@@ -2454,6 +2454,7 @@ class AnomxCliApp(
                 "agent_message",
                 {"message": response},
             )
+        self._append_turn_outcome_notice(turn.session, response, turn.work_count)
         turn.completed = True
         self._active_session_turns.pop(self._session_turn_key(turn.session), None)
         return response
@@ -2820,8 +2821,6 @@ class AnomxCliApp(
         started_at: float,
         work_count: int,
     ) -> bool:
-        if not work_count:
-            return False
         return self._append_turn_summary(session, turn_id, started_at, "Worked for")
 
     def _append_interrupted_summary(
@@ -3734,6 +3733,39 @@ class AnomxCliApp(
                 "role": role,
             },
         )
+
+    def _append_turn_outcome_notice(
+        self,
+        session: SessionRecord,
+        response: str,
+        work_count: int,
+    ) -> None:
+        """Show a visible marker when a turn ended abnormally.
+
+        Normal completions already render their answer plus the work summary.
+        Crashes, step-limit stops, and empty runs would otherwise be
+        indistinguishable from a normal answer (or show nothing at all).
+        """
+
+        text = response.strip()
+        if text.startswith("Agent crashed:"):
+            self._append_system_message(
+                session,
+                "system",
+                "The agent crashed and the run was stopped.",
+            )
+        elif "step limit for a single turn" in text or "tool loop stopped after" in text:
+            self._append_system_message(
+                session,
+                "system",
+                "Run stopped at the step limit — send a follow-up message to continue.",
+            )
+        elif not text and not work_count:
+            self._append_system_message(
+                session,
+                "system",
+                "anomx ended the run without a response.",
+            )
 
     def _backend_response(
         self,
