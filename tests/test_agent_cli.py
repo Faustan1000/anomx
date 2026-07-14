@@ -64,6 +64,7 @@ from anomx.agent.memories import (
     write_memory,
 )
 from anomx.agent.runtime import (
+    MAX_PLAN_FINISH_REPROMPTS,
     AgentRole,
     AgentRuntime,
     QuestionRequest,
@@ -4588,6 +4589,121 @@ def test_desy_response_omits_thinking_config(tmp_path, monkeypatch):
     assert "thinking" not in captured_payloads[0]
 
 
+def test_desy_payload_uses_configured_max_output_tokens(tmp_path, monkeypatch):
+    from anomx.agent.backends.desy_assistant import DesyAssistantBackend
+
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home.set_api_key("desy", "sk-desy-test")
+    session = home.create_session(repo, provider="desy", model="desy-assistant")
+    runtime = AgentRuntime(home, repo)
+    captured_payloads: list[dict[str, object]] = []
+
+    def fake_stream(_self, _api_key, payload, _delta_callback, _status_callback):
+        captured_payloads.append(payload)
+        return runtime_module.AnthropicStreamResponse(
+            text="done",
+            tool_calls=(),
+            content=({"type": "text", "text": "done"},),
+        )
+
+    monkeypatch.setattr(DesyAssistantBackend, "_stream_response", fake_stream)
+
+    # desy-assistant has no metadata max_output_tokens, so the fallback applies.
+    runtime.desy_response(session.path, "desy-assistant")
+    assert captured_payloads[0]["max_tokens"] == 8192
+
+    config = home.load_config()
+    config["max_output_tokens"] = 20000
+    home.save_config(config)
+    captured_payloads.clear()
+    runtime.desy_response(session.path, "desy-assistant")
+    assert captured_payloads[0]["max_tokens"] == 20000
+
+
+def test_desy_loop_continues_after_max_tokens_truncation(tmp_path, monkeypatch):
+    from anomx.agent.backends.desy_assistant import DesyAssistantBackend
+
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home.set_api_key("desy", "sk-desy-test")
+    session = home.create_session(repo, provider="desy", model="desy-assistant")
+    runtime = AgentRuntime(home, repo)
+    payloads: list[dict[str, object]] = []
+    responses = [
+        runtime_module.AnthropicStreamResponse(
+            text="part one",
+            tool_calls=(),
+            content=({"type": "text", "text": "part one"},),
+            stop_reason="max_tokens",
+        ),
+        runtime_module.AnthropicStreamResponse(
+            text="part two",
+            tool_calls=(),
+            content=({"type": "text", "text": "part two"},),
+            stop_reason="end_turn",
+        ),
+    ]
+
+    def fake_stream(_self, _api_key, payload, _delta_callback, _status_callback):
+        payloads.append(payload)
+        return responses[len(payloads) - 1]
+
+    monkeypatch.setattr(DesyAssistantBackend, "_stream_response", fake_stream)
+
+    finals: list[str] = []
+    response = runtime.desy_response(
+        session.path,
+        "desy-assistant",
+        RuntimeCallbacks(finish=finals.append),
+    )
+
+    # The truncated first message must not end the turn; the loop continues and
+    # the delivered text stitches the truncated prefix onto the continuation.
+    assert len(payloads) == 2
+    assert response == "part onepart two"
+    assert finals == ["part onepart two"]
+    second_messages = payloads[1]["messages"]
+    assert any(
+        isinstance(message.get("content"), str)
+        and "truncated by the output token limit" in message["content"]
+        for message in second_messages
+    )
+
+
+def test_desy_loop_stops_continuing_after_max_tokens_cap(tmp_path, monkeypatch):
+    from anomx.agent.backends.desy_assistant import DesyAssistantBackend
+    from anomx.agent.base.backends import MAX_TOKENS_CONTINUATIONS
+
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home.set_api_key("desy", "sk-desy-test")
+    session = home.create_session(repo, provider="desy", model="desy-assistant")
+    runtime = AgentRuntime(home, repo)
+    call_count = {"n": 0}
+
+    def fake_stream(_self, _api_key, _payload, _delta_callback, _status_callback):
+        call_count["n"] += 1
+        return runtime_module.AnthropicStreamResponse(
+            text="still going",
+            tool_calls=(),
+            content=({"type": "text", "text": "still going"},),
+            stop_reason="max_tokens",
+        )
+
+    monkeypatch.setattr(DesyAssistantBackend, "_stream_response", fake_stream)
+
+    response = runtime.desy_response(session.path, "desy-assistant")
+
+    # Continue up to the cap, then deliver the accumulated text instead of
+    # looping forever.
+    assert call_count["n"] == MAX_TOKENS_CONTINUATIONS + 1
+    assert response == "still going" * (MAX_TOKENS_CONTINUATIONS + 1)
+
+
 def test_desy_stream_uses_messages_endpoint_and_api_key_header(tmp_path, monkeypatch):
     class FakeResponse:
         def __enter__(self):
@@ -7616,7 +7732,7 @@ def test_unfinished_plan_blocks_final_answer_with_work_reprompt(tmp_path):
         "Done.",
         RuntimeCallbacks(),
         session.path,
-        3,
+        MAX_PLAN_FINISH_REPROMPTS,
     )
 
     assert prompt is None
