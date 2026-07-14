@@ -110,7 +110,7 @@ OutputResponseCallback = Callable[[dict[str, Any]], None]
 SubagentCallback = Callable[[dict[str, Any]], None]
 FinishCallback = Callable[[str], None]
 
-MAX_PLAN_FINISH_REPROMPTS = 3
+MAX_PLAN_FINISH_REPROMPTS = 6
 IMAGE_FILE_EXTENSIONS = (".gif", ".jpeg", ".jpg", ".png", ".webp")
 
 
