@@ -1834,10 +1834,24 @@ class CliToolManager:
         *,
         long_running_callback: LongRunningCommandCallback | None = None,
     ) -> str:
+        segments = self._pipeline_segments(normalized)
+        if any(
+            self._has_shell_syntax(segment) or shlex.split(segment)[:1] == ["cd"]
+            for segment in segments
+        ):
+            # A segment carries a compound operator (&&, ;, redirection) or a shell
+            # builtin such as `cd`. Manual stdout->stdin threading cannot represent
+            # those, and running a builtin through subprocess.Popen(shell=False)
+            # raises FileNotFoundError (e.g. 'cd'). The command already classified as
+            # safe, so defer to the real shell instead.
+            return self._execute_shell_command(
+                normalized,
+                long_running_callback=long_running_callback,
+            )
         input_text: str | None = None
         stderr_parts: list[str] = []
         return_code = 0
-        for segment in self._pipeline_segments(normalized):
+        for segment in segments:
             result = self._execute_subprocess(
                 shlex.split(segment),
                 input=input_text,
@@ -1881,11 +1895,14 @@ class CliToolManager:
         if self.cancel_event is not None and self.cancel_event.is_set():
             return "Command stopped because the agent was interrupted."
 
-        process = self._open_subprocess(
-            command,
-            shell=shell,
-            stdin=subprocess.PIPE if input is not None else None,
-        )
+        try:
+            process = self._open_subprocess(
+                command,
+                shell=shell,
+                stdin=subprocess.PIPE if input is not None else None,
+            )
+        except OSError as error:
+            return f"Command failed: {error}"
         deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
         started_at = time.monotonic()
         reported_long_running = False
