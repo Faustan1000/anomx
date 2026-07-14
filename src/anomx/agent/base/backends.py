@@ -25,6 +25,9 @@ from anomx.agent.store import (
 )
 
 MAX_TOOL_ITERATIONS = 128
+# How many times a response truncated by the output token limit (stop_reason
+# "max_tokens") is automatically continued before the loop gives up.
+MAX_TOKENS_CONTINUATIONS = 4
 OPENAI_MAX_TOOL_CALLS = 128
 MODEL_REQUEST_RETRY_STATUS_CODES = frozenset({400, 404, 429, 500, 502, 503})
 MODEL_REQUEST_RETRY_COUNT = 10
@@ -95,6 +98,7 @@ class AnthropicStreamResponse:
     text: str
     tool_calls: tuple[AnthropicToolCall, ...]
     content: tuple[dict[str, Any], ...]
+    stop_reason: str | None = None
 
 
 @dataclass(frozen=True)
