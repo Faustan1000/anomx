@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from anomx.agent.base.backends import (
+    MAX_TOKENS_CONTINUATIONS,
     MAX_TOOL_ITERATIONS,
     AnthropicStreamResponse,
     AnthropicToolCall,
@@ -68,6 +69,8 @@ class AnthropicCompatibleBackend(BaseBackend):
         )
 
         plan_finish_attempts = 0
+        max_tokens_continuations = 0
+        truncated_prefix = ""
         for _ in range(MAX_TOOL_ITERATIONS):
             if self.runtime._turn_aborted():
                 return ""
@@ -90,6 +93,34 @@ class AnthropicCompatibleBackend(BaseBackend):
             )
             if not tool_outputs:
                 text = response.text or self._extract_anthropic_text(response.content)
+                if (
+                    response.stop_reason == "max_tokens"
+                    and max_tokens_continuations < MAX_TOKENS_CONTINUATIONS
+                ):
+                    max_tokens_continuations += 1
+                    truncated_prefix += text
+                    assistant_content = list(response.content) or [
+                        {"type": "text", "text": text}
+                    ]
+                    messages.append({"role": "assistant", "content": assistant_content})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous message was truncated by the output token "
+                                "limit. Continue exactly where you left off; do not repeat "
+                                "what you already wrote."
+                            ),
+                        }
+                    )
+                    payload = self._payload(
+                        session_path,
+                        model,
+                        messages,
+                        include_thinking=include_thinking,
+                        thinking_intensity=thinking_intensity,
+                    )
+                    continue
                 continuation_prompt, used_plan_guard = (
                     self.runtime._continuation_prompt_after_text(
                         text,
@@ -114,7 +145,7 @@ class AnthropicCompatibleBackend(BaseBackend):
                         thinking_intensity=thinking_intensity,
                     )
                     continue
-                final_text = text
+                final_text = truncated_prefix + text
                 if callbacks.finish is not None:
                     callbacks.finish(final_text)
                 return final_text
@@ -129,7 +160,10 @@ class AnthropicCompatibleBackend(BaseBackend):
                 thinking_intensity=thinking_intensity,
             )
 
-        return f"{self.provider_label} tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches."
+        return (
+            f"{self.provider_label} reached the {MAX_TOOL_ITERATIONS}-step limit for a single "
+            "turn and stopped. Send a follow-up message to continue."
+        )
 
     def _payload(
         self,
@@ -140,12 +174,17 @@ class AnthropicCompatibleBackend(BaseBackend):
         include_thinking: bool,
         thinking_intensity: str | None,
     ) -> dict[str, Any]:
+        configured = self.runtime.home.load_config().get("max_output_tokens")
+        try:
+            fallback = int(configured) if configured else 8_192
+        except (TypeError, ValueError):
+            fallback = 8_192
         payload: dict[str, Any] = {
             "model": model,
             "system": self.runtime._instructions(session_path),
             "messages": messages,
             "tools": self._anthropic_tools(),
-            "max_tokens": self._max_output_tokens(model, 4_096),
+            "max_tokens": self._max_output_tokens(model, fallback),
             "stream": True,
         }
         if include_thinking:
@@ -186,6 +225,7 @@ class AnthropicCompatibleBackend(BaseBackend):
             text_parts: list[str] = []
             content_by_index: dict[int, dict[str, Any]] = {}
             tool_json_parts: dict[int, list[str]] = {}
+            stop_reason: str | None = None
             with urllib.request.urlopen(request, timeout=120) as response:
                 for raw_line in response:
                     if self.runtime._turn_aborted():
@@ -274,6 +314,12 @@ class AnthropicCompatibleBackend(BaseBackend):
                             tool_json_parts,
                             index,
                         )
+                    elif event_type == "message_delta":
+                        delta = event.get("delta")
+                        if isinstance(delta, dict):
+                            reason = delta.get("stop_reason")
+                            if isinstance(reason, str) and reason:
+                                stop_reason = reason
                     elif event_type == "error":
                         error = event.get("error")
                         if isinstance(error, dict):
@@ -300,6 +346,7 @@ class AnthropicCompatibleBackend(BaseBackend):
                 "".join(text_parts).strip(),
                 tool_calls,
                 ordered_content,
+                stop_reason,
             )
 
         if self.runtime._turn_aborted():
