@@ -7674,6 +7674,48 @@ def test_finish_anyways_clears_current_plan(tmp_path):
     assert messages == ["Finishing despite stale plan"]
 
 
+def test_question_message_is_delivered_despite_open_plan_steps(tmp_path):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    runtime = AgentRuntime(home, repo)
+
+    runtime._execute_tool(
+        "create_plan",
+        {
+            "steps": [
+                {
+                    "title": "Phase 7",
+                    "description": "Continue the refactor.",
+                    "is_done": False,
+                },
+            ]
+        },
+        RuntimeCallbacks(),
+        session.path,
+    )
+
+    # The agent hands control back with a question while a plan step is open.
+    # It must be delivered and the turn must end (wait for the user), not be
+    # suppressed by the plan-finish guard.
+    prompt, used_guard = runtime._continuation_prompt_after_text(
+        "Ich warte auf deine Antwort: Soll ich mit Phase 7 weitermachen?",
+        RuntimeCallbacks(),
+        session.path,
+        0,
+    )
+
+    assert prompt is None
+    assert used_guard is False
+    work_messages = [
+        event_payload(event)
+        for event in home.read_session_events(session.path)
+        if event_payload_type(event) == "work_message"
+    ]
+    assert work_messages == []
+
+
 def test_unfinished_plan_blocks_final_answer_with_work_reprompt(tmp_path):
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"

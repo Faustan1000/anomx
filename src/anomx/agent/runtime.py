@@ -110,7 +110,7 @@ OutputResponseCallback = Callable[[dict[str, Any]], None]
 SubagentCallback = Callable[[dict[str, Any]], None]
 FinishCallback = Callable[[str], None]
 
-MAX_PLAN_FINISH_REPROMPTS = 6
+MAX_PLAN_FINISH_REPROMPTS = 3
 IMAGE_FILE_EXTENSIONS = (".gif", ".jpeg", ".jpg", ".png", ".webp")
 
 
@@ -997,6 +997,12 @@ class AgentRuntime:
             wait_output = self._wait_for_active_targets(callbacks)
             return self._command_continuation_prompt(wait_output), False
 
+        # If the agent is handing control back to ask the user something, deliver the
+        # message and end the turn instead of suppressing it with the plan-finish guard.
+        # Otherwise a prose question would be swallowed and the agent forced to guess on.
+        if message.strip().endswith("?"):
+            return None, False
+
         if self.role != AgentRole.OPERATOR or not False:
             return self._plan_finish_continuation_prompt(
                 session_path,
@@ -1081,7 +1087,9 @@ class AgentRuntime:
                 "",
                 "Continue working, update the plan, or remove it if it is stale. "
                 "If every item is complete, mark the plan done; the UI will remove it "
-                "automatically when you finish. If you are sure the final answer should "
+                "automatically when you finish. If you are blocked because you need a "
+                "decision or information from the user, call ask_question and wait for "
+                "the answer instead of guessing. If you are sure the final answer should "
                 "be delivered despite open plan steps, call finish_anyways(statement).",
             ]
         )
