@@ -36,6 +36,7 @@ from anomx.agent.helpers.tool_manager import (
 )
 from anomx.agent.helpers.utils import agent_spec, next_main_agent_kind, parse_agent_kind
 from anomx.agent.memories import MemoryKind, create_memory_record, write_memory
+from anomx.agent.model_catalog import discover_provider_models, merge_provider_models
 from anomx.agent.runtime import (
     AgentRuntime,
     QuestionRequest,
@@ -218,6 +219,7 @@ class AnomxCliApp(
         self._prepare_startup_during_loading = False
         self._startup_preparation: StartupPreparation | None = None
         self._active_session_turns: dict[Path, ActiveSessionTurn] = {}
+        self._discovered_provider_models: dict[str, tuple[str, ...]] = {}
 
     def prepare_startup_config(self) -> None:
         """Apply command-line startup provider/model overrides."""
@@ -243,6 +245,27 @@ class AnomxCliApp(
         config["provider"] = provider.key
         config["model"] = selected_model
         self.home.save_config(config)
+
+    def _provider_with_discovered_models(
+        self,
+        provider: ProviderOption,
+        *,
+        refresh: bool = False,
+    ) -> ProviderOption:
+        """Return a provider enriched with models advertised by its API."""
+
+        if refresh or provider.key not in self._discovered_provider_models:
+            api_keys = self.home.load_auth().get("api_keys")
+            api_key = api_keys.get(provider.key) if isinstance(api_keys, dict) else None
+            discovered = discover_provider_models(provider.key, api_key)
+            self._discovered_provider_models[provider.key] = merge_provider_models(
+                provider.models,
+                discovered,
+            )
+        return replace(
+            provider,
+            models=self._discovered_provider_models.get(provider.key, provider.models),
+        )
 
     def run(self) -> int:
         """Run the full-screen terminal UI."""
@@ -416,6 +439,9 @@ class AnomxCliApp(
         config = self.home.load_config()
         if not self._onboarding_complete(config):
             return StartupPreparation()
+        provider = provider_by_key(str(config.get("provider") or ""))
+        if provider is not None:
+            self._provider_with_discovered_models(provider, refresh=True)
         project = self._ensure_project()
         sandbox_runtime: str | None = None
         if config.get("sandbox_enabled"):
@@ -2208,6 +2234,9 @@ class AnomxCliApp(
         def tool_message_callback(message: str) -> None:
             events.put(RuntimeUiEvent("tool_message", message))
 
+        def thought_callback(thought: str) -> None:
+            events.put(RuntimeUiEvent("thought", thought))
+
         def command_callback(statement: str, command: str, _output: str) -> None:
             events.put(RuntimeUiEvent("command", statement, command=command))
 
@@ -2268,6 +2297,7 @@ class AnomxCliApp(
                         status=status_callback,
                         message=message_callback,
                         tool_message=tool_message_callback,
+                        thought=thought_callback,
                         command=command_callback,
                         delta=delta_callback,
                         approval=approval_callback,
@@ -3859,6 +3889,18 @@ class AnomxCliApp(
                     current_work_count += 1
             elif event.kind == "delta":
                 current_final += event.text
+            elif event.kind == "thought" and event.text:
+                self.home.append_session_event(
+                    session.path,
+                    "work_message",
+                    {
+                        "message": "Created a thought",
+                        "role": "thought",
+                        "command": event.text.strip(),
+                        "turn_id": turn_id,
+                    },
+                )
+                current_work_count += 1
             elif event.kind in {"message", "tool_message", "command"} and event.text:
                 clean_text = event.text.strip()
                 if current_final and event.kind in {"tool_message", "command"}:

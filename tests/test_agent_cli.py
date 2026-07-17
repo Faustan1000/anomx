@@ -420,8 +420,236 @@ def test_model_metadata_tracks_context_windows():
     assert model_detail("claude-sonnet-4-6") == "1M context · 64K max output"
 
 
-def test_provider_catalog_includes_desy_assistant():
-    assert AI_PROVIDER_KEYS == ("openai", "anthropic", "desy", "ollama")
+def test_provider_catalog_has_the_requested_backend_order():
+    assert AI_PROVIDER_KEYS == ("desy", "blablador", "anthropic", "openai", "ollama")
+
+
+def test_blablador_model_discovery_merges_api_models_with_alias_fallbacks(monkeypatch):
+    import anomx.agent.model_catalog as model_catalog
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps({"data": [{"id": "Qwen3.5-122B-A10B"}]}).encode("utf-8")
+
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["authorization"] = request.get_header("Authorization")
+        captured["timeout"] = timeout
+        captured["url"] = request.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(model_catalog.urllib.request, "urlopen", fake_urlopen)
+
+    discovered = model_catalog.discover_provider_models("blablador", "blablador-key")
+
+    assert discovered == ("Qwen3.5-122B-A10B",)
+    assert model_catalog.merge_provider_models(("alias-code",), discovered) == (
+        "alias-code",
+        "Qwen3.5-122B-A10B",
+    )
+    assert captured == {
+        "authorization": "Bearer blablador-key",
+        "timeout": model_catalog.MODEL_DISCOVERY_TIMEOUT_SECONDS,
+        "url": "https://api.blablador.fz-juelich.de/v1/models",
+    }
+
+
+def test_backend_registry_includes_blablador(tmp_path):
+    from anomx.agent.backends import backend_for_provider
+    from anomx.agent.backends.blablador import BlabladorBackend
+
+    runtime = AgentRuntime(AnomxHome(tmp_path / "home"), tmp_path)
+
+    assert isinstance(backend_for_provider("blablador", runtime), BlabladorBackend)
+
+
+def test_blablador_backend_streams_openai_compatible_chat_completion(tmp_path, monkeypatch):
+    import anomx.agent.backends.openai_chat as openai_chat_module
+    from anomx.agent.backends.blablador import BlabladorBackend
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"content":"<thi"}}]}\n'
+            yield b'data: {"choices":[{"delta":{"content":"nk>private reasoning"}}]}\n'
+            yield b'data: {"choices":[{"delta":{"content":"</think>Hello"}}]}\n'
+            yield b'data: {"choices":[{"delta":{"content":" from Blablador"}}]}\n'
+            yield b"data: [DONE]\n"
+
+    home = AnomxHome(tmp_path / "home")
+    home.set_api_key("blablador", "blablador-key")
+    config = home.load_config()
+    config.update({"provider": "blablador", "model": "alias-fast"})
+    home.save_config(config)
+    session = home.create_session(tmp_path, provider="blablador", model="alias-fast")
+    home.append_session_event(session.path, "user_message", {"message": "Say hello"})
+    runtime = AgentRuntime(home, tmp_path)
+    captured = {}
+    streamed_text: list[str] = []
+    statuses: list[str] = []
+    thoughts: list[str] = []
+
+    def fake_urlopen(request, timeout):
+        captured["authorization"] = request.get_header("Authorization")
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        captured["url"] = request.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(openai_chat_module.urllib.request, "urlopen", fake_urlopen)
+
+    assert BlabladorBackend(runtime).generate(
+        session.path,
+        "alias-fast",
+        RuntimeCallbacks(
+            delta=streamed_text.append,
+            status=statuses.append,
+            thought=thoughts.append,
+        ),
+    ) == "Hello from Blablador"
+    assert streamed_text == ["Hello", " from Blablador"]
+    assert statuses == ["Thinking"]
+    assert thoughts == ["private reasoning"]
+    assert captured["authorization"] == "Bearer blablador-key"
+    assert captured["payload"]["model"] == "alias-fast"
+    assert captured["payload"]["stream"] is True
+    assert captured["timeout"] == 120
+    assert captured["url"] == "https://api.blablador.fz-juelich.de/v1/chat/completions"
+
+
+def test_thinking_tag_filter_hides_complete_and_unfinished_reasoning():
+    from anomx.agent.base.backends import ThinkingTagStreamFilter, strip_thinking_tags
+
+    assert strip_thinking_tags("<think>private reasoning</think>Visible answer") == "Visible answer"
+    assert strip_thinking_tags("Visible answer<think>private reasoning") == "Visible answer"
+
+    text_filter = ThinkingTagStreamFilter()
+    visible, _ = text_filter.feed("Visible answer<think>private reasoning")
+    assert visible == "Visible answer"
+    assert text_filter.finish() == ""
+    assert text_filter.drain_completed_thoughts() == ("private reasoning",)
+
+    text_filter = ThinkingTagStreamFilter()
+    visible, _ = text_filter.feed(
+        "<think>The user said hello. I should reply warmly.\n\nHi there!"
+    )
+    assert visible == ""
+    assert text_filter.finish() == "Hi there!"
+    assert text_filter.drain_completed_thoughts() == (
+        "The user said hello. I should reply warmly.",
+    )
+
+
+def test_blablador_recovers_final_answer_after_unclosed_think_block(tmp_path, monkeypatch):
+    import anomx.agent.backends.openai_chat as openai_chat_module
+    from anomx.agent.backends.blablador import BlabladorBackend
+
+    class FakeResponse:
+        def __init__(self, lines):
+            self.lines = lines
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            return iter(self.lines)
+
+    home = AnomxHome(tmp_path / "home")
+    home.set_api_key("blablador", "blablador-key")
+    session = home.create_session(tmp_path, provider="blablador", model="alias-huge")
+    home.append_session_event(session.path, "user_message", {"message": "Say hello"})
+    runtime = AgentRuntime(home, tmp_path)
+    responses = iter(
+        (
+            [b'data: {"choices":[{"delta":{"content":"<think>private reasoning"}}]}\n', b"data: [DONE]\n"],
+            [b'data: {"choices":[{"delta":{"content":"Hello from Blablador"}}]}\n', b"data: [DONE]\n"],
+        )
+    )
+    payloads: list[dict[str, object]] = []
+    streamed_text: list[str] = []
+    thoughts: list[str] = []
+
+    def fake_urlopen(request, timeout):
+        assert timeout == 120
+        payloads.append(json.loads(request.data.decode("utf-8")))
+        return FakeResponse(next(responses))
+
+    monkeypatch.setattr(openai_chat_module.urllib.request, "urlopen", fake_urlopen)
+
+    assert BlabladorBackend(runtime).generate(
+        session.path,
+        "alias-huge",
+        RuntimeCallbacks(delta=streamed_text.append, thought=thoughts.append),
+    ) == "Hello from Blablador"
+    assert streamed_text == ["Hello from Blablador"]
+    assert thoughts == ["private reasoning"]
+    assert len(payloads) == 2
+    assert payloads[1]["messages"][-1] == {
+        "role": "user",
+        "content": (
+            "Provide the final answer to the user's request now. Return only that answer; "
+            "do not include reasoning or <think> tags."
+        ),
+    }
+
+
+def test_blablador_recovers_separated_final_text_from_unclosed_think_block(
+    tmp_path,
+    monkeypatch,
+):
+    import anomx.agent.backends.openai_chat as openai_chat_module
+    from anomx.agent.backends.blablador import BlabladorBackend
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield (
+                b'data: {"choices":[{"delta":{"reasoning_content":"The user just said '
+                b'hello. I should reply warmly.\\n\\nHi Theo! How can I help you today?"}}]}\n'
+            )
+            yield b"data: [DONE]\n"
+
+    runtime = AgentRuntime(AnomxHome(tmp_path / "home"), tmp_path)
+    deltas: list[str] = []
+    thoughts: list[str] = []
+
+    monkeypatch.setattr(
+        openai_chat_module.urllib.request,
+        "urlopen",
+        lambda *args, **kwargs: FakeResponse(),
+    )
+
+    response = BlabladorBackend(runtime)._stream_chat_completion(
+        "blablador-key",
+        {"model": "alias-huge", "messages": [], "stream": True},
+        deltas.append,
+        None,
+        thoughts.append,
+    )
+
+    assert response.text == "Hi Theo! How can I help you today?"
+    assert deltas == ["Hi Theo! How can I help you today?"]
+    assert thoughts == ["The user just said hello. I should reply warmly."]
 
 
 def test_thinking_intensity_options_are_model_specific():
@@ -3402,6 +3630,46 @@ def test_prompt_reader_combines_raw_mouse_escape_sequence(tmp_path):
     assert window.nodelay_calls == [True, False]
 
 
+def test_masked_text_prompt_consumes_bracketed_paste_markers(tmp_path, monkeypatch):
+    class Window:
+        def __init__(self):
+            self._keys = iter(
+                (
+                    "\x1b",
+                    "[",
+                    "2",
+                    "0",
+                    "0",
+                    "~",
+                    *"blablador-api-key\n",
+                    "\x1b",
+                    "[",
+                    "2",
+                    "0",
+                    "1",
+                    "~",
+                    "\n",
+                )
+            )
+
+        def get_wch(self):
+            return next(self._keys)
+
+        def nodelay(self, _flag):
+            pass
+
+    app = AnomxCliApp(home=AnomxHome(tmp_path / "home"))
+    monkeypatch.setattr(app, "_draw_overlay", lambda *_args, **_kwargs: None)
+
+    assert app._prompt_text(
+        Window(),
+        "JSC Blablador API key",
+        "Paste your API key",
+        mask=True,
+        optional=False,
+    ) == "blablador-api-key"
+
+
 def test_session_scroll_bounds_allow_bottom_slack(tmp_path):
     app = AnomxCliApp(home=AnomxHome(tmp_path / "home"))
 
@@ -4946,6 +5214,45 @@ def test_runtime_status_events_keep_thinking_live_only(tmp_path):
     assert working_deadline is None
     assert final_text == ""
     assert work_count == 0
+
+
+def test_runtime_thought_event_persists_an_expandable_detail(tmp_path):
+    app = AnomxCliApp(home=AnomxHome(tmp_path / "home"))
+    home = AnomxHome(tmp_path / "home")
+    session = home.create_session(tmp_path, provider="blablador", model="alias-huge")
+    events: queue.SimpleQueue[RuntimeUiEvent] = queue.SimpleQueue()
+    events.put(RuntimeUiEvent("thought", "Private reasoning details"))
+
+    _working_text, _working_deadline, _final_text, work_count = app._process_runtime_events(
+        object(),
+        session,
+        events,
+        "Thinking",
+        None,
+        "",
+        "turn-1",
+        0,
+        None,
+    )
+
+    assert work_count == 1
+    work_payload = next(
+        event["payload"]
+        for event in home.read_session_events(session.path)
+        if event.get("type") == "event_msg"
+        and event.get("payload", {}).get("type") == "work_message"
+    )
+    assert work_payload == {
+        "message": "Created a thought",
+        "role": "thought",
+        "command": "Private reasoning details",
+        "turn_id": "turn-1",
+        "type": "work_message",
+    }
+    thought_line = next(line for line in app._read_message_lines(session.path) if line.role == "thought")
+    assert thought_line.detail_title == "Thought"
+    assert thought_line.detail_body == "Private reasoning details"
+    assert app._is_expandable_work_role(thought_line.role)
 
 
 def test_concrete_status_events_persist_as_work_statements(tmp_path):

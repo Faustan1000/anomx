@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "anomx"
-version = "0.2.16"
+version = "0.2.17"
 description = "Installable time-series anomaly library with forecasting, reconstruction, and representation base approaches."
 readme = "README.md"
 requires-python = ">=3.11"

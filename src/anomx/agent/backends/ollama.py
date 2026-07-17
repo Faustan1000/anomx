@@ -7,7 +7,6 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 from anomx.agent.base.backends import (
@@ -16,6 +15,7 @@ from anomx.agent.base.backends import (
     BaseBackend,
     OllamaStreamResponse,
     OllamaToolCall,
+    ThinkingTagStreamFilter,
 )
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata
@@ -51,11 +51,7 @@ class OllamaBackend(BaseBackend):
                 "role": "system",
                 "content": self.runtime._instructions(session_path),
             }
-            stream_callbacks = SimpleNamespace(
-                status=callbacks.status,
-                delta=callbacks.delta,
-            )
-            response = self._stream_ollama_response(model, messages, stream_callbacks)
+            response = self._stream_ollama_response(model, messages, callbacks)
             if isinstance(response, str):
                 return response
             if self.runtime._turn_aborted():
@@ -118,6 +114,7 @@ class OllamaBackend(BaseBackend):
             self.runtime._debug_log_step(self.provider_key, payload)
             thinking_parts: list[str] = []
             text_parts: list[str] = []
+            text_filter = ThinkingTagStreamFilter()
             tool_calls: list[OllamaToolCall] = []
             with urllib.request.urlopen(request, timeout=120) as response:
                 self.runtime._status(callbacks.status, "Thinking")
@@ -140,15 +137,37 @@ class OllamaBackend(BaseBackend):
                         )
                     content = stream_message.get("content")
                     if isinstance(content, str) and content:
-                        text_parts.append(content)
-                        if callbacks.delta is not None:
-                            callbacks.delta(content)
+                        visible = self._visible_stream_text(
+                            text_filter,
+                            content,
+                            callbacks.delta,
+                            callbacks.status,
+                            callbacks.thought,
+                        )
+                        if visible:
+                            text_parts.append(visible)
                     raw_tool_calls = stream_message.get("tool_calls")
                     if isinstance(raw_tool_calls, list):
                         for item in raw_tool_calls:
                             tool_call = self._ollama_tool_call(item)
                             if tool_call is not None:
                                 tool_calls.append(tool_call)
+
+            trailing_text = self._finish_visible_stream_text(
+                text_filter,
+                callbacks.delta,
+                callbacks.status,
+                callbacks.thought,
+            )
+            if trailing_text:
+                text_parts.append(trailing_text)
+
+            thought = "".join(thinking_parts).strip()
+            if thought:
+                if callbacks.thought is not None:
+                    callbacks.thought(thought)
+                else:
+                    self.runtime._status(callbacks.status, "Created a thought")
 
             assistant_message: dict[str, Any] = {"role": "assistant"}
             if thinking_parts:
@@ -161,7 +180,7 @@ class OllamaBackend(BaseBackend):
                 ]
             return OllamaStreamResponse(
                 "".join(text_parts).strip(),
-                "".join(thinking_parts).strip(),
+                thought,
                 tuple(tool_calls),
                 assistant_message,
             )

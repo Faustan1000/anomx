@@ -625,6 +625,7 @@ class ConfigViewMixin:
         self.state = AgentState.MODEL
         config = self.home.load_config()
         provider = provider_by_key(str(config.get("provider", "openai"))) or AI_PROVIDERS[0]
+        provider = self._provider_with_discovered_models(provider)
         choices = [MenuChoice(model, model, model_detail(model)) for model in provider.models]
         if provider.allow_custom_model:
             choices.append(
@@ -697,6 +698,7 @@ class ConfigViewMixin:
         self.state = AgentState.MODEL
         config = self.home.load_config()
         provider = provider_by_key(str(config.get("provider", "openai"))) or AI_PROVIDERS[0]
+        provider = self._provider_with_discovered_models(provider)
         choices = [MenuChoice(model, model, model_detail(model)) for model in provider.models]
         if provider.allow_custom_model:
             choices.append(
@@ -1615,7 +1617,7 @@ class ConfigViewMixin:
         provider = self._select_provider(stdscr)
         if provider is None:
             return False
-        if provider.key in {"openai", "anthropic", "desy"}:
+        if provider.key in {"openai", "anthropic", "blablador", "desy"}:
             should_prompt_api_key = True
             if self.home.has_api_key(provider.key):
                 selected = self._menu(
@@ -1641,6 +1643,7 @@ class ConfigViewMixin:
                 if not api_key:
                     return False
                 self.home.set_api_key(provider.key, api_key)
+        provider = self._provider_with_discovered_models(provider, refresh=True)
         selected_model = str(config.get("model", ""))
         model_was_selected = False
         if provider.key != previous_provider:
@@ -2052,6 +2055,7 @@ class ConfigViewMixin:
         return provider_by_key(selected) if selected is not None else None
 
     def _select_model(self, stdscr: CursesWindow, provider: ProviderOption) -> str | None:
+        provider = self._provider_with_discovered_models(provider)
         choices = [MenuChoice(model, model, model_detail(model)) for model in provider.models]
         if provider.allow_custom_model:
             choices.append(

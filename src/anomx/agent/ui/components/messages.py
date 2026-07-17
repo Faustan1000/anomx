@@ -11,6 +11,7 @@ import textwrap
 from pathlib import Path
 from typing import Any
 
+from anomx.agent.base.backends import strip_thinking_tags
 from anomx.agent.helpers.terminal import CODE_END, CODE_START, markdown_to_terminal_rendered_lines
 from anomx.agent.store import (
     SessionRecord,
@@ -39,7 +40,7 @@ class MessagesComponentMixin:
             return self._attr("bold")
         if role == "meta_accent":
             return self._attr("accent")
-        if role in {"meta", "tool", "work_summary", "approved", "notice"}:
+        if role in {"meta", "thought", "tool", "work_summary", "approved", "notice"}:
             return self._attr("light")
         if role == "code":
             return self._attr("accent")
@@ -445,7 +446,9 @@ class MessagesComponentMixin:
             elif event_type == "agent_message" and message:
                 turn_id = str(payload.get("turn_id", ""))
                 role = "agent_intermediate" if payload.get("intermediate") else "agent"
-                append_turn_line(turn_id, MessageLine(role, message, turn_id))
+                visible_message = strip_thinking_tags(message)
+                if visible_message:
+                    append_turn_line(turn_id, MessageLine(role, visible_message, turn_id))
             elif event_type == "system_message" and message:
                 role = str(payload.get("role", "system"))
                 if role == "question":
@@ -574,6 +577,8 @@ class MessagesComponentMixin:
         message: str,
         command: str = "",
     ) -> tuple[str, str, str]:
+        if role == "thought":
+            return message, command, "Thought"
         if role != "forbidden":
             return message, command, ""
 
@@ -712,7 +717,7 @@ class MessagesComponentMixin:
         ]
 
     def _is_expandable_work_role(self, role: str) -> bool:
-        return role in {"tool", "approved", "forbidden"}
+        return role in {"thought", "tool", "approved", "forbidden"}
 
     def _work_message_display_text(self, message: MessageLine) -> str:
         return self._single_line_work_text(message.text)

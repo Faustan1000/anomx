@@ -100,7 +100,18 @@ class ProjectRecord:
 
 
 AI_PROVIDERS: tuple[ProviderOption, ...] = (
-    ProviderOption("openai", "OpenAI", ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")),
+    ProviderOption(
+        "desy",
+        "DESY Assistant",
+        ("desy-assistant", "reasoning", "coding"),
+        allow_custom_model=True,
+    ),
+    ProviderOption(
+        "blablador",
+        "JSC Blablador",
+        ("alias-code", "alias-fast", "alias-large", "alias-huge"),
+        allow_custom_model=True,
+    ),
     ProviderOption(
         "anthropic",
         "Anthropic",
@@ -109,11 +120,12 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
             "claude-sonnet-4-6",
             "claude-haiku-4-5-20251001",
         ),
+        allow_custom_model=True,
     ),
     ProviderOption(
-        "desy",
-        "DESY Assistant",
-        ("desy-assistant", "reasoning", "coding"),
+        "openai",
+        "OpenAI",
+        ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
         allow_custom_model=True,
     ),
     ProviderOption(

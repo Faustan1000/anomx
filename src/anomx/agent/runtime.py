@@ -14,8 +14,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TextIO
 from uuid import uuid4
 
-from anomx.agent.backends import backend_for_provider
 from anomx.agent.agents.main import CONNECTED_PLATFORM_AGENT_PROMPT
+from anomx.agent.backends import backend_for_provider
 from anomx.agent.base.backends import (
     AnthropicStreamResponse,
     AnthropicToolCall,
@@ -30,6 +30,7 @@ from anomx.agent.base.backends import (
     estimate_backend_context_tokens,
     image_mime_type,
     normalized_image_attachments,
+    strip_thinking_tags,
 )
 from anomx.agent.base.interactions import QuestionOption, QuestionRequest, QuestionResponse
 from anomx.agent.base.processes import AsyncProcessState
@@ -104,6 +105,7 @@ StatusCallback = Callable[[str], None]
 MessageCallback = Callable[[str], None]
 ToolMessageCallback = Callable[[str], None]
 DeltaCallback = Callable[[str], None]
+ThoughtCallback = Callable[[str], None]
 SystemMessageCallback = Callable[[str, str], None]
 CommandCallback = Callable[[str, str, str], None]
 OutputResponseCallback = Callable[[dict[str, Any]], None]
@@ -156,6 +158,7 @@ class RuntimeCallbacks:
     status: StatusCallback | None = None
     message: MessageCallback | None = None
     tool_message: ToolMessageCallback | None = None
+    thought: ThoughtCallback | None = None
     command: CommandCallback | None = None
     output_response: OutputResponseCallback | None = None
     subagent: SubagentCallback | None = None
@@ -560,6 +563,21 @@ class AgentRuntime:
             RuntimeCallbacks() if callbacks is None else callbacks,
         )
 
+    def blablador_response(
+        self,
+        session_path: Path,
+        model: str,
+        callbacks: RuntimeCallbacks | None = None,
+    ) -> str:
+        """Compatibility wrapper for the JSC Blablador backend."""
+
+        return self._backend_response_for_provider(
+            "blablador",
+            session_path,
+            model,
+            RuntimeCallbacks() if callbacks is None else callbacks,
+        )
+
     def ollama_response(
         self,
         session_path: Path,
@@ -661,7 +679,9 @@ class AgentRuntime:
                 if prompt:
                     messages.append({"role": "user", "content": prompt})
             elif event_type == "agent_message" and message:
-                messages.append({"role": "assistant", "content": message})
+                visible_message = strip_thinking_tags(message)
+                if visible_message:
+                    messages.append({"role": "assistant", "content": visible_message})
             elif event_type == "system_message" and message:
                 messages.append({"role": "system", "content": message})
         return messages[-20:]

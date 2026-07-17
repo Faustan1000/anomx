@@ -17,6 +17,7 @@ from anomx.agent.base.backends import (
     BaseBackend,
     OpenAIStreamResponse,
     OpenAIToolCall,
+    ThinkingTagStreamFilter,
 )
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata
@@ -153,6 +154,7 @@ class OpenAIBackend(BaseBackend):
             )
             response_id: str | None = None
             text_parts: list[str] = []
+            text_filter = ThinkingTagStreamFilter()
             reasoning_parts: list[str] = []
             tool_calls: list[OpenAIToolCall] = []
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -170,9 +172,14 @@ class OpenAIBackend(BaseBackend):
                     if event_type == "response.output_text.delta":
                         delta = str(event.get("delta", ""))
                         if delta:
-                            text_parts.append(delta)
-                            if delta_callback is not None:
-                                delta_callback(delta)
+                            visible = self._visible_stream_text(
+                                text_filter,
+                                delta,
+                                delta_callback,
+                                status_callback,
+                            )
+                            if visible:
+                                text_parts.append(visible)
                     elif event_type == "response.reasoning_summary_text.delta":
                         delta = str(event.get("delta", ""))
                         if delta:
@@ -191,6 +198,9 @@ class OpenAIBackend(BaseBackend):
                             maybe_id = response_payload.get("id")
                             if isinstance(maybe_id, str):
                                 response_id = maybe_id
+            trailing_text = self._finish_visible_stream_text(text_filter, delta_callback)
+            if trailing_text:
+                text_parts.append(trailing_text)
             return OpenAIStreamResponse(
                 response_id,
                 "".join(text_parts).strip(),

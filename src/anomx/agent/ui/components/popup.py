@@ -24,11 +24,24 @@ from anomx.agent.ui.models import (
     BottomPanel,
     CursesWindow,
     MenuChoice,
+    PromptPasteEvent,
 )
 
 
 class PopupComponentMixin:
     """Reusable menus, overlays, text popovers, and approval/question popups."""
+
+    @staticmethod
+    def _insert_single_line_paste(value: str, cursor: int, text: str) -> tuple[str, int]:
+        """Insert a terminal paste event into a single-line input.
+
+        Clipboard tools commonly include a trailing newline.  A text popover is
+        intentionally single-line, so keep the pasted secret or value intact
+        while discarding line separators rather than treating them as submit
+        keystrokes.
+        """
+        paste = text.replace("\r", "").replace("\n", "")
+        return value[:cursor] + paste + value[cursor:], cursor + len(paste)
 
     def _menu(
         self,
@@ -223,7 +236,10 @@ class PopupComponentMixin:
                 footer=footer,
                 show_input_cursor=True,
             )
-            key = stdscr.get_wch()
+            key = self._read_prompt_key(stdscr)
+            if isinstance(key, PromptPasteEvent):
+                value, cursor = self._insert_single_line_paste(value, cursor, key.text)
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None if optional else ""
             if self._is_enter(key) and (value or optional):
@@ -303,7 +319,10 @@ class PopupComponentMixin:
                 cursor,
                 "",
             )
-            key = stdscr.get_wch()
+            key = self._read_prompt_key(stdscr)
+            if isinstance(key, PromptPasteEvent):
+                value, cursor = self._insert_single_line_paste(value, cursor, key.text)
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None if optional else ""
             if self._is_enter(key) and (value or optional):
@@ -369,7 +388,10 @@ class PopupComponentMixin:
                 cursor,
                 "",
             )
-            key = stdscr.get_wch()
+            key = self._read_prompt_key(stdscr)
+            if isinstance(key, PromptPasteEvent):
+                value, cursor = self._insert_single_line_paste(value, cursor, key.text)
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None if optional else ""
             if self._is_enter(key) and (value or optional):
@@ -853,7 +875,10 @@ class PopupComponentMixin:
                     cursor,
                     "Esc Cancel · Enter Submit",
                 )
-                key = stdscr.get_wch()
+                key = self._read_prompt_key(stdscr)
+                if isinstance(key, PromptPasteEvent):
+                    value, cursor = self._insert_single_line_paste(value, cursor, key.text)
+                    continue
                 if self._is_escape(key) or self._is_ctrl_c(key):
                     return QuestionResponse(
                         answered=False,

@@ -6,11 +6,12 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import time
 import urllib.error
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Protocol, TypeAlias, cast
 
@@ -83,6 +84,16 @@ class OpenAIStreamResponse:
 
 
 @dataclass(frozen=True)
+class OpenAIChatCompletionStreamResponse:
+    """Result collected from an OpenAI-compatible Chat Completions stream."""
+
+    text: str
+    tool_calls: tuple[OpenAIToolCall, ...]
+    assistant_message: dict[str, Any]
+    thoughts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class AnthropicToolCall:
     """Tool call emitted by the Anthropic Messages API."""
 
@@ -140,9 +151,152 @@ class OllamaStreamResponse:
 
 
 ModelRequestStreamResponse: TypeAlias = (
-    OpenAIStreamResponse | AnthropicStreamResponse | OllamaStreamResponse | str
+    OpenAIStreamResponse
+    | OpenAIChatCompletionStreamResponse
+    | AnthropicStreamResponse
+    | OllamaStreamResponse
+    | str
 )
 BackendTextCallback: TypeAlias = Callable[[str], None]
+
+
+@dataclass
+class ThinkingTagStreamFilter:
+    """Hide provider-supplied ``<think>`` blocks from user-facing text streams."""
+
+    _buffer: str = ""
+    _inside_thinking: bool = False
+    _active_thought_parts: list[str] = field(default_factory=list)
+    _completed_thoughts: list[str] = field(default_factory=list)
+
+    _OPEN_TAG: ClassVar[str] = "<think>"
+    _CLOSE_TAG: ClassVar[str] = "</think>"
+
+    def feed(self, text: str) -> tuple[str, bool]:
+        """Return visible text and whether this chunk started a hidden thought."""
+        self._buffer += text
+        visible: list[str] = []
+        thought_started = False
+
+        while self._buffer:
+            normalized = self._buffer.lower()
+            if self._inside_thinking:
+                closing_index = normalized.find(self._CLOSE_TAG)
+                if closing_index < 0:
+                    trailing_prefix = self._trailing_tag_prefix(self._buffer, self._CLOSE_TAG)
+                    thought = (
+                        self._buffer[: -len(trailing_prefix)]
+                        if trailing_prefix
+                        else self._buffer
+                    )
+                    if thought:
+                        self._active_thought_parts.append(thought)
+                    self._buffer = trailing_prefix
+                    break
+                if closing_index:
+                    self._active_thought_parts.append(self._buffer[:closing_index])
+                self._buffer = self._buffer[closing_index + len(self._CLOSE_TAG) :]
+                self._inside_thinking = False
+                self._complete_thought()
+                continue
+
+            opening_index = normalized.find(self._OPEN_TAG)
+            closing_index = normalized.find(self._CLOSE_TAG)
+            if closing_index >= 0 and (opening_index < 0 or closing_index < opening_index):
+                visible.append(self._buffer[:closing_index])
+                self._buffer = self._buffer[closing_index + len(self._CLOSE_TAG) :]
+                continue
+            if opening_index < 0:
+                trailing_prefix = self._trailing_tag_prefix(self._buffer, self._OPEN_TAG)
+                if trailing_prefix:
+                    visible.append(self._buffer[: -len(trailing_prefix)])
+                    self._buffer = trailing_prefix
+                else:
+                    visible.append(self._buffer)
+                    self._buffer = ""
+                break
+
+            visible.append(self._buffer[:opening_index])
+            self._buffer = self._buffer[opening_index + len(self._OPEN_TAG) :]
+            self._inside_thinking = True
+            thought_started = True
+
+        return "".join(visible), thought_started
+
+    def finish(self) -> str:
+        """Flush ordinary trailing text while retaining unfinished thoughts separately."""
+        if self._inside_thinking:
+            thought, final_text = self.split_unclosed_thought(
+                "".join(self._active_thought_parts)
+            )
+            self._active_thought_parts.clear()
+            if thought:
+                self._completed_thoughts.append(thought)
+            self._buffer = ""
+            return final_text
+        if self._buffer and self._OPEN_TAG.startswith(self._buffer.lower()):
+            self._buffer = ""
+            return ""
+        trailing = self._buffer
+        self._buffer = ""
+        return trailing
+
+    def drain_completed_thoughts(self) -> tuple[str, ...]:
+        """Return thought blocks completed since the last drain."""
+        thoughts = tuple(self._completed_thoughts)
+        self._completed_thoughts.clear()
+        return thoughts
+
+    def _complete_thought(self) -> None:
+        thought = "".join(self._active_thought_parts).strip()
+        self._active_thought_parts.clear()
+        if thought:
+            self._completed_thoughts.append(thought)
+
+    @staticmethod
+    def split_unclosed_thought(value: str) -> tuple[str, str]:
+        """Recover a clearly separated final reply from malformed thought output.
+
+        Some OpenAI-compatible providers emit a reasoning paragraph and then the
+        user-facing answer in the same unclosed ``<think>`` block.  We only recover
+        the last paragraph when the leading text unmistakably reads like reasoning;
+        otherwise the entire value remains hidden.
+        """
+        text = value.strip()
+        parts = [part.strip() for part in re.split(r"\n[\t ]*\n", text) if part.strip()]
+        if len(parts) < 2:
+            return text, ""
+
+        thought = "\n\n".join(parts[:-1]).strip()
+        final_text = parts[-1]
+        normalized_thought = thought.lower()
+        reasoning_markers = (
+            "the user",
+            "i should",
+            "i need to",
+            "we need",
+            "let me",
+            "should respond",
+            "my response",
+        )
+        if not any(marker in normalized_thought for marker in reasoning_markers):
+            return text, ""
+        return thought, final_text
+
+    @staticmethod
+    def _trailing_tag_prefix(value: str, tag: str) -> str:
+        lowered = value.lower()
+        for length in range(min(len(value), len(tag) - 1), 0, -1):
+            if lowered.endswith(tag[:length]):
+                return value[-length:]
+        return ""
+
+
+def strip_thinking_tags(text: str) -> str:
+    """Return complete persisted text without provider private-reasoning tags."""
+    text_filter = ThinkingTagStreamFilter()
+    visible, _thought_started = text_filter.feed(text)
+    return f"{visible}{text_filter.finish()}".strip()
 
 
 class BackendCallbacks(Protocol):
@@ -150,6 +304,7 @@ class BackendCallbacks(Protocol):
 
     status: BackendTextCallback | None
     delta: BackendTextCallback | None
+    thought: BackendTextCallback | None
     finish: BackendTextCallback | None
 
 
@@ -171,6 +326,8 @@ def backend_supports_image_input(provider_key: str, model: str) -> bool:
 
     if provider_key in {"openai", "anthropic"}:
         return True
+    if provider_key == "blablador":
+        return model == "alias-code"
     if provider_key == "ollama":
         normalized = model.lower()
         return any(marker in normalized for marker in OLLAMA_IMAGE_MODEL_MARKERS)
@@ -244,7 +401,7 @@ class BaseBackend:
     stays on the runtime and is available through ``self.runtime``.
     """
 
-    runtime: object
+    runtime: Any
     provider_key: ClassVar[str] = ""
     provider_label: ClassVar[str] = ""
     env_var: ClassVar[str] = ""
@@ -253,6 +410,50 @@ class BaseBackend:
         """Delegate runtime-owned orchestration helpers to the active runtime."""
 
         return getattr(self.runtime, name)
+
+    def _visible_stream_text(
+        self,
+        text_filter: ThinkingTagStreamFilter,
+        text: str,
+        delta_callback: BackendTextCallback | None,
+        status_callback: BackendTextCallback | None,
+        thought_callback: BackendTextCallback | None = None,
+    ) -> str:
+        """Emit only final-answer text while retaining hidden reasoning separately."""
+        visible, _thought_started = text_filter.feed(text)
+        self._emit_completed_thoughts(text_filter, thought_callback, status_callback)
+        if visible and delta_callback is not None:
+            delta_callback(visible)
+        return visible
+
+    def _finish_visible_stream_text(
+        self,
+        text_filter: ThinkingTagStreamFilter,
+        delta_callback: BackendTextCallback | None,
+        status_callback: BackendTextCallback | None = None,
+        thought_callback: BackendTextCallback | None = None,
+    ) -> str:
+        """Flush text buffered to detect a possible split thinking tag."""
+        visible = text_filter.finish()
+        self._emit_completed_thoughts(text_filter, thought_callback, status_callback)
+        if visible and delta_callback is not None:
+            delta_callback(visible)
+        return visible
+
+    def _emit_completed_thoughts(
+        self,
+        text_filter: ThinkingTagStreamFilter,
+        thought_callback: BackendTextCallback | None,
+        status_callback: BackendTextCallback | None,
+    ) -> tuple[str, ...]:
+        """Surface completed reasoning as an expandable work item when supported."""
+        thoughts = text_filter.drain_completed_thoughts()
+        for thought in thoughts:
+            if thought_callback is not None:
+                thought_callback(thought)
+            else:
+                self.runtime._status(status_callback, "Created a thought")
+        return thoughts
 
     def generate(
         self,
@@ -398,7 +599,7 @@ class BaseBackend:
                     "expired",
                 )
             )
-        if provider_key in {"anthropic", "desy"}:
+        if provider_key in {"anthropic", "desy", "blablador"}:
             return status == 401 or error_type == "authentication_error"
         return False
 
