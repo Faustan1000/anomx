@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from anomx.agent.base.agents import AgentKind, BaseAgent
+from anomx.agent.helpers.anomx_api import call_anomx_api, connection_from_home
 from anomx.agent.helpers.mode import AgentMode
 from anomx.agent.helpers.state import (
     latest_plan_steps,
@@ -356,6 +357,7 @@ class AnomxCliApp(
                     subagent_badge_pair = 11
             self._colors = {
                 "accent": curses.color_pair(1) | curses.A_BOLD,
+                "match": curses.color_pair(subagent_pair) | curses.A_BOLD,
                 "subagent": curses.color_pair(subagent_pair) | curses.A_BOLD,
                 "subagent_badge": curses.color_pair(subagent_badge_pair) | curses.A_BOLD,
                 "selected": curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD,
@@ -388,6 +390,7 @@ class AnomxCliApp(
         else:
             self._colors = {
                 "accent": curses.A_BOLD,
+                "match": curses.A_BOLD,
                 "subagent": curses.A_BOLD,
                 "subagent_badge": curses.A_REVERSE | curses.A_BOLD,
                 "selected": curses.A_REVERSE,
@@ -988,6 +991,22 @@ class AnomxCliApp(
                 scroll,
             )
             return None
+        if command == "/effort":
+            self._run_project_effort_panel(
+                stdscr,
+                project,
+                sessions,
+                selected,
+                scroll,
+            )
+            return None
+        if command == "/feedback":
+            current_session = (
+                self._project_command_session(sessions, selected)
+                or self._ephemeral_session()
+            )
+            self._send_cli_feedback(stdscr, current_session, submitted)
+            return None
         skill = self._skill_for_command(command)
         if skill is not None:
             return self._start_project_skill_session(skill, submitted or command)
@@ -1142,6 +1161,19 @@ class AnomxCliApp(
             agent_kind=self.active_agent.kind,
         )
 
+    def _restore_session_model(self, session: SessionRecord) -> None:
+        """Make the chat's stored provider/model the active selection on open."""
+        provider = str(getattr(session, "provider", "") or "").strip()
+        model = str(getattr(session, "model", "") or "").strip()
+        if not provider or not model:
+            return
+        config = self.home.load_config()
+        if str(config.get("provider", "")) == provider and str(config.get("model", "")) == model:
+            return
+        config["provider"] = provider
+        config["model"] = model
+        self.home.save_config(config)
+
     def _ephemeral_session(self) -> SessionRecord:
         """Return a non-persisted placeholder session for backdrop rendering."""
         return SessionRecord(
@@ -1158,6 +1190,7 @@ class AnomxCliApp(
     def _run_session(self, stdscr: CursesWindow, session: SessionRecord) -> int | str:
         current_session = session
         self._activate_agent(current_session.agent_kind)
+        self._restore_session_model(current_session)
         input_text = ""
         cursor = 0
         file_references: dict[str, str] = {}
@@ -2040,6 +2073,12 @@ class AnomxCliApp(
         if command == "/model":
             self._run_model_panel(stdscr, current_session)
             return None
+        if command == "/effort":
+            self._run_effort_panel(stdscr, current_session)
+            return None
+        if command == "/feedback":
+            self._send_cli_feedback(stdscr, current_session, submitted)
+            return None
         if command == "/new":
             return self._create_session()
         skill = self._skill_for_command(command)
@@ -2205,6 +2244,66 @@ class AnomxCliApp(
     def _message_count_label(self, count: int) -> str:
         noun = "message" if count == 1 else "messages"
         return f"{count} {noun}"
+
+    def _send_cli_feedback(
+        self,
+        stdscr: CursesWindow,
+        current_session: SessionRecord,
+        submitted: str = "",
+    ) -> None:
+        connection = connection_from_home(self.home)
+        if connection is None:
+            self._message(
+                stdscr,
+                "Feedback unavailable",
+                "Connect this CLI agent to an Anomx Platform in /config first.",
+            )
+            return
+
+        parts = submitted.strip().split(maxsplit=1)
+        comment = parts[1].strip() if len(parts) > 1 else ""
+        if not comment:
+            if self.state == AgentState.PROJECT:
+                prompted_comment = self._prompt_text(
+                    stdscr,
+                    title="Send Feedback",
+                    label="Short comment",
+                    optional=False,
+                )
+            else:
+                prompted_comment = self._prompt_popover_text(
+                    stdscr,
+                    current_session,
+                    title="Send Feedback",
+                    label="Short comment",
+                    optional=False,
+                )
+            if prompted_comment is None:
+                return
+            comment = prompted_comment.strip()
+        if not comment:
+            return
+
+        result = call_anomx_api(
+            connection,
+            method="POST",
+            path="/feedback/entries",
+            body={
+                "feature_key": "anomx-cli",
+                "source": "global",
+                "urgency": "low",
+                "message": comment,
+            },
+            output_name="cli-feedback",
+        )
+        if result.get("ok"):
+            self._message(stdscr, "Feedback sent", "Thank you for helping improve Anomx.")
+            return
+        self._message(
+            stdscr,
+            "Feedback failed",
+            f"The platform returned status {result.get('status_code', 0)}.",
+        )
 
     def _start_session_turn(
         self,
@@ -4590,14 +4689,24 @@ class AnomxCliApp(
             CommandSpec(skill.slash_command, f"{skill.title} · {skill.description}")
             for skill in self._all_skills()
         )
-        return (*COMMANDS, *skill_specs)
+        commands = tuple(
+            spec
+            for spec in COMMANDS
+            if spec.command != "/feedback" or self.home.has_platform_connection()
+        )
+        return (*commands, *skill_specs)
 
     def _project_command_specs(self) -> tuple[CommandSpec, ...]:
         skill_specs = tuple(
             CommandSpec(skill.slash_command, f"{skill.title} · {skill.description}")
             for skill in self._all_skills()
         )
-        project_specs = tuple(spec for spec in COMMANDS if spec.command in PROJECT_COMMANDS)
+        project_specs = tuple(
+            spec
+            for spec in COMMANDS
+            if spec.command in PROJECT_COMMANDS
+            and (spec.command != "/feedback" or self.home.has_platform_connection())
+        )
         return (*project_specs, *skill_specs)
 
     def _invoke_skill(

@@ -13,7 +13,6 @@ from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-
 ROOT_ONLY_PATHS = frozenset({"/docs", "/openapi.json"})
 
 

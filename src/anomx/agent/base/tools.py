@@ -172,6 +172,7 @@ def default_tool_statement(tool_name: str) -> str:
         "remove_plan": "Removing plan",
         "finish_anyways": "Finishing anyway",
         "output_response": "Preparing response",
+        "send_feedback": "Sending platform feedback",
         "start_subagent": "Starting subagent",
         "prompt_subagent": "Prompting subagent",
         "remove_subagent": "Removing subagent",

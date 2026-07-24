@@ -1,7 +1,7 @@
 import pandas as pd
 import pytest
 
-from anomx.datasets import TimeSeriesDataset, make_sine_anomaly_dataset
+from anomx.data import TimeSeriesDataset, make_sine_anomaly_dataset
 
 
 def test_synthetic_dataset_has_datetime_index_and_targets():

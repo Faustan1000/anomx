@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from anomx.datasets.core import TimeSeriesDataset
+from anomx.data.datasets import TimeSeriesDataset
 
 
 def make_sine_anomaly_dataset(

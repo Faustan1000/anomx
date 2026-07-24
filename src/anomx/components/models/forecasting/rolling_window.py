@@ -9,13 +9,19 @@ from typing import Any
 import pandas as pd
 
 from anomx._shared import ensure_dataframe
-from anomx.components.models.base import BaseAnomalyModel
+from anomx.components.base import DataStructure, ModelSignature, NormalityModel, Predictive
+from anomx.data.base.characteristics import Modality
 
 
-class RollingWindowForecastModel(BaseAnomalyModel):
+class RollingWindowForecastModel(NormalityModel, Predictive):
     """Estimate expected values from a rolling window and score residuals."""
 
     component_key = "rolling_window_forecast"
+    component_icon = "TrendUp01"
+    signature = ModelSignature(
+        structures={DataStructure.TEMPORAL_SEQUENCE, DataStructure.SEQUENCE},
+        modalities={Modality.NUMERIC},
+    )
     component_name = "Rolling Window Forecast"
     component_default_config = {
         "feature_columns": [],
@@ -70,7 +76,7 @@ class RollingWindowForecastModel(BaseAnomalyModel):
                 handle,
             )
 
-    def load(self, path: str) -> "RollingWindowForecastModel":
+    def load(self, path: str) -> RollingWindowForecastModel:
         with Path(path).open("rb") as handle:
             payload = pickle.load(handle)
         self.config = dict(payload["config"])

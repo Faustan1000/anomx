@@ -48,6 +48,8 @@ class ProviderOption:
     label: str
     models: tuple[str, ...]
     allow_custom_model: bool = False
+    connect_hint: str = "Connect to this AI backend"
+    requires_api_key: bool = True
 
 
 @dataclass(frozen=True)
@@ -105,12 +107,14 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
         "DESY Assistant",
         ("desy-assistant", "reasoning", "coding"),
         allow_custom_model=True,
+        connect_hint="Connect to LLMs hosted on the Maxwell cluster",
     ),
     ProviderOption(
         "blablador",
         "JSC Blablador",
         ("alias-code", "alias-fast", "alias-large", "alias-huge"),
         allow_custom_model=True,
+        connect_hint="Connect to LLMs hosted on the Jülich Supercomputing Centre",
     ),
     ProviderOption(
         "anthropic",
@@ -121,18 +125,22 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
             "claude-haiku-4-5-20251001",
         ),
         allow_custom_model=True,
+        connect_hint="Connect to Claude models hosted by Anthropic",
     ),
     ProviderOption(
         "openai",
         "OpenAI",
         ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
         allow_custom_model=True,
+        connect_hint="Connect to GPT models hosted by OpenAI",
     ),
     ProviderOption(
         "ollama",
         "Ollama",
         ("qwen3.6", "qwen3-coder:30b", "qwen2.5-coder:32b"),
         allow_custom_model=True,
+        connect_hint="Connect to LLMs that you run on your machine via Ollama",
+        requires_api_key=False,
     ),
 )
 
@@ -239,6 +247,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "projects": {},
     "global_allowed_commands": [],
     "global_rejected_commands": [],
+    "connected_backends": [],
 }
 
 CONFIG_SCALAR_FIELDS = (
@@ -635,6 +644,67 @@ class AnomxHome:
         auth = self.load_auth()
         api_keys = cast(dict[str, str], auth["api_keys"])
         return bool(api_keys.get(provider))
+
+    def remove_api_key(self, provider: str) -> None:
+        """Remove a stored API key for a provider."""
+
+        auth = self.load_auth()
+        api_keys = cast(dict[str, str], auth["api_keys"])
+        if api_keys.pop(provider, None) is not None:
+            self.save_auth(auth)
+
+    def _explicit_connected_backends(self) -> list[str]:
+        """Return the provider keys the user explicitly connected."""
+
+        config = self.load_config()
+        raw = config.get("connected_backends", [])
+        if not isinstance(raw, list):
+            return []
+        return [str(entry).strip() for entry in raw if str(entry).strip()]
+
+    def is_backend_connected(self, provider: str) -> bool:
+        """Return whether a backend is connected and usable.
+
+        Credential-based backends are connected once an API key is stored.
+        Keyless backends (such as Ollama) are connected via an explicit toggle.
+        """
+
+        option = provider_by_key(provider)
+        if option is not None and not option.requires_api_key:
+            if provider in self._explicit_connected_backends():
+                return True
+            # Migrate a legacy single-provider selection for keyless backends.
+            config = self.load_config()
+            return bool(config.get("onboarding_complete")) and (
+                str(config.get("provider", "")) == provider
+            )
+        return self.has_api_key(provider)
+
+    def connected_backend_keys(self) -> list[str]:
+        """Return the provider keys for every connected backend, in catalog order."""
+
+        return [
+            provider.key
+            for provider in AI_PROVIDERS
+            if self.is_backend_connected(provider.key)
+        ]
+
+    def set_backend_connected(self, provider: str, connected: bool) -> None:
+        """Connect or disconnect a keyless backend (e.g. Ollama).
+
+        Credential-based backends are connected by storing an API key and
+        disconnected by removing it; this only tracks the explicit toggle.
+        """
+
+        config = self.load_config()
+        current = config.get("connected_backends", [])
+        keys = [str(entry).strip() for entry in current if str(entry).strip()] if isinstance(current, list) else []
+        if connected and provider not in keys:
+            keys.append(provider)
+        elif not connected and provider in keys:
+            keys = [key for key in keys if key != provider]
+        config["connected_backends"] = keys
+        self.save_config(config)
 
     def set_platform_connection(
         self,
@@ -1270,6 +1340,35 @@ class AnomxHome:
         if str(payload.get("agent_mode", "")) == agent_mode.value:
             return
         payload["agent_mode"] = agent_mode.value
+        tmp_path = session_path.with_suffix(f"{session_path.suffix}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            for event in events:
+                json.dump(event, handle, sort_keys=True)
+                handle.write("\n")
+        tmp_path.replace(session_path)
+
+    def update_session_model(self, session_path: Path, provider: str, model: str) -> None:
+        """Persist the last used provider/model in the session metadata event."""
+
+        provider = str(provider or "").strip()
+        model = str(model or "").strip()
+        if not provider or not model:
+            return
+
+        events = self.read_session_events(session_path)
+        if not events:
+            return
+
+        first_event = events[0]
+        payload = first_event.get("payload")
+        if first_event.get("type") != "session_meta" or not isinstance(payload, dict):
+            return
+
+        if str(payload.get("provider", "")) == provider and str(payload.get("model", "")) == model:
+            return
+        payload["model_provider"] = provider
+        payload["provider"] = provider
+        payload["model"] = model
         tmp_path = session_path.with_suffix(f"{session_path.suffix}.tmp")
         with tmp_path.open("w", encoding="utf-8") as handle:
             for event in events:

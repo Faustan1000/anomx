@@ -7,10 +7,10 @@ from typing import Any
 import pandas as pd
 
 from anomx._shared import ensure_dataframe
-from anomx.components.detection.scorers.base import BaseScorer
+from anomx.components.base import ResidualScorer
 
 
-class ZScoreScorer(BaseScorer):
+class ZScoreScorer(ResidualScorer):
     """Normalize a model score column with a z-score."""
 
     component_key = "zscore"

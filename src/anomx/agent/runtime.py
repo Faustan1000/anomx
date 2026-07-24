@@ -188,6 +188,7 @@ class AgentRuntime:
         local_sandbox_enabled: bool = False,
         local_sandbox_home: Path | None = None,
         local_sandbox_allow_subprocess: bool = False,
+        platform_chat_id: str = "",
     ) -> None:
         self.home = home
         self.cwd = cwd.expanduser().resolve()
@@ -236,6 +237,7 @@ class AgentRuntime:
         self._parent_session_id: str = ""
         self.process_owner_id = process_owner_id
         self.process_owner_name = process_owner_name
+        self.platform_chat_id = platform_chat_id
         self.backend: BaseBackend | None = None
         self._sandbox_session: SandboxSession | None = None
 
@@ -987,6 +989,7 @@ class AgentRuntime:
             for tool in self.agent_spec.tools
             if (
                 (tool.name != "use_anomx_api" or self.has_platform_connection())
+                and (tool.name != "send_feedback" or self.has_platform_connection())
                 and (tool.name != "output_response" or self.can_output_response())
             )
         ]
@@ -1822,6 +1825,11 @@ class AgentRuntime:
             "ANOMX_API_KEY, and ANOMX_RESPONSES_DIR.",
             "- The helper folder is synced to ~/.anomx/skills/use-anomx-api and includes "
             "api.py for custom Python scripts.",
+            "- You have the right to use `send_feedback` when concrete platform friction or "
+            "a helpful platform behavior should be reported so Anomx can better serve users. "
+            "Good feedback explains what was unexpected, what information would have helped "
+            "earlier, or which tool or command repeatedly failed. Continue serving the user "
+            "after sending it and never include secrets.",
         ]
         if self.agent_spec.can_spawn_subagents:
             lines.append(

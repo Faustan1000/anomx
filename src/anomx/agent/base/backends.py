@@ -30,7 +30,11 @@ MAX_TOOL_ITERATIONS = 128
 # "max_tokens") is automatically continued before the loop gives up.
 MAX_TOKENS_CONTINUATIONS = 4
 OPENAI_MAX_TOOL_CALLS = 128
-MODEL_REQUEST_RETRY_STATUS_CODES = frozenset({400, 404, 429, 500, 502, 503})
+# Only transient statuses are retried. 400 is a deterministic client error (bad
+# request) that never succeeds on retry; retrying it turned real failures into an
+# endless "Reconnecting" loop instead of surfacing the error. 404 is kept because
+# the DESY backend returns it transiently while a route is warming up.
+MODEL_REQUEST_RETRY_STATUS_CODES = frozenset({404, 408, 429, 500, 502, 503, 529})
 MODEL_REQUEST_RETRY_COUNT = 10
 MODEL_REQUEST_RETRY_INITIAL_DELAY_SECONDS = 1.0
 MODEL_REQUEST_RETRY_MAX_DELAY_SECONDS = 60.0
@@ -958,12 +962,17 @@ class BaseBackend:
         ]
 
     def _openai_tools(self) -> list[dict[str, Any]]:
+        # ``strict`` is intentionally omitted: strict mode requires every tool's
+        # parameter schema (including nested objects) to list all properties in
+        # ``required`` with ``additionalProperties: false``. Several tools use
+        # optional/nested fields, so enabling strict makes the OpenAI Responses
+        # API reject the whole request with HTTP 400. The Chat Completions path
+        # (DESY/Blablador) omits strict for the same reason.
         return [
             {
                 "type": "function",
                 "name": tool["name"],
                 "description": tool["description"],
-                "strict": True,
                 "parameters": tool["parameters"],
             }
             for tool in self._tool_definitions()

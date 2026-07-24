@@ -15,7 +15,7 @@ class JobSpec:
     config: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_mapping(cls, payload: dict[str, Any]) -> "JobSpec":
+    def from_mapping(cls, payload: dict[str, Any]) -> JobSpec:
         return cls(
             connector=str(payload.get("connector") or "").strip(),
             model=str(payload.get("model") or "").strip(),

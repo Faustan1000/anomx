@@ -7,10 +7,10 @@ from typing import Any
 import pandas as pd
 
 from anomx._shared import ensure_dataframe
-from anomx.components.detection.detectors.base import BaseDetector
+from anomx.components.base import StaticThresholdDetector
 
 
-class ThresholdDetector(BaseDetector):
+class ThresholdDetector(StaticThresholdDetector):
     """Flag anomalies whenever a score column crosses a fixed threshold."""
 
     component_key = "threshold"

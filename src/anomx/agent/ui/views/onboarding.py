@@ -17,7 +17,7 @@ class OnboardingViewMixin:
         if provider is None:
             return False
 
-        if provider.key in {"openai", "anthropic", "blablador", "desy"}:
+        if provider.requires_api_key:
             api_key = self._prompt_text(
                 stdscr,
                 title=provider.label,
@@ -45,6 +45,9 @@ class OnboardingViewMixin:
         )
         if not user_name:
             return False
+
+        if not provider.requires_api_key:
+            self.home.set_backend_connected(provider.key, True)
 
         config = self.home.load_config()
         config["onboarding_complete"] = True

@@ -5,7 +5,7 @@ import anomx
 
 
 def test_version_is_exposed():
-    assert anomx.__version__ == "0.2.17"
+    assert anomx.__version__ == "0.2.20"
 
 
 def test_cli_version_runs():
@@ -16,4 +16,4 @@ def test_cli_version_runs():
         text=True,
     )
 
-    assert "anomx 0.2.17" in result.stdout
+    assert "anomx 0.2.20" in result.stdout

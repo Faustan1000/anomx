@@ -12,6 +12,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from anomx.agent.helpers.tool_manager import (
+    COMMAND_TIMEOUT_SECONDS,
+    command_timeout_output,
+)
+
 SANDBOX_IMAGE = "ubuntu:24.04"
 StatusCallback = Callable[[str], None]
 
@@ -309,7 +314,7 @@ class SandboxSession:
         self,
         command: str,
         *,
-        timeout: float = 120,
+        timeout: float = COMMAND_TIMEOUT_SECONDS,
     ) -> str:
         if self._container_id is None:
             return "[sandbox: container not running]"
@@ -320,7 +325,10 @@ class SandboxSession:
         ]
         exec_args.extend(["/bin/bash", "-c", command])
 
-        return self._run_captured(exec_args, timeout=timeout)
+        try:
+            return self._run_captured(exec_args, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            return command_timeout_output(error, timeout)
 
     # --- Internals ---
 

@@ -6,6 +6,7 @@ import curses
 import textwrap
 from collections.abc import Sequence
 from contextlib import suppress
+from dataclasses import replace
 
 from anomx.agent.helpers.tool_manager import (
     ApprovalChoice,
@@ -30,6 +31,40 @@ from anomx.agent.ui.models import (
 
 class PopupComponentMixin:
     """Reusable menus, overlays, text popovers, and approval/question popups."""
+
+    @staticmethod
+    def _filter_menu_choices(
+        choices: tuple[MenuChoice, ...],
+        query: str,
+    ) -> tuple[MenuChoice, ...]:
+        """Filter menu choices by a case-insensitive substring of the label.
+
+        Matching choices carry the query as ``highlight`` so the renderer can
+        mark the matched span. An empty query returns the choices unchanged.
+        """
+        needle = query.strip().lower()
+        if not needle:
+            return choices
+        return tuple(
+            replace(choice, highlight=query)
+            for choice in choices
+            if needle in choice.label.lower()
+        )
+
+    @staticmethod
+    def _menu_search_subtitle(subtitle: str, query: str, searchable: bool) -> str:
+        if not searchable:
+            return subtitle
+        if query:
+            return f"Search: {query}"
+        return f"{subtitle} · type to search" if subtitle else "Type to search"
+
+    @staticmethod
+    def _apply_menu_search_key(key: object, query: str) -> tuple[str, bool]:
+        """Return the updated query and whether the key was consumed as search."""
+        if isinstance(key, str) and key and key.isprintable() and key not in {"\n", "\r"}:
+            return query + key, True
+        return query, False
 
     @staticmethod
     def _insert_single_line_paste(value: str, cursor: int, text: str) -> tuple[str, int]:
@@ -65,15 +100,28 @@ class PopupComponentMixin:
         anchor_line: int | None = None,
         prompt_notice: str = "",
         prompt_notice_role: str = "light",
+        searchable: bool = False,
     ) -> str | None:
         selected = 0
         current_scroll = scroll
+        query = ""
         with suppress(curses.error):
             stdscr.nodelay(False)
         try:
             while True:
                 messages = self._read_message_lines(session.path)
-                panel = BottomPanel(title, subtitle, choices, selected)
+                active_choices = (
+                    self._filter_menu_choices(choices, query) if searchable else choices
+                )
+                selected = max(0, min(selected, len(active_choices) - 1)) if active_choices else 0
+                panel = BottomPanel(
+                    title,
+                    self._menu_search_subtitle(subtitle, query, searchable),
+                    active_choices,
+                    selected,
+                    highlight_attr="match" if searchable else "accent",
+                    selected_highlight_attr="match" if searchable else "selected",
+                )
                 viewport = self._draw_session(
                     stdscr,
                     session,
@@ -97,7 +145,7 @@ class PopupComponentMixin:
                 if key == curses.KEY_UP:
                     selected = max(0, selected - 1)
                 elif key == curses.KEY_DOWN:
-                    selected = min(len(choices) - 1, selected + 1)
+                    selected = min(len(active_choices) - 1, selected + 1)
                 elif key == curses.KEY_PPAGE:
                     panel_viewport = self._bottom_panel_viewport(stdscr, panel)
                     page_size = max(1, len(panel_viewport.visible_indices))
@@ -105,13 +153,21 @@ class PopupComponentMixin:
                 elif key == curses.KEY_NPAGE:
                     panel_viewport = self._bottom_panel_viewport(stdscr, panel)
                     page_size = max(1, len(panel_viewport.visible_indices))
-                    selected = min(len(choices) - 1, selected + page_size)
+                    selected = min(len(active_choices) - 1, selected + page_size)
                 elif key == curses.KEY_MOUSE:
                     choice = self._bottom_panel_mouse_choice(stdscr, panel)
-                    if choice is not None:
-                        return choices[choice].value
+                    if choice is not None and choice < len(active_choices):
+                        return active_choices[choice].value
                 elif self._is_enter(key):
-                    return choices[selected].value
+                    if active_choices:
+                        return active_choices[selected].value
+                elif searchable and self._is_backspace(key):
+                    query = query[:-1]
+                    selected = 0
+                elif searchable:
+                    query, consumed = self._apply_menu_search_key(key, query)
+                    if consumed:
+                        selected = 0
         finally:
             if restore_nodelay:
                 with suppress(curses.error):
@@ -128,11 +184,13 @@ class PopupComponentMixin:
         sessions: Sequence[SessionRecord],
         session_selected: int,
         scroll: int = 0,
+        searchable: bool = False,
     ) -> str | None:
         if not choices:
             return None
         selected = 0
         current_scroll = scroll
+        query = ""
         visible_sessions = list(sessions)
         with suppress(curses.error):
             stdscr.nodelay(False)
@@ -142,7 +200,18 @@ class PopupComponentMixin:
             session_selected = (
                 max(0, min(session_selected, len(visible_sessions) - 1)) if visible_sessions else 0
             )
-            panel = BottomPanel(title, subtitle, choices, selected)
+            active_choices = (
+                self._filter_menu_choices(choices, query) if searchable else choices
+            )
+            selected = max(0, min(selected, len(active_choices) - 1)) if active_choices else 0
+            panel = BottomPanel(
+                title,
+                self._menu_search_subtitle(subtitle, query, searchable),
+                active_choices,
+                selected,
+                highlight_attr="match" if searchable else "accent",
+                selected_highlight_attr="match" if searchable else "selected",
+            )
             current_scroll = self._draw_project(
                 stdscr,
                 project,
@@ -165,7 +234,7 @@ class PopupComponentMixin:
             if key == curses.KEY_UP:
                 selected = max(0, selected - 1)
             elif key == curses.KEY_DOWN:
-                selected = min(len(choices) - 1, selected + 1)
+                selected = min(len(active_choices) - 1, selected + 1)
             elif key == curses.KEY_PPAGE:
                 panel_viewport = self._bottom_panel_viewport(stdscr, panel)
                 page_size = max(1, len(panel_viewport.visible_indices))
@@ -173,13 +242,21 @@ class PopupComponentMixin:
             elif key == curses.KEY_NPAGE:
                 panel_viewport = self._bottom_panel_viewport(stdscr, panel)
                 page_size = max(1, len(panel_viewport.visible_indices))
-                selected = min(len(choices) - 1, selected + page_size)
+                selected = min(len(active_choices) - 1, selected + page_size)
             elif key == curses.KEY_MOUSE:
                 choice = self._bottom_panel_mouse_choice(stdscr, panel)
-                if choice is not None:
-                    return choices[choice].value
+                if choice is not None and choice < len(active_choices):
+                    return active_choices[choice].value
             elif self._is_enter(key):
-                return choices[selected].value
+                if active_choices:
+                    return active_choices[selected].value
+            elif searchable and self._is_backspace(key):
+                query = query[:-1]
+                selected = 0
+            elif searchable:
+                query, consumed = self._apply_menu_search_key(key, query)
+                if consumed:
+                    selected = 0
 
     def _run_overlay_menu(
         self,

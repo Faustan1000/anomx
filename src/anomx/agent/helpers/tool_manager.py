@@ -324,6 +324,30 @@ SCRIPT_RUNNERS = frozenset({"npm", "pnpm", "yarn"})
 OPTION_VALUE_ALLOWANCE_FLAGS = frozenset({"-m", "--module"})
 
 
+def command_timeout_output(
+    error: subprocess.TimeoutExpired,
+    timeout: float,
+) -> str:
+    """Format a command timeout as recoverable tool output for the agent."""
+
+    partial_parts: list[str] = []
+    for value in (error.output, error.stderr):
+        if isinstance(value, bytes):
+            text = value.decode("utf-8", errors="backslashreplace").strip()
+        else:
+            text = str(value or "").strip()
+        if text and text not in partial_parts:
+            partial_parts.append(text)
+    output = (
+        f"[timeout after {timeout:g}s]\n"
+        "The command exceeded its time limit. It may have made partial changes; "
+        "inspect the workspace and process state before deciding whether to retry."
+    )
+    if partial_parts:
+        output = f"{output}\nPartial output:\n" + "\n".join(partial_parts)
+    return output
+
+
 @dataclass(frozen=True)
 class CommandAllowanceDisplay:
     """Human-readable parts of a persisted command allowance key."""

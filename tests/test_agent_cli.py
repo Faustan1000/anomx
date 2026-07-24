@@ -4,6 +4,7 @@ import io
 import json
 import queue
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -48,6 +49,7 @@ from anomx.agent.helpers.terminal import (
     markdown_to_terminal_rendered_lines,
 )
 from anomx.agent.helpers.tool_manager import (
+    COMMAND_TIMEOUT_SECONDS,
     ApprovalChoice,
     CliToolManager,
     CommandApprovalRequest,
@@ -986,6 +988,9 @@ def test_anomx_api_tool_is_hidden_without_platform_connection(tmp_path):
     runtime = AgentRuntime(home, tmp_path, mode=AgentMode.CONFIRM)
 
     assert "use_anomx_api" not in {tool.name for tool in runtime._available_tools()}
+    assert "send_feedback" not in {tool.name for tool in runtime._available_tools()}
+    app = AnomxCliApp(home=home, cwd=tmp_path)
+    assert "/feedback" not in {spec.command for spec in app._command_specs()}
 
 
 def test_platform_connection_exposes_api_tool_and_hidden_system_skill(tmp_path):
@@ -1001,6 +1006,7 @@ def test_platform_connection_exposes_api_tool_and_hidden_system_skill(tmp_path):
     runtime = AgentRuntime(home, tmp_path, mode=AgentMode.CONFIRM)
 
     assert "use_anomx_api" in {tool.name for tool in runtime._available_tools()}
+    assert "send_feedback" in {tool.name for tool in runtime._available_tools()}
     assert runtime.tool_manager.subprocess_env is not None
     assert (
         runtime.tool_manager.subprocess_env["ANOMX_PLATFORM_API_URL"]
@@ -1012,6 +1018,7 @@ def test_platform_connection_exposes_api_tool_and_hidden_system_skill(tmp_path):
 
     app = AnomxCliApp(home=home, cwd=tmp_path)
     assert "/use-anomx-api" not in {spec.command for spec in app._command_specs()}
+    assert "/feedback" in {spec.command for spec in app._command_specs()}
 
 
 def test_startup_ollama_configures_local_backend(tmp_path):
@@ -1053,7 +1060,7 @@ def test_slash_commands_show_skills_on_empty_slash(tmp_path):
         "/rename",
         "/config",
         "/model",
-        "/exit",
+        "/effort",
     ]
     removed_commands = {"/open", "/debug", "/skills"}
     assert removed_commands.isdisjoint({command.command for command in all_commands})
@@ -1101,6 +1108,7 @@ def test_running_slash_commands_only_show_non_message_commands(tmp_path):
     assert [command.command for command in app._filtered_running_commands("/")] == [
         "/config",
         "/model",
+        "/effort",
     ]
     assert [command.command for command in app._filtered_running_commands("/con")] == [
         "/config"
@@ -1736,10 +1744,10 @@ def test_config_menu_shows_only_requested_entries(tmp_path):
     choices = app._config_menu_choices()
 
     assert [(choice.label, choice.value, choice.detail) for choice in choices] == [
-        ("Choose Backend", "backend", "Select provider and enter API key"),
-        ("Choose Model", "model", "Pick the model for the selected backend"),
+        ("Manage Backends", "backend", "Connect one or more AI backends"),
+        ("Choose Model", "model", "Pick a model from your connected backends"),
         (
-            "Connect Platform",
+            "Manage Platform",
             "platform",
             "Send agent activity, results, and findings to Anomx Platform",
         ),
@@ -2497,12 +2505,12 @@ def test_startup_loading_exits_when_platform_heartbeat_succeeds(
     assert len(sleeps) >= 3
 
 
-def test_configure_backend_requires_api_key_for_hosted_provider(tmp_path, monkeypatch):
+def test_connect_backend_stores_api_key_for_hosted_provider(tmp_path, monkeypatch):
     home = AnomxHome(tmp_path / "home")
     app = AnomxCliApp(home=home)
     prompts: list[tuple[str, str]] = []
 
-    monkeypatch.setattr(app, "_select_provider", lambda _stdscr: provider_by_key("openai"))
+    monkeypatch.setattr(app, "_provider_with_discovered_models", lambda provider, **_k: provider)
 
     def fake_prompt(_stdscr, title, label, mask=False, optional=True):
         prompts.append((title, label))
@@ -2512,93 +2520,68 @@ def test_configure_backend_requires_api_key_for_hosted_provider(tmp_path, monkey
 
     monkeypatch.setattr(app, "_prompt_text", fake_prompt)
 
-    assert app._configure_backend(object()) is True
+    app._connect_backend(object(), provider_by_key("openai"))
 
-    config = home.load_config()
-    assert config["provider"] == "openai"
     assert home.has_api_key("openai") is True
+    assert home.is_backend_connected("openai") is True
     assert prompts == [("OpenAI", "API key")]
 
 
-def test_configure_backend_provider_change_requires_model_selection(tmp_path, monkeypatch):
+def test_connect_backend_sets_active_model_when_none_connected(tmp_path, monkeypatch):
     home = AnomxHome(tmp_path / "home")
     app = AnomxCliApp(home=home)
-    prompts: list[tuple[str, str]] = []
-    selected_models: list[str] = []
 
-    monkeypatch.setattr(app, "_select_provider", lambda _stdscr: provider_by_key("desy"))
-    monkeypatch.setattr(
-        app,
-        "_select_model",
-        lambda _stdscr, provider: selected_models.append(provider.key) or "reasoning",
-    )
+    monkeypatch.setattr(app, "_provider_with_discovered_models", lambda provider, **_k: provider)
+    monkeypatch.setattr(app, "_prompt_text", lambda *_args, **_kwargs: "desy-api-key")
 
-    def fake_prompt(_stdscr, title, label, mask=False, optional=True):
-        prompts.append((title, label))
-        assert mask is True
-        assert optional is False
-        return "desy-api-key"
+    app._connect_backend(object(), provider_by_key("desy"))
 
-    monkeypatch.setattr(app, "_prompt_text", fake_prompt)
-
-    assert app._configure_backend(object()) is True
-
+    assert home.has_api_key("desy") is True
+    assert home.is_backend_connected("desy") is True
     config = home.load_config()
     assert config["provider"] == "desy"
-    assert config["model"] == "reasoning"
-    assert home.has_api_key("desy") is True
-    assert prompts == [("DESY Assistant", "API key")]
-    assert selected_models == ["desy"]
+    assert config["model"] == "desy-assistant"
 
 
-def test_configure_backend_can_keep_existing_api_key(tmp_path, monkeypatch):
+def test_connect_backend_ollama_uses_explicit_toggle(tmp_path, monkeypatch):
     home = AnomxHome(tmp_path / "home")
-    home.set_api_key("desy", "saved-desy-key")
     app = AnomxCliApp(home=home)
-    prompts: list[tuple[str, str]] = []
-    selected_models: list[str] = []
 
-    monkeypatch.setattr(app, "_select_provider", lambda _stdscr: provider_by_key("desy"))
-    monkeypatch.setattr(
-        app,
-        "_menu",
-        lambda _stdscr, title, subtitle, choices: (
-            prompts.append((title, subtitle)),
-            "keep",
-        )[1],
-    )
-    monkeypatch.setattr(
-        app,
-        "_select_model",
-        lambda _stdscr, provider: selected_models.append(provider.key) or "coding",
-    )
+    monkeypatch.setattr(app, "_provider_with_discovered_models", lambda provider, **_k: provider)
     monkeypatch.setattr(
         app,
         "_prompt_text",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("prompt should not run")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("no key prompt for ollama")),
     )
 
-    assert app._configure_backend(object()) is True
+    app._connect_backend(object(), provider_by_key("ollama"))
 
-    config = home.load_config()
-    assert config["provider"] == "desy"
-    assert config["model"] == "coding"
-    assert prompts == [("DESY Assistant", "API key already configured")]
-    assert selected_models == ["desy"]
+    assert home.has_api_key("ollama") is False
+    assert home.is_backend_connected("ollama") is True
 
 
-def test_configure_backend_does_not_save_provider_change_when_model_selection_is_cancelled(
-    tmp_path, monkeypatch
-):
+def test_disconnect_backend_removes_api_key(tmp_path):
+    home = AnomxHome(tmp_path / "home")
+    home.set_api_key("anthropic", "saved-key")
+    app = AnomxCliApp(home=home)
+    assert home.is_backend_connected("anthropic") is True
+
+    app._disconnect_backend(provider_by_key("anthropic"))
+
+    assert home.has_api_key("anthropic") is False
+    assert home.is_backend_connected("anthropic") is False
+
+
+def test_connect_backend_cancelled_prompt_does_not_connect(tmp_path, monkeypatch):
     home = AnomxHome(tmp_path / "home")
     app = AnomxCliApp(home=home)
 
-    monkeypatch.setattr(app, "_select_provider", lambda _stdscr: provider_by_key("desy"))
-    monkeypatch.setattr(app, "_prompt_text", lambda *_args, **_kwargs: "desy-api-key")
-    monkeypatch.setattr(app, "_select_model", lambda _stdscr, provider: None)
+    monkeypatch.setattr(app, "_prompt_text", lambda *_args, **_kwargs: "")
 
-    assert app._configure_backend(object()) is False
+    app._connect_backend(object(), provider_by_key("desy"))
 
+    assert home.has_api_key("desy") is False
+    assert home.is_backend_connected("desy") is False
     config = home.load_config()
     assert config["provider"] == "openai"
     assert config["model"] == "gpt-5.5"
@@ -2631,32 +2614,22 @@ def test_run_session_executes_selected_slash_command(tmp_path, monkeypatch):
     assert executed == ["/rename"]
 
 
-def test_run_config_panel_closes_after_backend_configuration(tmp_path, monkeypatch):
+def test_run_config_panel_stays_open_after_managing_backends(tmp_path, monkeypatch):
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
     repo.mkdir()
     session = home.create_session(repo, provider="openai", model="gpt-5.5")
     app = AnomxCliApp(home=home, use_color=False)
     stdscr = object()
-    menu_calls = 0
-    configured: list[object] = []
+    menu_results = iter(["backend", None])
+    managed: list[object] = []
 
-    def fake_menu(*_args, **_kwargs):
-        nonlocal menu_calls
-        menu_calls += 1
-        return "backend"
-
-    monkeypatch.setattr(app, "_menu", fake_menu)
-    monkeypatch.setattr(
-        app,
-        "_configure_backend",
-        lambda stdscr: configured.append(stdscr) or True,
-    )
+    monkeypatch.setattr(app, "_menu", lambda *_args, **_kwargs: next(menu_results))
+    monkeypatch.setattr(app, "_manage_backends", lambda s: managed.append(s))
 
     app._run_config_panel(stdscr, session)
 
-    assert menu_calls == 1
-    assert configured == [stdscr]
+    assert managed == [stdscr]
     assert app.state == AgentState.NEW_SESSION
 
 
@@ -2699,12 +2672,14 @@ def test_run_model_panel_saves_thinking_intensity_after_model_selection(
     repo = tmp_path / "repo"
     repo.mkdir()
     session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    home.set_api_key("openai", "openai-key")
     app = AnomxCliApp(home=home, use_color=False)
     intensity_prompts: list[tuple[str, str]] = []
 
-    monkeypatch.setattr(app, "_bottom_menu", lambda *_args, **_kwargs: "gpt-5.4")
+    monkeypatch.setattr(app, "_provider_with_discovered_models", lambda provider, **_k: provider)
+    monkeypatch.setattr(app, "_bottom_menu", lambda *_args, **_kwargs: "openai::gpt-5.4")
 
-    def fake_intensity(_stdscr, provider, model):
+    def fake_intensity(_stdscr, provider, model, **_kwargs):
         intensity_prompts.append((provider.key, model))
         return "high"
 
@@ -2717,6 +2692,100 @@ def test_run_model_panel_saves_thinking_intensity_after_model_selection(
     assert config["model"] == "gpt-5.4"
     assert config["thinking_intensity"] == "high"
     assert intensity_prompts == [("openai", "gpt-5.4")]
+
+
+def test_filter_menu_choices_marks_matching_models(tmp_path):
+    app = AnomxCliApp(home=AnomxHome(tmp_path / "home"))
+    choices = (
+        MenuChoice("gpt-5.5", "openai::gpt-5.5", "OpenAI"),
+        MenuChoice("claude-opus-4-8", "anthropic::claude-opus-4-8", "Anthropic"),
+        MenuChoice("gpt-5.4-mini", "openai::gpt-5.4-mini", "OpenAI"),
+    )
+
+    filtered = app._filter_menu_choices(choices, "gpt")
+
+    assert [choice.value for choice in filtered] == ["openai::gpt-5.5", "openai::gpt-5.4-mini"]
+    assert all(choice.highlight == "gpt" for choice in filtered)
+    assert app._filter_menu_choices(choices, "") == choices
+    assert app._filter_menu_choices(choices, "  ") == choices
+
+
+def test_run_effort_panel_saves_selected_intensity(tmp_path, monkeypatch):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    app = AnomxCliApp(home=home, use_color=False)
+
+    monkeypatch.setattr(app, "_bottom_menu", lambda *_args, **_kwargs: "high")
+
+    assert app._run_effort_panel(object(), session) is True
+    assert home.load_config()["thinking_intensity"] == "high"
+
+
+def test_run_effort_panel_reports_unsupported_model(tmp_path, monkeypatch):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="ollama", model="qwen3.6")
+    config = home.load_config()
+    config["provider"] = "ollama"
+    config["model"] = "qwen3.6"
+    home.save_config(config)
+    app = AnomxCliApp(home=home, use_color=False)
+    messages: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        app,
+        "_message",
+        lambda _stdscr, title, message: messages.append((title, message)),
+    )
+
+    assert app._run_effort_panel(object(), session) is False
+    assert messages and messages[0][0] == "Effort"
+
+
+def test_update_session_model_persists_selection(tmp_path):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="openai", model="gpt-5.5")
+
+    home.update_session_model(session.path, "anthropic", "claude-opus-4-8")
+
+    reloaded = next(
+        record for record in home.list_sessions(limit=None) if record.session_id == session.session_id
+    )
+    assert reloaded.provider == "anthropic"
+    assert reloaded.model == "claude-opus-4-8"
+
+
+def test_restore_session_model_updates_config(tmp_path):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="anthropic", model="claude-opus-4-8")
+    app = AnomxCliApp(home=home, use_color=False)
+
+    app._restore_session_model(session)
+
+    config = home.load_config()
+    assert config["provider"] == "anthropic"
+    assert config["model"] == "claude-opus-4-8"
+
+
+def test_new_session_uses_last_selected_model(tmp_path):
+    home = AnomxHome(tmp_path / "home")
+    config = home.load_config()
+    config["provider"] = "anthropic"
+    config["model"] = "claude-opus-4-8"
+    home.save_config(config)
+    app = AnomxCliApp(home=home, cwd=tmp_path, use_color=False)
+
+    session = app._create_session()
+
+    assert session.provider == "anthropic"
+    assert session.model == "claude-opus-4-8"
 
 
 def test_open_session_choices_show_location_without_model(tmp_path):
@@ -7038,6 +7107,40 @@ def test_local_sandbox_allows_agent_response_root_reads_and_copies(tmp_path):
     assert copy_output == "Paths copied."
     assert (workspace / "anomx-folders.json").read_text(encoding="utf-8") == '{"ok": true}'
     assert "outside the sandbox root" in private_config_output
+
+
+def test_local_sandbox_returns_shell_timeout_to_agent(tmp_path, monkeypatch):
+    workspace = tmp_path / "chat-workspace"
+    agent_home = tmp_path / "agent-home"
+    workspace.mkdir()
+    session = LocalSandboxSession(
+        LocalSandboxConfig(
+            root=workspace,
+            home=agent_home,
+            allow_subprocess=True,
+        )
+    )
+    captured: dict[str, float] = {}
+
+    def timeout_run(*_args, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        raise subprocess.TimeoutExpired(
+            "npm create",
+            kwargs["timeout"],
+            output=b"Creating application...",
+        )
+
+    monkeypatch.setattr(
+        "anomx.agent.helpers.local_sandbox.subprocess.run",
+        timeout_run,
+    )
+
+    output = session.exec_command("cd . && npm create 2>&1")
+
+    assert captured["timeout"] == COMMAND_TIMEOUT_SECONDS == 300
+    assert output.startswith("[timeout after 300s]")
+    assert "inspect the workspace and process state" in output
+    assert "Creating application..." in output
 
 
 def test_runtime_file_tools_allow_agent_response_root(tmp_path):

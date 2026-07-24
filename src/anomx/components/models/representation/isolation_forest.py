@@ -10,13 +10,25 @@ import pandas as pd
 from sklearn.ensemble import IsolationForest
 
 from anomx._shared import ensure_dataframe
-from anomx.components.models.base import BaseAnomalyModel
+from anomx.components.base import (
+    BoundaryEstimating,
+    DataStructure,
+    ModelSignature,
+    NormalityModel,
+    Representational,
+)
+from anomx.data.base.characteristics import Modality
 
 
-class IsolationForestModel(BaseAnomalyModel):
+class IsolationForestModel(NormalityModel, BoundaryEstimating, Representational):
     """Train an isolation forest on numeric columns and expose anomaly scores."""
 
     component_key = "isolation_forest"
+    component_icon = "Dataflow03"
+    signature = ModelSignature(
+        structures={DataStructure.TABULAR},
+        modalities={Modality.NUMERIC},
+    )
     component_name = "Isolation Forest"
     component_default_config = {
         "contamination": 0.15,
@@ -66,7 +78,7 @@ class IsolationForestModel(BaseAnomalyModel):
         with target.open("wb") as handle:
             pickle.dump({"model": self.model, "feature_columns": self.feature_columns}, handle)
 
-    def load(self, path: str) -> "IsolationForestModel":
+    def load(self, path: str) -> IsolationForestModel:
         with Path(path).open("rb") as handle:
             payload = pickle.load(handle)
         self.model = payload["model"]

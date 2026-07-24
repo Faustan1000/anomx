@@ -15,7 +15,6 @@ from anomx.components.models import (
 )
 from anomx.data.connectors import BaseConnector, LocalFSConnector
 
-
 ComponentKind = Literal["connector", "model", "scorer", "detector"]
 ComponentClass: TypeAlias = type[Any]
 

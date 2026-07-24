@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from shlex import split as shell_split
 
+from anomx.agent.helpers.tool_manager import (
+    COMMAND_TIMEOUT_SECONDS,
+    command_timeout_output,
+)
+
 MAX_OUTPUT_CHARS = 80_000
 PYTHON_SANDBOX_SYSTEMS = frozenset({"python", "local", "local-python", "software"})
 
@@ -92,19 +97,28 @@ class LocalSandboxSession:
         self.root.mkdir(parents=True, exist_ok=True)
         self.current_dir.mkdir(parents=True, exist_ok=True)
 
-    def exec_command(self, command: str, *, timeout: float = 120) -> str:
+    def exec_command(
+        self,
+        command: str,
+        *,
+        timeout: float = COMMAND_TIMEOUT_SECONDS,
+    ) -> str:
         normalized = command.strip()
         if not normalized:
             return "Command is empty."
-        if self._has_shell_syntax(normalized):
-            if self.config.allow_subprocess:
-                return self._run_shell_subprocess(normalized, timeout=timeout)
-            return (
-                "Local sandbox blocked this command: shell operators, environment "
-                "expansion, and redirection are not available in strict sandbox mode."
-            )
         try:
+            if self._has_shell_syntax(normalized):
+                if self.config.allow_subprocess:
+                    return self._run_shell_subprocess(normalized, timeout=timeout)
+                return (
+                    "Local sandbox blocked this command: shell operators, environment "
+                    "expansion, and redirection are not available in strict sandbox mode."
+                )
             parts = shell_split(normalized)
+        except OSError as error:
+            return f"Command failed: {error}"
+        except subprocess.TimeoutExpired as error:
+            return self._limit_output(command_timeout_output(error, timeout))
         except ValueError as error:
             return f"Local sandbox blocked this command: {error}"
         if not parts:
@@ -161,8 +175,8 @@ class LocalSandboxSession:
             )
         except OSError as error:
             return f"Command failed: {error}"
-        except subprocess.TimeoutExpired:
-            return f"Command timed out after {timeout:g}s."
+        except subprocess.TimeoutExpired as error:
+            return self._limit_output(command_timeout_output(error, timeout))
         except ValueError as error:
             return f"Local sandbox blocked this command: {error}"
 

@@ -1,4 +1,11 @@
-"""Component metadata helpers and discovery."""
+"""Component metadata surface and discovery.
+
+Every anomx building block — normality models, scorers, detectors,
+classifiers, algorithms — inherits from :class:`BaseComponent`. The base class
+provides everything a platform needs to render the component without importing
+domain code: name, description, docs, icon, configuration schema, current
+configuration, capability keys, and data signature.
+"""
 
 from __future__ import annotations
 
@@ -10,9 +17,10 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from anomx._shared import normalise_component_key, normalize_text
+from anomx.components.base.capabilities import collect_capability_keys
+from anomx.components.base.signature import ModelSignature
 
-
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
 COMPONENT_PACKAGE_NAMES = (
     "anomx.components.algorithms",
     "anomx.components.detection",
@@ -37,18 +45,20 @@ def read_component_source_path(component_class: type[object]) -> str:
 
 
 class BaseComponent:
-    """Common metadata surface for installable algorithm components."""
+    """Common metadata surface for installable pipeline components."""
 
     component_type: ClassVar[str | None] = None
     component_key: ClassVar[str] = ""
     component_name: ClassVar[str] = ""
     component_description: ClassVar[str] = ""
     component_docs: ClassVar[str] = ""
+    component_icon: ClassVar[str] = ""
     component_image_path: ClassVar[str] = ""
     component_status: ClassVar[str] = "active"
     component_default_config: ClassVar[dict[str, Any]] = {}
     component_config_schema: ClassVar[dict[str, Any]] = {}
     component_code_version: ClassVar[str] = ""
+    signature: ClassVar[ModelSignature | None] = None
 
     @classmethod
     def is_component_abstract(cls) -> bool:
@@ -86,6 +96,10 @@ class BaseComponent:
         return normalize_text(docs.split("\n\n", 1)[0])
 
     @classmethod
+    def get_component_icon(cls) -> str:
+        return normalize_text(getattr(cls, "component_icon", ""))
+
+    @classmethod
     def get_component_image_path(cls) -> str:
         return normalize_text(getattr(cls, "component_image_path", ""))
 
@@ -112,19 +126,65 @@ class BaseComponent:
         return read_component_source_path(cls)
 
     @classmethod
+    def get_component_import_path(cls) -> str:
+        return f"{cls.__module__}.{cls.__name__}"
+
+    @classmethod
+    def get_component_capabilities(cls) -> list[str]:
+        return collect_capability_keys(cls)
+
+    @classmethod
+    def get_component_signature(cls) -> ModelSignature | None:
+        signature = getattr(cls, "signature", None)
+        return signature if isinstance(signature, ModelSignature) else None
+
+    @classmethod
+    def get_component_parameters(cls) -> list[dict[str, Any]]:
+        """Describe the configurable parameters of this component.
+
+        The schema and defaults are the source of truth; the `__init__`
+        docstring may add per-parameter descriptions later.
+        """
+        schema = cls.get_component_config_schema()
+        defaults = cls.get_component_default_config()
+        parameter_names = list(dict.fromkeys([*schema.keys(), *defaults.keys()]))
+        return [
+            {
+                "name": parameter_name,
+                "type": normalize_text((schema.get(parameter_name) or {}).get("type")) or "string",
+                "default": defaults.get(parameter_name),
+            }
+            for parameter_name in parameter_names
+        ]
+
+    def get_config(self) -> dict[str, Any]:
+        """Return the effective configuration of this component instance."""
+        config = getattr(self, "config", None)
+        merged_config = {**self.get_component_default_config()}
+        if isinstance(config, dict):
+            merged_config.update(config)
+        return merged_config
+
+    @classmethod
     def get_component_definition_payload(cls) -> dict[str, Any]:
+        signature = cls.get_component_signature()
         return {
+            "capabilities": cls.get_component_capabilities(),
             "code_version": cls.get_component_code_version(),
             "component_type": cls.get_component_type(),
             "config_schema": cls.get_component_config_schema(),
             "default_config": cls.get_component_default_config(),
             "description": cls.get_component_description(),
             "docs": cls.get_component_docs(),
+            "icon": cls.get_component_icon(),
             "image_path": cls.get_component_image_path(),
+            "import_path": cls.get_component_import_path(),
             "key": cls.get_component_key(),
             "name": cls.get_component_name(),
+            "parameters": cls.get_component_parameters(),
             "python_class": cls.__name__,
             "python_module": cls.__module__,
+            "signature": signature.to_dict() if signature is not None else {},
             "source_path": cls.get_component_source_path(),
             "status": cls.get_component_status(),
         }

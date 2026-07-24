@@ -8,7 +8,7 @@ import shutil
 import textwrap
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -42,6 +42,7 @@ from anomx.agent.store import (
     ProviderOption,
     SessionRecord,
     model_detail,
+    normalize_thinking_intensity,
     provider_by_key,
     thinking_intensity_options,
 )
@@ -56,6 +57,9 @@ from anomx.agent.ui.models import (
     PlatformConnectionDraft,
     SkillFormDraft,
 )
+
+BACKEND_MODEL_CHOICE_SEPARATOR = "::"
+CUSTOM_MODEL_CHOICE_PREFIX = "__custom__"
 
 
 class ConfigViewMixin:
@@ -615,6 +619,64 @@ class ConfigViewMixin:
                 value = value[:cursor] + key + value[cursor:]
                 cursor += 1
 
+    def _connected_model_menu_choices(self, *, include_custom: bool = True) -> list[MenuChoice]:
+        """Return model choices aggregated across every connected backend."""
+
+        choices: list[MenuChoice] = []
+        connected_keys = self.home.connected_backend_keys()
+        for provider_key in connected_keys:
+            provider = provider_by_key(provider_key)
+            if provider is None:
+                continue
+            enriched = self._provider_with_discovered_models(provider)
+            for model in enriched.models:
+                info = model_detail(model)
+                detail = f"{provider.label} · {info}" if info else provider.label
+                choices.append(
+                    MenuChoice(
+                        model,
+                        f"{provider.key}{BACKEND_MODEL_CHOICE_SEPARATOR}{model}",
+                        detail,
+                    )
+                )
+        if include_custom:
+            for provider_key in connected_keys:
+                provider = provider_by_key(provider_key)
+                if provider is None or not provider.allow_custom_model:
+                    continue
+                choices.append(
+                    MenuChoice(
+                        f"Custom {provider.label} model",
+                        f"{CUSTOM_MODEL_CHOICE_PREFIX}{BACKEND_MODEL_CHOICE_SEPARATOR}{provider.key}",
+                        f"Use a custom {provider.label} model name",
+                    )
+                )
+        return choices
+
+    def _resolve_model_choice(
+        self,
+        selected: str | None,
+        *,
+        custom_prompt: Callable[[ProviderOption], str | None],
+    ) -> tuple[ProviderOption, str] | None:
+        """Resolve a union model-menu value into a (backend, model) pair."""
+
+        if not selected or BACKEND_MODEL_CHOICE_SEPARATOR not in selected:
+            return None
+        head, _, tail = selected.partition(BACKEND_MODEL_CHOICE_SEPARATOR)
+        if head == CUSTOM_MODEL_CHOICE_PREFIX:
+            provider = provider_by_key(tail)
+            if provider is None:
+                return None
+            model = custom_prompt(provider)
+            if not model:
+                return None
+            return provider, model.strip()
+        provider = provider_by_key(head)
+        if provider is None:
+            return None
+        return provider, tail
+
     def _run_model_panel(
         self,
         stdscr: CursesWindow,
@@ -623,39 +685,27 @@ class ConfigViewMixin:
         bottom_popover: bool = True,
     ) -> bool:
         self.state = AgentState.MODEL
-        config = self.home.load_config()
-        provider = provider_by_key(str(config.get("provider", "openai"))) or AI_PROVIDERS[0]
-        provider = self._provider_with_discovered_models(provider)
-        choices = [MenuChoice(model, model, model_detail(model)) for model in provider.models]
-        if provider.allow_custom_model:
-            choices.append(
-                MenuChoice(
-                    "Custom model",
-                    "__custom__",
-                    f"Use a custom {provider.label} model name",
-                )
-            )
+        choices = self._connected_model_menu_choices()
+        if not choices:
+            self._prompt_connect_backend(stdscr, current_session, bottom_popover=bottom_popover)
+            self.state = AgentState.NEW_SESSION
+            return False
+        subtitle = "Models from your connected backends"
         selected = (
             self._bottom_menu(
                 stdscr,
                 current_session,
                 "Model",
-                f"Provider: {provider.label}",
+                subtitle,
                 tuple(choices),
+                searchable=True,
             )
             if bottom_popover
-            else self._menu(
-                stdscr,
-                "Model",
-                f"Provider: {provider.label}",
-                tuple(choices),
-            )
+            else self._menu(stdscr, "Model", subtitle, tuple(choices))
         )
-        if selected is None:
-            self.state = AgentState.NEW_SESSION
-            return False
-        model = (
-            (
+        resolved = self._resolve_model_choice(
+            selected,
+            custom_prompt=lambda _provider: (
                 self._prompt_popover_text(
                     stdscr,
                     current_session,
@@ -665,27 +715,55 @@ class ConfigViewMixin:
                 )
                 if bottom_popover
                 else self._prompt_text(stdscr, "Model", "Model name", optional=False)
-            )
-            if selected == "__custom__"
-            else selected
+            ),
         )
-        if model:
-            thinking_intensity = self._select_thinking_intensity(
-                stdscr,
-                provider,
-                model,
-                current_session=current_session if bottom_popover else None,
-            )
-            if thinking_intensity is None:
-                self.state = AgentState.NEW_SESSION
-                return False
-            config["provider"] = provider.key
-            config["model"] = model
-            config["thinking_intensity"] = thinking_intensity
-            config["onboarding_complete"] = True
-            self.home.save_config(config)
+        if resolved is None:
+            self.state = AgentState.NEW_SESSION
+            return False
+        provider, model = resolved
+        thinking_intensity = self._select_thinking_intensity(
+            stdscr,
+            provider,
+            model,
+            current_session=current_session if bottom_popover else None,
+        )
+        if thinking_intensity is None:
+            self.state = AgentState.NEW_SESSION
+            return False
+        config = self.home.load_config()
+        config["provider"] = provider.key
+        config["model"] = model
+        config["thinking_intensity"] = thinking_intensity
+        config["onboarding_complete"] = True
+        self.home.save_config(config)
+        if getattr(current_session, "session_id", ""):
+            self.home.update_session_model(current_session.path, provider.key, model)
         self.state = AgentState.NEW_SESSION
-        return bool(model)
+        return True
+
+    def _prompt_connect_backend(
+        self,
+        stdscr: CursesWindow,
+        current_session: SessionRecord,
+        *,
+        bottom_popover: bool,
+    ) -> None:
+        """Offer to open Manage Backends when no backend is connected yet."""
+
+        choices = (
+            MenuChoice(
+                "Manage Backends",
+                "__manage__",
+                "Connect a backend before choosing a model",
+            ),
+        )
+        selected = (
+            self._bottom_menu(stdscr, current_session, "Model", "No connected backends", choices)
+            if bottom_popover
+            else self._menu(stdscr, "Model", "No connected backends", choices)
+        )
+        if selected == "__manage__":
+            self._manage_backends(stdscr)
 
     def _run_project_model_panel(
         self,
@@ -696,33 +774,42 @@ class ConfigViewMixin:
         scroll: int = 0,
     ) -> bool:
         self.state = AgentState.MODEL
-        config = self.home.load_config()
-        provider = provider_by_key(str(config.get("provider", "openai"))) or AI_PROVIDERS[0]
-        provider = self._provider_with_discovered_models(provider)
-        choices = [MenuChoice(model, model, model_detail(model)) for model in provider.models]
-        if provider.allow_custom_model:
-            choices.append(
-                MenuChoice(
-                    "Custom model",
-                    "__custom__",
-                    f"Use a custom {provider.label} model name",
-                )
+        choices = self._connected_model_menu_choices()
+        if not choices:
+            selected = self._project_bottom_menu(
+                stdscr,
+                project,
+                "Model",
+                "No connected backends",
+                (
+                    MenuChoice(
+                        "Manage Backends",
+                        "__manage__",
+                        "Connect a backend before choosing a model",
+                    ),
+                ),
+                sessions=sessions,
+                session_selected=session_selected,
+                scroll=scroll,
             )
+            if selected == "__manage__":
+                self._manage_backends(stdscr)
+            self.state = AgentState.PROJECT
+            return False
         selected = self._project_bottom_menu(
             stdscr,
             project,
             "Model",
-            f"Provider: {provider.label}",
+            "Models from your connected backends",
             tuple(choices),
             sessions=sessions,
             session_selected=session_selected,
             scroll=scroll,
+            searchable=True,
         )
-        if selected is None:
-            self.state = AgentState.PROJECT
-            return False
-        model = (
-            self._prompt_project_popover_text(
+        resolved = self._resolve_model_choice(
+            selected,
+            custom_prompt=lambda _provider: self._prompt_project_popover_text(
                 stdscr,
                 project,
                 "Model",
@@ -730,30 +817,121 @@ class ConfigViewMixin:
                 optional=False,
                 session_selected=session_selected,
                 scroll=scroll,
-            )
-            if selected == "__custom__"
-            else selected
+            ),
         )
-        if model:
-            thinking_intensity = self._select_project_thinking_intensity(
-                stdscr,
-                project,
-                provider,
-                model,
-                sessions=sessions,
-                session_selected=session_selected,
-                scroll=scroll,
-            )
-            if thinking_intensity is None:
-                self.state = AgentState.PROJECT
-                return False
-            config["provider"] = provider.key
-            config["model"] = model
-            config["thinking_intensity"] = thinking_intensity
-            config["onboarding_complete"] = True
-            self.home.save_config(config)
+        if resolved is None:
+            self.state = AgentState.PROJECT
+            return False
+        provider, model = resolved
+        thinking_intensity = self._select_project_thinking_intensity(
+            stdscr,
+            project,
+            provider,
+            model,
+            sessions=sessions,
+            session_selected=session_selected,
+            scroll=scroll,
+        )
+        if thinking_intensity is None:
+            self.state = AgentState.PROJECT
+            return False
+        config = self.home.load_config()
+        config["provider"] = provider.key
+        config["model"] = model
+        config["thinking_intensity"] = thinking_intensity
+        config["onboarding_complete"] = True
+        self.home.save_config(config)
         self.state = AgentState.PROJECT
-        return bool(model)
+        return True
+
+    def _effort_menu_choices(
+        self,
+        provider: ProviderOption,
+        model: str,
+        current: str,
+    ) -> tuple[MenuChoice, ...]:
+        choices: list[MenuChoice] = []
+        for option in thinking_intensity_options(provider.key, model):
+            detail = option.detail
+            if option.value == current:
+                detail = f"{detail} · current" if detail else "current"
+            choices.append(MenuChoice(option.label, option.value, detail))
+        return tuple(choices)
+
+    def _run_effort_panel(
+        self,
+        stdscr: CursesWindow,
+        current_session: SessionRecord,
+        *,
+        bottom_popover: bool = True,
+    ) -> bool:
+        self.state = AgentState.MODEL
+        config = self.home.load_config()
+        provider = provider_by_key(str(config.get("provider", "")))
+        model = str(config.get("model", ""))
+        if provider is None or not thinking_intensity_options(provider.key, model):
+            self._message(
+                stdscr,
+                "Effort",
+                f"{model or 'This model'} does not support reasoning effort.",
+            )
+            self.state = AgentState.NEW_SESSION
+            return False
+        current = normalize_thinking_intensity(config.get("thinking_intensity"))
+        choices = self._effort_menu_choices(provider, model, current)
+        subtitle = f"Reasoning effort · {model}"
+        selected = (
+            self._bottom_menu(stdscr, current_session, "Effort", subtitle, choices)
+            if bottom_popover
+            else self._menu(stdscr, "Effort", subtitle, choices)
+        )
+        if selected is None:
+            self.state = AgentState.NEW_SESSION
+            return False
+        config["thinking_intensity"] = selected
+        self.home.save_config(config)
+        self.state = AgentState.NEW_SESSION
+        return True
+
+    def _run_project_effort_panel(
+        self,
+        stdscr: CursesWindow,
+        project: ProjectRecord,
+        sessions: Sequence[SessionRecord],
+        session_selected: int,
+        scroll: int = 0,
+    ) -> bool:
+        self.state = AgentState.MODEL
+        config = self.home.load_config()
+        provider = provider_by_key(str(config.get("provider", "")))
+        model = str(config.get("model", ""))
+        if provider is None or not thinking_intensity_options(provider.key, model):
+            self._message(
+                stdscr,
+                "Effort",
+                f"{model or 'This model'} does not support reasoning effort.",
+            )
+            self.state = AgentState.PROJECT
+            return False
+        current = normalize_thinking_intensity(config.get("thinking_intensity"))
+        choices = self._effort_menu_choices(provider, model, current)
+        selected = self._project_bottom_menu(
+            stdscr,
+            project,
+            "Effort",
+            f"Reasoning effort · {model}",
+            choices,
+            sessions=sessions,
+            session_selected=session_selected,
+            scroll=scroll,
+        )
+        if selected is None:
+            self.state = AgentState.PROJECT
+            return False
+        config["thinking_intensity"] = selected
+        self.home.save_config(config)
+        self.state = AgentState.PROJECT
+        return True
 
     def _run_commands_panel(self, stdscr: CursesWindow, current_session: SessionRecord) -> None:
         self.state = AgentState.INFO
@@ -882,8 +1060,7 @@ class ConfigViewMixin:
                 if selected is None:
                     return
                 if selected == "backend":
-                    if self._configure_backend(stdscr):
-                        return
+                    self._manage_backends(stdscr)
                     continue
                 if selected == "model":
                     if self._run_model_panel(
@@ -934,8 +1111,8 @@ class ConfigViewMixin:
         )
         config = self.home.load_config()
         return (
-            MenuChoice("Choose Backend", "backend", "Select provider and enter API key"),
-            MenuChoice("Choose Model", "model", "Pick the model for the selected backend"),
+            MenuChoice("Manage Backends", "backend", self._backends_config_detail()),
+            MenuChoice("Choose Model", "model", "Pick a model from your connected backends"),
             platform_choice,
             MenuChoice("Manage Debug Mode", "debug", self._debug_config_detail(config)),
             MenuChoice(
@@ -1611,59 +1788,115 @@ class ConfigViewMixin:
         except curses.error:
             return None
 
-    def _configure_backend(self, stdscr: CursesWindow) -> bool:
+    def _backends_config_detail(self) -> str:
+        connected = self.home.connected_backend_keys()
+        if not connected:
+            return "Connect one or more AI backends"
+        if len(connected) == 1:
+            label = next(
+                (provider.label for provider in AI_PROVIDERS if provider.key == connected[0]),
+                connected[0],
+            )
+            return f"{label} connected"
+        return f"{len(connected)} backends connected"
+
+    def _backend_state_detail(self, provider: ProviderOption) -> str:
+        return "Connected" if self.home.is_backend_connected(provider.key) else provider.connect_hint
+
+    def _manage_backends(self, stdscr: CursesWindow) -> None:
+        while True:
+            choices = tuple(
+                MenuChoice(provider.label, provider.key, self._backend_state_detail(provider))
+                for provider in AI_PROVIDERS
+            )
+            selected = self._menu(
+                stdscr,
+                "Manage Backends",
+                "Connect one or more AI backends",
+                choices,
+            )
+            if selected is None:
+                return
+            provider = provider_by_key(selected)
+            if provider is not None:
+                self._manage_single_backend(stdscr, provider)
+
+    def _manage_single_backend(self, stdscr: CursesWindow, provider: ProviderOption) -> None:
+        if not self.home.is_backend_connected(provider.key):
+            self._connect_backend(stdscr, provider)
+            return
+        if provider.requires_api_key:
+            choices = (
+                MenuChoice("Replace API Key", "replace", "Enter a new API key"),
+                MenuChoice("Disconnect", "disconnect", f"Remove {provider.label} and its API key"),
+            )
+        else:
+            choices = (MenuChoice("Disconnect", "disconnect", f"Stop using {provider.label}"),)
+        selected = self._menu(stdscr, provider.label, "Connected", choices)
+        if selected == "replace":
+            self._connect_backend(stdscr, provider, force_key=True)
+        elif selected == "disconnect":
+            self._disconnect_backend(provider)
+
+    def _connect_backend(
+        self,
+        stdscr: CursesWindow,
+        provider: ProviderOption,
+        *,
+        force_key: bool = False,
+    ) -> None:
+        del force_key
+        if provider.requires_api_key:
+            api_key = self._prompt_text(
+                stdscr,
+                title=provider.label,
+                label="API key",
+                mask=True,
+                optional=False,
+            )
+            if not api_key:
+                return
+            self.home.set_api_key(provider.key, api_key)
+            self._provider_with_discovered_models(provider, refresh=True)
+        else:
+            self.home.set_backend_connected(provider.key, True)
+        self._ensure_active_model(provider)
+
+    def _disconnect_backend(self, provider: ProviderOption) -> None:
+        if provider.requires_api_key:
+            self.home.remove_api_key(provider.key)
+        self.home.set_backend_connected(provider.key, False)
+        self._reset_active_model_if_orphaned()
+
+    def _ensure_active_model(self, provider: ProviderOption) -> None:
         config = self.home.load_config()
-        previous_provider = str(config.get("provider", ""))
-        provider = self._select_provider(stdscr)
-        if provider is None:
-            return False
-        if provider.key in {"openai", "anthropic", "blablador", "desy"}:
-            should_prompt_api_key = True
-            if self.home.has_api_key(provider.key):
-                selected = self._menu(
-                    stdscr,
-                    provider.label,
-                    "API key already configured",
-                    (
-                        MenuChoice("Keep API Key", "keep", "Use the saved API key"),
-                        MenuChoice("New API Key", "new", "Replace the saved API key"),
-                    ),
-                )
-                if selected is None:
-                    return False
-                should_prompt_api_key = selected == "new"
-            if should_prompt_api_key:
-                api_key = self._prompt_text(
-                    stdscr,
-                    title=provider.label,
-                    label="API key",
-                    mask=True,
-                    optional=False,
-                )
-                if not api_key:
-                    return False
-                self.home.set_api_key(provider.key, api_key)
-        provider = self._provider_with_discovered_models(provider, refresh=True)
-        selected_model = str(config.get("model", ""))
-        model_was_selected = False
-        if provider.key != previous_provider:
-            model = self._select_model(stdscr, provider)
-            if model is None:
-                return False
-            selected_model = model
-            model_was_selected = True
-        elif not self._model_allowed(provider, selected_model):
-            selected_model = provider.models[0]
-            model_was_selected = True
-        if model_was_selected:
-            thinking_intensity = self._select_thinking_intensity(stdscr, provider, selected_model)
-            if thinking_intensity is None:
-                return False
-            config["thinking_intensity"] = thinking_intensity
+        active_provider = str(config.get("provider", ""))
+        active_model = str(config.get("model", ""))
+        if active_provider and active_model and self.home.is_backend_connected(active_provider):
+            return
+        enriched = self._provider_with_discovered_models(provider)
+        if not enriched.models:
+            return
         config["provider"] = provider.key
-        config["model"] = selected_model
+        config["model"] = enriched.models[0]
+        config["onboarding_complete"] = True
         self.home.save_config(config)
-        return True
+
+    def _reset_active_model_if_orphaned(self) -> None:
+        config = self.home.load_config()
+        active_provider = str(config.get("provider", ""))
+        if active_provider and self.home.is_backend_connected(active_provider):
+            return
+        connected = self.home.connected_backend_keys()
+        fallback = provider_by_key(connected[0]) if connected else None
+        if fallback is None:
+            return
+        enriched = self._provider_with_discovered_models(fallback)
+        if not enriched.models:
+            return
+        config["provider"] = fallback.key
+        config["model"] = enriched.models[0]
+        self.home.save_config(config)
 
     def _configure_platform(
         self,
@@ -2048,7 +2281,7 @@ class ConfigViewMixin:
 
     def _select_provider(self, stdscr: CursesWindow) -> ProviderOption | None:
         choices = tuple(
-            MenuChoice(provider.label, provider.key, ", ".join(provider.models))
+            MenuChoice(provider.label, provider.key, self._backend_state_detail(provider))
             for provider in AI_PROVIDERS
         )
         selected = self._menu(stdscr, "AI Backend", "Select provider", choices)

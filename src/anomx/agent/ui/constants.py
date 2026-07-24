@@ -20,10 +20,12 @@ COMMANDS = (
     CommandSpec("/rename", "Rename the current session"),
     CommandSpec("/config", "Edit configuration"),
     CommandSpec("/model", "Change model"),
+    CommandSpec("/effort", "Change reasoning effort"),
+    CommandSpec("/feedback", "Send feedback to the connected Anomx Platform"),
     CommandSpec("/exit", "Exit Anomx"),
 )
-PROJECT_COMMANDS = frozenset({"/new", "/config", "/model", "/exit"})
-RUNNING_SESSION_COMMANDS = frozenset({"/config", "/model"})
+PROJECT_COMMANDS = frozenset({"/new", "/config", "/model", "/effort", "/feedback", "/exit"})
+RUNNING_SESSION_COMMANDS = frozenset({"/config", "/model", "/effort"})
 
 RUNNING_NOTICE = (
     "Agent is working · messages blocked · Esc back · Ctrl+C/Ctrl+X interrupt"

@@ -10,8 +10,8 @@ from typing import Protocol, cast
 
 import pandas as pd
 
-from anomx.datasets import TimeSeriesDataset
-from anomx.models import Forecast, ForecastingModel
+from anomx.components.base import Forecast
+from anomx.data import TimeSeriesDataset
 
 
 class _DartsPrediction(Protocol):
@@ -37,7 +37,7 @@ def is_darts_available() -> bool:
     return util.find_spec("darts") is not None
 
 
-class DartsForecastingModel(ForecastingModel):
+class DartsForecastingModel:
     """Adapter for any fitted or unfitted Darts forecasting model.
 
     The wrapped model must implement the usual Darts `fit(TimeSeries)` and

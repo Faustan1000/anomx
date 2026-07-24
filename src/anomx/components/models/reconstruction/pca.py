@@ -11,13 +11,19 @@ from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
 from anomx._shared import ensure_dataframe
-from anomx.components.models.base import BaseAnomalyModel
+from anomx.components.base import DataStructure, ModelSignature, NormalityModel, Reconstructive
+from anomx.data.base.characteristics import Modality
 
 
-class PcaReconstructionModel(BaseAnomalyModel):
+class PcaReconstructionModel(NormalityModel, Reconstructive):
     """Project numeric features into a low-rank space and score reconstruction error."""
 
     component_key = "pca_reconstruction"
+    component_icon = "Cube01"
+    signature = ModelSignature(
+        structures={DataStructure.TABULAR, DataStructure.TEMPORAL_SEQUENCE},
+        modalities={Modality.NUMERIC},
+    )
     component_name = "PCA Reconstruction"
     component_default_config = {
         "feature_columns": [],
@@ -83,7 +89,7 @@ class PcaReconstructionModel(BaseAnomalyModel):
                 handle,
             )
 
-    def load(self, path: str) -> "PcaReconstructionModel":
+    def load(self, path: str) -> PcaReconstructionModel:
         with Path(path).open("rb") as handle:
             payload = pickle.load(handle)
         self.config = dict(payload["config"])

@@ -20,6 +20,7 @@ from anomx.agent.tools.prompt_subagent import PromptSubagentTool
 from anomx.agent.tools.read_file import ReadFileTool
 from anomx.agent.tools.remove_plan import RemovePlanTool
 from anomx.agent.tools.remove_subagent import RemoveSubagentTool
+from anomx.agent.tools.send_feedback import SendFeedbackTool
 from anomx.agent.tools.start_process import StartProcessTool
 from anomx.agent.tools.start_subagent import StartSubagentTool
 from anomx.agent.tools.update_plan import UpdatePlanTool
@@ -47,6 +48,7 @@ def build_agent_tools() -> tuple[BaseTool, ...]:
         EndProcessTool(statement_description=statement),
         AskQuestionTool(statement_description=statement),
         OutputResponseTool(),
+        SendFeedbackTool(statement_description=statement),
         MemorizeTool(statement_description=statement),
         CreatePlanTool(),
         UpdatePlanTool(),
@@ -73,6 +75,7 @@ def general_agent_tools() -> tuple[BaseTool, ...]:
         WebSearchTool(statement_description=statement),
         WebFetchTool(statement_description=statement),
         UseAnomxApiTool(statement_description=statement),
+        SendFeedbackTool(statement_description=statement),
     )
 
 
@@ -93,6 +96,7 @@ def explore_agent_tools() -> tuple[BaseTool, ...]:
         GrepTool(statement_description=statement),
         WebSearchTool(statement_description=statement),
         WebFetchTool(statement_description=statement),
+        SendFeedbackTool(statement_description=statement),
     )
 
 
@@ -108,6 +112,7 @@ def platform_agent_tools() -> tuple[BaseTool, ...]:
         GrepTool(statement_description=statement),
         WebSearchTool(statement_description=statement),
         WebFetchTool(statement_description=statement),
+        SendFeedbackTool(statement_description=statement),
     )
 
 
@@ -130,6 +135,7 @@ def plan_agent_tools() -> tuple[BaseTool, ...]:
         WebSearchTool(statement_description=statement),
         WebFetchTool(statement_description=statement),
         AskQuestionTool(statement_description=statement),
+        SendFeedbackTool(statement_description=statement),
         MemorizeTool(statement_description=statement),
         CreatePlanTool(),
         UpdatePlanTool(),
@@ -168,6 +174,7 @@ __all__ = [
     "ReadFileTool",
     "RemovePlanTool",
     "RemoveSubagentTool",
+    "SendFeedbackTool",
     "StartProcessTool",
     "StartSubagentTool",
     "UpdatePlanTool",
