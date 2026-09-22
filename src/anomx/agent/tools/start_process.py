@@ -11,7 +11,7 @@ from anomx.agent.helpers.utils import utc_now_iso
 
 
 class StartProcessTool(BaseTool):
-    def __init__(self, *, statement_description: str, build_agent: bool = False) -> None:
+    def __init__(self, *, statement_description: str, main_agent: bool = False) -> None:
         super().__init__(
             name="start_process",
             description="Start a long-running async CLI process.",
@@ -23,7 +23,7 @@ class StartProcessTool(BaseTool):
                         "description": (
                             "Long-running CLI command, for example 'npm run dev'. "
                             "It continues after the agent turn until ended."
-                            if build_agent
+                            if main_agent
                             else "Long-running CLI command."
                         ),
                     },
@@ -35,9 +35,7 @@ class StartProcessTool(BaseTool):
     def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> str:
         context.emit_operator_statement(self.name, arguments)
         if not context.runtime.agent_spec.can_start_processes:
-            return context.json_result(
-                {"error": "This agent kind cannot start async processes."}
-            )
+            return context.json_result({"error": "This agent kind cannot start async processes."})
         if context.session_path is None:
             return context.json_result({"error": "start_process requires a session."})
 

@@ -102,7 +102,7 @@ class PromptBarComponentMixin:
             self._attr("light"),
         )
         show_notice = bool(notice and notice != RUNNING_NOTICE)
-        hint_text = notice if show_notice else self.active_agent.prompt_hint
+        hint_text = notice if show_notice else self.agent_mode.prompt_hint
         hint_attr = notice_role if show_notice else self._mode_hint_attr_name()
         hint_width = layout.input_width + 2
         self._add(

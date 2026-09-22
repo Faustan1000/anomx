@@ -348,13 +348,14 @@ class BottomBarComponentMixin:
         suggestions: list[MenuChoice],
         selected: int,
         active: bool = False,
+        searching: bool = False,
     ) -> BottomPanel | None:
         if not suggestions:
             if not active:
                 return None
             return BottomPanel(
                 "Files",
-                "No matches found",
+                "Searching…" if searching else "No matches found",
                 tuple(),
                 0,
                 frame_attr="bold",

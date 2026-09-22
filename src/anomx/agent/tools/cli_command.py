@@ -30,7 +30,7 @@ class CliCommandTool(BaseTool):
         description: str | None = None,
         access: CliCommandAccess = "write",
         aliases: tuple[str, ...] = (),
-        build_agent: bool = False,
+        main_agent: bool = False,
     ) -> None:
         command_description = (
             "A read-only shell command inside the trusted workspace."
@@ -39,7 +39,7 @@ class CliCommandTool(BaseTool):
                 "A single CLI command, for example 'ls -la'. Shell operators and "
                 "redirection may be used when necessary; paths must resolve inside "
                 "the trusted workspace root."
-                if build_agent
+                if main_agent
                 else "A single CLI command inside the trusted workspace."
             )
         )
@@ -97,9 +97,7 @@ class CliCommandTool(BaseTool):
                 session_path=context.session_path,
             )
             with context.runtime._process_lock:
-                context.runtime._processes[long_running_command.process_id] = (
-                    long_running_command
-                )
+                context.runtime._processes[long_running_command.process_id] = long_running_command
             context.runtime._publish_process_state(
                 long_running_command,
                 context.session_path,
@@ -200,7 +198,7 @@ class CliCommandTool(BaseTool):
         command: str,
         statement: str,
     ) -> str | None:
-        if self.access != "read" and not context.runtime.agent_spec.read_only:
+        if self.access != "read":
             return None
         policy = context.runtime.tool_manager.classify(
             command,
@@ -208,12 +206,11 @@ class CliCommandTool(BaseTool):
         )
         if policy.safety == CommandSafety.ALLOW:
             return None
-        subject = "This tool" if self.access == "read" else "This subagent"
         return context.json_result(
             {
                 "approved": False,
                 "output": (
-                    f"{subject} is read-only. The command was denied because it is "
+                    "This tool is read-only. The command was denied because it is "
                     f"not classified as a read-only exploration command. Reason: {policy.reason}"
                 ),
                 "safety": CommandSafety.FORBIDDEN.value,

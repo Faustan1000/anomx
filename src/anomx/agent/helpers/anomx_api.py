@@ -15,6 +15,8 @@ from anomx import __version__
 from anomx.agent.store import AnomxHome
 
 DEFAULT_API_TIMEOUT_SECONDS = 30
+RESPONSE_PREVIEW_MAX_CHARACTERS = 20_000
+RESPONSE_PREVIEW_MAX_ITEMS = 20
 ANOMX_PLATFORM_ENV_KEYS = (
     "ANOMX_PLATFORM_URL",
     "ANOMX_PLATFORM_API_URL",
@@ -23,7 +25,6 @@ ANOMX_PLATFORM_ENV_KEYS = (
     "ANOMX_API_KEY",
     "ANOMX_RESPONSES_DIR",
 )
-ROOT_ONLY_PATHS = frozenset({"/docs", "/openapi.json"})
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,7 @@ def call_anomx_api(
     )
     length = len(raw)
     result_count = _result_count(payload)
+    response_preview, response_truncated = _response_preview(payload)
     meta = {
         "ok": 200 <= status_code < 300,
         "status_code": status_code,
@@ -151,6 +153,8 @@ def call_anomx_api(
         "parsed_as_json": parsed_as_json,
         "result_count": result_count,
         "response_path": str(output_path),
+        "response": response_preview,
+        "response_truncated": response_truncated,
     }
     if error:
         meta["error"] = error
@@ -161,13 +165,12 @@ def _build_url(base_url: str, path: str, query: Mapping[str, object] | None) -> 
     normalized_path = path.strip()
     if not normalized_path:
         raise AnomxApiError("path is required.")
-    root_path = normalized_path if normalized_path.startswith("/") else f"/{normalized_path}"
     if normalized_path.startswith(("http://", "https://")):
+        base = urlparse(base_url)
+        requested = urlparse(normalized_path)
+        if (requested.scheme, requested.netloc) != (base.scheme, base.netloc):
+            raise AnomxApiError("Absolute API URLs must use the connected platform origin.")
         url = normalized_path
-    elif root_path in ROOT_ONLY_PATHS:
-        parsed = urlparse(base_url)
-        origin = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
-        url = urljoin(f"{origin.rstrip('/')}/", root_path.lstrip("/"))
     else:
         url = urljoin(f"{base_url.rstrip('/')}/", normalized_path.lstrip("/"))
     query_string = _query_string(query)
@@ -242,3 +245,49 @@ def _result_count(payload: object) -> int | None:
     if isinstance(count, int):
         return count
     return None
+
+
+def _response_preview(payload: object) -> tuple[object, bool]:
+    """Return a bounded structured preview suitable for a model tool result."""
+
+    remaining = [RESPONSE_PREVIEW_MAX_CHARACTERS]
+    truncated = [False]
+
+    def visit(value: object, depth: int = 0) -> object:
+        if remaining[0] <= 0:
+            truncated[0] = True
+            return "[truncated]"
+        if depth >= 8:
+            truncated[0] = True
+            return "[maximum depth reached]"
+        if isinstance(value, dict):
+            preview: dict[str, object] = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= 50 or remaining[0] <= 0:
+                    truncated[0] = True
+                    break
+                normalized_key = str(key)
+                remaining[0] -= len(normalized_key) + 4
+                preview[normalized_key] = visit(item, depth + 1)
+            return preview
+        if isinstance(value, list):
+            if len(value) > RESPONSE_PREVIEW_MAX_ITEMS:
+                truncated[0] = True
+            return [visit(item, depth + 1) for item in value[:RESPONSE_PREVIEW_MAX_ITEMS]]
+        if isinstance(value, str):
+            allowed = max(0, min(len(value), remaining[0], 4_000))
+            preview = value[:allowed]
+            remaining[0] -= allowed
+            if allowed < len(value):
+                truncated[0] = True
+                return f"{preview}…"
+            return preview
+        serialized = json.dumps(value, ensure_ascii=False, default=str)
+        if len(serialized) > remaining[0]:
+            truncated[0] = True
+            remaining[0] = 0
+            return "[truncated]"
+        remaining[0] -= len(serialized)
+        return value
+
+    return visit(payload), truncated[0]

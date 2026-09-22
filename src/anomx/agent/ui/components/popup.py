@@ -126,13 +126,16 @@ class PopupComponentMixin:
                     stdscr,
                     session,
                     messages,
-                    "",
-                    0,
+                    self._modal_prompt_text,
+                    self._modal_prompt_cursor,
                     current_scroll,
                     bottom_panel=panel,
                     anchor_line=anchor_line,
                     prompt_notice=prompt_notice,
                     prompt_notice_role=prompt_notice_role,
+                    file_references=self._modal_prompt_file_references,
+                    image_attachments=self._modal_prompt_image_attachments,
+                    pasted_spans=self._modal_prompt_pasted_spans,
                 )
                 if viewport is not None:
                     current_scroll = viewport.scroll
@@ -218,12 +221,14 @@ class PopupComponentMixin:
                 visible_sessions,
                 session_selected,
                 current_scroll,
-                "",
-                0,
+                self._modal_prompt_text,
+                self._modal_prompt_cursor,
                 "",
                 "light",
                 0,
                 bottom_panel=panel,
+                file_references=self._modal_prompt_file_references,
+                pasted_spans=self._modal_prompt_pasted_spans,
             )
             key = stdscr.get_wch()
             if self._is_escape(key) or self._is_ctrl_c(key):
@@ -269,7 +274,12 @@ class PopupComponentMixin:
         """Run an overlay menu loop."""
         if not choices:
             return None
-        selected = 0
+        selectable_indices = tuple(
+            index for index, choice in enumerate(choices) if choice.selectable
+        )
+        if not selectable_indices:
+            return None
+        selected = selectable_indices[0]
         while True:
             self._draw_overlay(
                 stdscr,
@@ -283,10 +293,20 @@ class PopupComponentMixin:
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None
             if key == curses.KEY_UP:
-                selected = max(0, selected - 1)
+                selected = next(
+                    (
+                        index
+                        for index in reversed(selectable_indices)
+                        if index < selected
+                    ),
+                    selected,
+                )
             elif key == curses.KEY_DOWN:
-                selected = min(len(choices) - 1, selected + 1)
-            elif self._is_enter(key):
+                selected = next(
+                    (index for index in selectable_indices if index > selected),
+                    selected,
+                )
+            elif self._is_enter(key) and choices[selected].selectable:
                 return choices[selected].value
 
     def _run_overlay_text(
@@ -382,10 +402,13 @@ class PopupComponentMixin:
                 stdscr,
                 session,
                 self._read_message_lines(session.path),
-                "",
-                0,
+                self._modal_prompt_text,
+                self._modal_prompt_cursor,
                 0,
                 prompt_hint_suffix=" · Esc Cancel · Enter Save",
+                file_references=self._modal_prompt_file_references,
+                image_attachments=self._modal_prompt_image_attachments,
+                pasted_spans=self._modal_prompt_pasted_spans,
             )
             display_value = "*" * len(value) if mask else value
             self._draw_text_popover(
@@ -449,12 +472,14 @@ class PopupComponentMixin:
                 sessions,
                 session_selected,
                 current_scroll,
-                "",
-                0,
+                self._modal_prompt_text,
+                self._modal_prompt_cursor,
                 "",
                 "light",
                 0,
                 prompt_hint_suffix=" · Esc Cancel · Enter Save",
+                file_references=self._modal_prompt_file_references,
+                pasted_spans=self._modal_prompt_pasted_spans,
             )
             display_value = "*" * len(value) if mask else value
             self._draw_text_popover(

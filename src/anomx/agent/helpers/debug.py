@@ -140,6 +140,14 @@ class SessionDebugLogger:
         system = payload.get("system")
         if isinstance(system, str) and system.strip():
             messages.append({"role": "system", "content": system})
+        elif isinstance(system, list):
+            system_text = "\n\n".join(
+                str(block.get("text", ""))
+                for block in system
+                if isinstance(block, dict) and block.get("type") == "text"
+            ).strip()
+            if system_text:
+                messages.append({"role": "system", "content": system_text})
 
         instructions = payload.get("instructions")
         if isinstance(instructions, str) and instructions.strip():

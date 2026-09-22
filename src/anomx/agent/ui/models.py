@@ -13,6 +13,7 @@ from typing import Protocol
 from anomx.agent.helpers.mode import AgentMode
 from anomx.agent.helpers.tool_manager import ApprovalChoice, CommandApprovalRequest
 from anomx.agent.runtime import AgentRuntime, QuestionRequest, QuestionResponse
+from anomx.agent.runtime_process import RuntimeProcessClient
 from anomx.agent.store import ProjectRecord, SessionRecord
 
 
@@ -50,13 +51,14 @@ class CursesWindow(Protocol):
 
 @dataclass(frozen=True)
 class MenuChoice:
-    """Selectable full-screen menu item."""
+    """Full-screen menu row, optionally used as a non-selectable section label."""
 
     label: str
     value: str
     detail: str = ""
     highlight: str = ""
     highlight_spans: tuple[tuple[int, int], ...] = ()
+    selectable: bool = True
 
 
 @dataclass(frozen=True)
@@ -69,6 +71,7 @@ class MessageLine:
     expansion_key: str = dataclass_field(default="", compare=False)
     detail_title: str = dataclass_field(default="", compare=False)
     detail_body: str = dataclass_field(default="", compare=False)
+    activity_wave: bool = dataclass_field(default=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -165,7 +168,7 @@ class ActiveSessionTurn:
     """A model turn that may keep running outside the focused session view."""
 
     session: SessionRecord
-    runtime: AgentRuntime
+    runtime: AgentRuntime | RuntimeProcessClient
     events: queue.SimpleQueue[RuntimeUiEvent]
     result: dict[str, str]
     turn_id: str

@@ -12,6 +12,7 @@ MODEL_DISCOVERY_TIMEOUT_SECONDS = 8
 OPENAI_MODELS_ENDPOINT = "https://api.openai.com/v1/models"
 ANTHROPIC_MODELS_ENDPOINT = "https://api.anthropic.com/v1/models"
 BLABLADOR_MODELS_ENDPOINT = "https://api.blablador.fz-juelich.de/v1/models"
+KIMI_MODELS_ENDPOINT = "https://api.moonshot.ai/v1/models"
 OLLAMA_MODELS_ENDPOINT = "http://127.0.0.1:11434/api/tags"
 
 
@@ -77,9 +78,14 @@ def _model_request(provider_key: str, api_key: str | None) -> urllib.request.Req
             },
             method="GET",
         )
-    if provider_key == "blablador":
+    if provider_key in {"blablador", "kimi"}:
+        endpoint = (
+            BLABLADOR_MODELS_ENDPOINT
+            if provider_key == "blablador"
+            else KIMI_MODELS_ENDPOINT
+        )
         return urllib.request.Request(
-            BLABLADOR_MODELS_ENDPOINT,
+            endpoint,
             headers={"Authorization": f"Bearer {token}"},
             method="GET",
         )

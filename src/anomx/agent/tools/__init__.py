@@ -3,6 +3,14 @@
 from __future__ import annotations
 
 from anomx.agent.base.tools import BaseTool
+from anomx.agent.tools.anomx_platform import (
+    GetAnomxDataChannelHistoryTool,
+    GetAnomxObjectDetailsTool,
+    GetBackgroundRunsTool,
+    SearchAnomxDataChannelsTool,
+    SearchAnomxObjectsTool,
+)
+from anomx.agent.tools.data_adapters import ManageDataAdaptersTool
 from anomx.agent.tools.ask_question import AskQuestionTool
 from anomx.agent.tools.check_command_status import CheckCommandStatusTool
 from anomx.agent.tools.cli_command import CliCommandTool
@@ -29,22 +37,34 @@ from anomx.agent.tools.wait import WaitTool
 from anomx.agent.tools.web_fetch import WebFetchTool
 from anomx.agent.tools.web_search import WebSearchTool
 
-BUILD_STATEMENT_DESCRIPTION = "Persistent user-visible working message for this tool call."
+MAIN_AGENT_STATEMENT_DESCRIPTION = "Persistent user-visible working message for this tool call."
 SUBAGENT_STATEMENT_DESCRIPTION = "Persistent working message for this tool call."
 
 
-def build_agent_tools() -> tuple[BaseTool, ...]:
-    """Return tools available to the primary build-style agents."""
+def main_agent_tools() -> tuple[BaseTool, ...]:
+    """Return every tool available to the main agent."""
 
-    statement = BUILD_STATEMENT_DESCRIPTION
+    statement = MAIN_AGENT_STATEMENT_DESCRIPTION
     return (
         CliCommandTool(
             statement_description=statement,
-            description="Run a CLI command for operator inspection or validation.",
+            description="Run a CLI command for main-agent inspection or validation.",
             aliases=("run_cli_command",),
-            build_agent=True,
+            main_agent=True,
         ),
-        StartProcessTool(statement_description=statement, build_agent=True),
+        ReadFileTool(statement_description=statement),
+        ListDirectoryTool(statement_description=statement),
+        GlobTool(statement_description=statement),
+        GrepTool(statement_description=statement),
+        WebSearchTool(statement_description=statement),
+        WebFetchTool(statement_description=statement),
+        UseAnomxApiTool(statement_description=statement),
+        GetAnomxObjectDetailsTool(),
+        SearchAnomxObjectsTool(),
+        SearchAnomxDataChannelsTool(),
+        GetAnomxDataChannelHistoryTool(),
+        ManageDataAdaptersTool(),
+        StartProcessTool(statement_description=statement, main_agent=True),
         EndProcessTool(statement_description=statement),
         AskQuestionTool(statement_description=statement),
         OutputResponseTool(),
@@ -61,8 +81,8 @@ def build_agent_tools() -> tuple[BaseTool, ...]:
     )
 
 
-def general_agent_tools() -> tuple[BaseTool, ...]:
-    """Return tools available to general implementation subagents."""
+def subagent_tools() -> tuple[BaseTool, ...]:
+    """Return main-agent tools except direct-user, process, plan, and delegation tools."""
 
     statement = SUBAGENT_STATEMENT_DESCRIPTION
     return (
@@ -70,63 +90,33 @@ def general_agent_tools() -> tuple[BaseTool, ...]:
             statement_description=statement,
             aliases=("run_cli_command",),
         ),
-        StartProcessTool(statement_description=statement),
-        EndProcessTool(statement_description=statement),
-        WebSearchTool(statement_description=statement),
-        WebFetchTool(statement_description=statement),
-        UseAnomxApiTool(statement_description=statement),
-        SendFeedbackTool(statement_description=statement),
-    )
-
-
-def explore_agent_tools() -> tuple[BaseTool, ...]:
-    """Return tools available to read-only exploration subagents."""
-
-    statement = SUBAGENT_STATEMENT_DESCRIPTION
-    return (
-        CliCommandTool(
-            statement_description=statement,
-            name="bash",
-            description="Run a read-only shell command inside the trusted workspace.",
-            access="read",
-        ),
         ReadFileTool(statement_description=statement),
         ListDirectoryTool(statement_description=statement),
         GlobTool(statement_description=statement),
         GrepTool(statement_description=statement),
         WebSearchTool(statement_description=statement),
         WebFetchTool(statement_description=statement),
-        SendFeedbackTool(statement_description=statement),
-    )
-
-
-def platform_agent_tools() -> tuple[BaseTool, ...]:
-    """Return tools available to platform API subagents."""
-
-    statement = SUBAGENT_STATEMENT_DESCRIPTION
-    return (
         UseAnomxApiTool(statement_description=statement),
-        ReadFileTool(statement_description=statement),
-        ListDirectoryTool(statement_description=statement),
-        GlobTool(statement_description=statement),
-        GrepTool(statement_description=statement),
-        WebSearchTool(statement_description=statement),
-        WebFetchTool(statement_description=statement),
+        GetAnomxObjectDetailsTool(),
+        SearchAnomxObjectsTool(),
+        SearchAnomxDataChannelsTool(),
+        GetAnomxDataChannelHistoryTool(),
+        ManageDataAdaptersTool(),
         SendFeedbackTool(statement_description=statement),
     )
 
 
-def plan_agent_tools() -> tuple[BaseTool, ...]:
-    """Return tools available to the planning-first main agent."""
+def read_only_mode_tools() -> tuple[BaseTool, ...]:
+    """Return tools exposed to either agent while Plan mode is active."""
 
-    statement = BUILD_STATEMENT_DESCRIPTION
+    statement = MAIN_AGENT_STATEMENT_DESCRIPTION
     return (
         CliCommandTool(
             statement_description=statement,
             description="Run a read-only CLI command for planning and inspection.",
             access="read",
             aliases=("run_cli_command",),
-            build_agent=True,
+            main_agent=True,
         ),
         ReadFileTool(statement_description=statement),
         ListDirectoryTool(statement_description=statement),
@@ -134,14 +124,43 @@ def plan_agent_tools() -> tuple[BaseTool, ...]:
         GrepTool(statement_description=statement),
         WebSearchTool(statement_description=statement),
         WebFetchTool(statement_description=statement),
-        AskQuestionTool(statement_description=statement),
-        SendFeedbackTool(statement_description=statement),
-        MemorizeTool(statement_description=statement),
-        CreatePlanTool(),
-        UpdatePlanTool(),
-        RemovePlanTool(statement_description=statement),
-        FinishAnywaysTool(statement_description=statement),
+        GetAnomxObjectDetailsTool(),
+        SearchAnomxObjectsTool(),
+        SearchAnomxDataChannelsTool(),
+        GetAnomxDataChannelHistoryTool(),
+        ManageDataAdaptersTool(),
     )
+
+
+def recommendation_mode_tools(*, main_agent: bool) -> tuple[BaseTool, ...]:
+    """Return read tools plus recommendation creation for a connected platform."""
+
+    statement = MAIN_AGENT_STATEMENT_DESCRIPTION if main_agent else SUBAGENT_STATEMENT_DESCRIPTION
+    tools: list[BaseTool] = [
+        CliCommandTool(
+            statement_description=statement,
+            description="Run a read-only CLI command for recommendation research.",
+            access="read",
+            aliases=("run_cli_command",),
+            main_agent=main_agent,
+        ),
+        ReadFileTool(statement_description=statement),
+        ListDirectoryTool(statement_description=statement),
+        GlobTool(statement_description=statement),
+        GrepTool(statement_description=statement),
+        WebSearchTool(statement_description=statement),
+        WebFetchTool(statement_description=statement),
+        UseAnomxApiTool(statement_description=statement),
+        GetAnomxObjectDetailsTool(),
+        SearchAnomxObjectsTool(),
+        SearchAnomxDataChannelsTool(),
+        GetAnomxDataChannelHistoryTool(),
+        ManageDataAdaptersTool(),
+    ]
+    tools.append(GetBackgroundRunsTool())
+    if main_agent:
+        tools.append(OutputResponseTool())
+    return tuple(tools)
 
 
 def command_control_tools() -> tuple[BaseTool, ...]:
@@ -158,12 +177,16 @@ def wait_tool(target_description: str) -> BaseTool:
 
 __all__ = [
     "BaseTool",
+    "ManageDataAdaptersTool",
     "CheckCommandStatusTool",
     "CliCommandTool",
     "CreatePlanTool",
     "EndProcessTool",
     "FinishAnywaysTool",
     "GetSubagentInfoTool",
+    "GetBackgroundRunsTool",
+    "GetAnomxDataChannelHistoryTool",
+    "GetAnomxObjectDetailsTool",
     "GlobTool",
     "GrepTool",
     "KillCommandTool",
@@ -177,16 +200,17 @@ __all__ = [
     "SendFeedbackTool",
     "StartProcessTool",
     "StartSubagentTool",
+    "SearchAnomxDataChannelsTool",
+    "SearchAnomxObjectsTool",
     "UpdatePlanTool",
     "UseAnomxApiTool",
     "WaitTool",
     "WebFetchTool",
     "WebSearchTool",
-    "build_agent_tools",
     "command_control_tools",
-    "explore_agent_tools",
-    "general_agent_tools",
-    "platform_agent_tools",
-    "plan_agent_tools",
+    "main_agent_tools",
+    "read_only_mode_tools",
+    "recommendation_mode_tools",
+    "subagent_tools",
     "wait_tool",
 ]

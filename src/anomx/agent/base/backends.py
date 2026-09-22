@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
@@ -13,23 +14,27 @@ from collections.abc import Callable, Iterable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ClassVar, Protocol, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, TypeAlias, cast
 
+from anomx.agent.exceptions import BackendFailure
 from anomx.agent.helpers.extract_json import extract_json_object
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata, sanitize_memory_metadata
 from anomx.agent.store import (
     THINKING_INTENSITY_AUTO,
-    model_metadata,
+    model_output_token_budget,
     normalize_thinking_intensity,
     thinking_intensity_options,
 )
 
-MAX_TOOL_ITERATIONS = 128
+if TYPE_CHECKING:
+    from anomx.agent.context_management import ContextMessage
+
+MAX_TOOL_ITERATIONS = 256
 # How many times a response truncated by the output token limit (stop_reason
 # "max_tokens") is automatically continued before the loop gives up.
 MAX_TOKENS_CONTINUATIONS = 4
-OPENAI_MAX_TOOL_CALLS = 128
+OPENAI_MAX_TOOL_CALLS = 256
 # Only transient statuses are retried. 400 is a deterministic client error (bad
 # request) that never succeeds on retry; retrying it turned real failures into an
 # endless "Reconnecting" loop instead of surfacing the error. 404 is kept because
@@ -70,6 +75,202 @@ OLLAMA_IMAGE_MODEL_MARKERS = frozenset(
 
 
 @dataclass(frozen=True)
+class TokenUsage:
+    """Normalized token accounting reported by an AI backend for one API call.
+
+    ``input_tokens`` is the full request context including any cached portions,
+    so it directly reflects the context size occupied by the request. Provider
+    cache details are kept separately in ``cached_tokens`` (read from cache) and
+    ``cache_creation_tokens`` (written to cache).
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        if not isinstance(other, TokenUsage):
+            return NotImplemented
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            cached_tokens=self.cached_tokens + other.cached_tokens,
+            cache_creation_tokens=self.cache_creation_tokens + other.cache_creation_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cached_tokens: int = 0,
+        cache_creation_tokens: int = 0,
+        total_tokens: int = 0,
+    ) -> TokenUsage | None:
+        """Build a usage record, returning ``None`` when nothing was reported."""
+
+        usage = cls(
+            input_tokens=max(0, int(input_tokens)),
+            output_tokens=max(0, int(output_tokens)),
+            cached_tokens=max(0, int(cached_tokens)),
+            cache_creation_tokens=max(0, int(cache_creation_tokens)),
+            total_tokens=max(0, int(total_tokens))
+            or max(0, int(input_tokens)) + max(0, int(output_tokens)),
+        )
+        return usage if usage.total_tokens > 0 else None
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any] | None) -> TokenUsage | None:
+        """Restore a usage record from its persisted ``to_dict`` payload."""
+
+        if not isinstance(value, Mapping):
+            return None
+        return cls.build(
+            input_tokens=_usage_int(value.get("input_tokens")),
+            output_tokens=_usage_int(value.get("output_tokens")),
+            cached_tokens=_usage_int(value.get("cached_tokens")),
+            cache_creation_tokens=_usage_int(value.get("cache_creation_tokens")),
+            total_tokens=_usage_int(value.get("total_tokens")),
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        """Serialize for persistence in session events or platform metadata."""
+
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cached_tokens": self.cached_tokens,
+            "cache_creation_tokens": self.cache_creation_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    """Cumulative usage of a generation loop plus the latest context size."""
+
+    total: TokenUsage
+    context_tokens: int = 0
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any] | None) -> UsageSnapshot | None:
+        """Restore a snapshot from its persisted ``to_dict`` payload."""
+
+        if not isinstance(value, Mapping):
+            return None
+        usage = TokenUsage.from_dict(value)
+        if usage is None:
+            return None
+        return cls(total=usage, context_tokens=_usage_int(value.get("context_tokens")))
+
+    def to_dict(self) -> dict[str, int]:
+        """Serialize as a flat usage payload including the context size."""
+
+        return {**self.total.to_dict(), "context_tokens": self.context_tokens}
+
+
+UsageCallback: TypeAlias = Callable[[UsageSnapshot], None]
+
+
+def _usage_int(value: object) -> int:
+    """Coerce a provider usage value to a non-negative integer."""
+
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(number):
+        return 0
+    return max(0, int(number))
+
+
+def anthropic_token_usage(usage: Mapping[str, Any] | None) -> TokenUsage | None:
+    """Build normalized usage from an Anthropic Messages API usage payload."""
+
+    if not isinstance(usage, Mapping):
+        return None
+    cached_tokens = _usage_int(usage.get("cache_read_input_tokens"))
+    cache_creation_tokens = _usage_int(usage.get("cache_creation_input_tokens"))
+    return TokenUsage.build(
+        input_tokens=(
+            _usage_int(usage.get("input_tokens")) + cached_tokens + cache_creation_tokens
+        ),
+        output_tokens=_usage_int(usage.get("output_tokens")),
+        cached_tokens=cached_tokens,
+        cache_creation_tokens=cache_creation_tokens,
+    )
+
+
+def openai_token_usage(usage: Mapping[str, Any] | None) -> TokenUsage | None:
+    """Build normalized usage from an OpenAI Responses API usage payload."""
+
+    if not isinstance(usage, Mapping):
+        return None
+    details = usage.get("input_tokens_details")
+    cached_tokens = _usage_int(details.get("cached_tokens")) if isinstance(details, Mapping) else 0
+    return TokenUsage.build(
+        input_tokens=_usage_int(usage.get("input_tokens")),
+        output_tokens=_usage_int(usage.get("output_tokens")),
+        cached_tokens=cached_tokens,
+        total_tokens=_usage_int(usage.get("total_tokens")),
+    )
+
+
+def chat_completion_token_usage(usage: Mapping[str, Any] | None) -> TokenUsage | None:
+    """Build normalized usage from a Chat Completions usage payload."""
+
+    if not isinstance(usage, Mapping):
+        return None
+    details = usage.get("prompt_tokens_details")
+    cached_tokens = _usage_int(details.get("cached_tokens")) if isinstance(details, Mapping) else 0
+    return TokenUsage.build(
+        input_tokens=_usage_int(usage.get("prompt_tokens")),
+        output_tokens=_usage_int(usage.get("completion_tokens")),
+        cached_tokens=cached_tokens,
+        total_tokens=_usage_int(usage.get("total_tokens")),
+    )
+
+
+def ollama_token_usage(payload: Mapping[str, Any] | None) -> TokenUsage | None:
+    """Build normalized usage from a final Ollama chat response payload."""
+
+    if not isinstance(payload, Mapping):
+        return None
+    return TokenUsage.build(
+        input_tokens=_usage_int(payload.get("prompt_eval_count")),
+        output_tokens=_usage_int(payload.get("eval_count")),
+    )
+
+
+_TOKEN_COUNT_UNITS = ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "k"))
+
+
+def format_token_count(tokens: int) -> str:
+    """Format a token count compactly, e.g. ``132``, ``12k``, ``324k``, ``1M``."""
+
+    value = max(0, int(tokens))
+    if value < 1_000:
+        return str(value)
+    for index, (divisor, suffix) in enumerate(_TOKEN_COUNT_UNITS):
+        if value < divisor:
+            continue
+        scaled = value / divisor
+        rounded = round(scaled) if scaled >= 100 else round(scaled, 1)
+        if rounded >= 1000 and index > 0:
+            divisor, suffix = _TOKEN_COUNT_UNITS[index - 1]
+            scaled = value / divisor
+            rounded = round(scaled) if scaled >= 100 else round(scaled, 1)
+        return f"{rounded:g}{suffix}"
+    return str(value)
+
+
+@dataclass(frozen=True)
 class OpenAIToolCall:
     """Function call emitted by the Responses API."""
 
@@ -85,6 +286,7 @@ class OpenAIStreamResponse:
     response_id: str | None
     text: str
     tool_calls: tuple[OpenAIToolCall, ...]
+    usage: TokenUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -95,6 +297,7 @@ class OpenAIChatCompletionStreamResponse:
     tool_calls: tuple[OpenAIToolCall, ...]
     assistant_message: dict[str, Any]
     thoughts: tuple[str, ...] = ()
+    usage: TokenUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +317,7 @@ class AnthropicStreamResponse:
     tool_calls: tuple[AnthropicToolCall, ...]
     content: tuple[dict[str, Any], ...]
     stop_reason: str | None = None
+    usage: TokenUsage | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +356,7 @@ class OllamaStreamResponse:
     thinking: str
     tool_calls: tuple[OllamaToolCall, ...]
     message: dict[str, Any]
+    usage: TokenUsage | None = None
 
 
 ModelRequestStreamResponse: TypeAlias = (
@@ -310,6 +515,7 @@ class BackendCallbacks(Protocol):
     delta: BackendTextCallback | None
     thought: BackendTextCallback | None
     finish: BackendTextCallback | None
+    usage: UsageCallback | None
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -330,8 +536,13 @@ def backend_supports_image_input(provider_key: str, model: str) -> bool:
 
     if provider_key in {"openai", "anthropic"}:
         return True
+    if provider_key == "kimi":
+        normalized = model.lower()
+        return normalized in {"kimi-k3", "kimi-k2.5", "kimi-k2.6"} or (
+            "vision" in normalized
+        )
     if provider_key == "blablador":
-        return model == "alias-code"
+        return model in {"alias-code", "alias-kimi-k3-1m", "alias-muse"}
     if provider_key == "ollama":
         normalized = model.lower()
         return any(marker in normalized for marker in OLLAMA_IMAGE_MODEL_MARKERS)
@@ -356,6 +567,50 @@ def estimate_backend_context_tokens(
         tokens += estimate_text_tokens(content)
         tokens += len(images) * MESSAGE_IMAGE_CONTEXT_TOKENS
     return max(1, tokens)
+
+
+def context_summary_system_prompt() -> str:
+    """Return the shared instruction used for rolling conversation summaries."""
+
+    return (
+        "You are the assistant in this chat. Summarize this for you to quickly "
+        "review what has happened before. Write it from an I-Perspective. Preserve "
+        "the user's goals, decisions, constraints, important facts, file paths, "
+        "commands, results, unresolved issues, and promised next steps. Preserve "
+        "completed writes and their object references, verified working API paths, "
+        "failed endpoints and reasons, pagination positions, and the next unfinished "
+        "action. Distinguish successful changes from proposals and failed attempts. "
+        "Replace superseded facts from the previous summary. Do not copy raw API "
+        "responses, past-run metadata, or previous summaries verbatim; retain response "
+        "file paths for detailed evidence. Keep the summary under 2000 words. "
+        "Return only the summary."
+    )
+
+
+def context_summary_user_prompt(
+    messages: list[dict[str, Any]],
+    previous_summary: str,
+) -> str:
+    """Render role-labelled messages and an optional prior rolling summary."""
+
+    sections: list[str] = []
+    if previous_summary.strip():
+        sections.extend(["Previous summary:", previous_summary.strip(), ""])
+    sections.append("Conversation messages to incorporate:")
+    for message in messages:
+        role = str(message.get("role") or "unknown").strip().upper()
+        content = str(message.get("content") or "").strip()
+        images = normalized_image_attachments(message.get("images"))
+        if images:
+            image_labels = ", ".join(image.label or image.path.name for image in images)
+            content = "\n".join(
+                part
+                for part in (content, f"[Image attachments: {image_labels}]")
+                if part
+            )
+        if content:
+            sections.extend(["", f"{role}:", content])
+    return "\n".join(sections).strip()
 
 
 def normalized_image_attachments(raw_images: object) -> tuple[ImageAttachment, ...]:
@@ -409,11 +664,63 @@ class BaseBackend:
     provider_key: ClassVar[str] = ""
     provider_label: ClassVar[str] = ""
     env_var: ClassVar[str] = ""
+    _usage_total: TokenUsage = field(default_factory=TokenUsage, init=False)
+    _latest_context_tokens: int = field(default=0, init=False)
+    _context_recovery_attempted: bool = field(default=False, init=False)
+
+    def _recover_context_window(
+        self,
+        response: str,
+        session_path: Path,
+        entries: list[ContextMessage],
+        callbacks: BackendCallbacks,
+    ) -> list[ContextMessage] | None:
+        """Rebuild rejected context once without repeating any executed tools."""
+
+        from anomx.agent.context_management import (
+            CONTINUE_AFTER_COMPRESSION_PROMPT,
+            transient_context_message,
+        )
+
+        if (
+            not isinstance(response, BackendFailure)
+            or response.code != "context_window_exceeded"
+            or self._context_recovery_attempted
+            or self.runtime._turn_aborted()
+        ):
+            return None
+        self._context_recovery_attempted = True
+        entries, compressed = self.runtime.compress_in_turn_context(
+            session_path,
+            entries,
+            current_context_tokens=0,
+            status_callback=callbacks.status,
+            force=True,
+        )
+        if not compressed:
+            return None
+        entries.append(transient_context_message("user", CONTINUE_AFTER_COMPRESSION_PROMPT))
+        return entries
 
     def __getattr__(self, name: str) -> object:
         """Delegate runtime-owned orchestration helpers to the active runtime."""
 
         return getattr(self.runtime, name)
+
+    def _track_usage(self, usage: TokenUsage | None, callbacks: BackendCallbacks) -> None:
+        """Accumulate provider usage and report the latest snapshot."""
+
+        if usage is None:
+            return
+        self._usage_total = self._usage_total + usage
+        self._latest_context_tokens = usage.input_tokens
+        if callbacks.usage is not None:
+            callbacks.usage(
+                UsageSnapshot(
+                    total=self._usage_total,
+                    context_tokens=self._latest_context_tokens,
+                )
+            )
 
     def _visible_stream_text(
         self,
@@ -523,6 +830,17 @@ class BaseBackend:
         del messages, model
         return None
 
+    def summarize_conversation(
+        self,
+        messages: list[dict[str, Any]],
+        previous_summary: str,
+        model: str,
+    ) -> str | None:
+        """Summarize a transcript prefix for rolling context compression."""
+
+        del messages, previous_summary, model
+        return None
+
     def _api_key(self, provider: str, env_var: str) -> str | None:
         env_key = os.environ.get(env_var)
         if env_key:
@@ -546,7 +864,14 @@ class BaseBackend:
         detail, error_type = self._parse_api_error(body)
         if self._looks_like_invalid_api_key(provider_key, status, error_type, detail):
             return self._invalid_api_key_message(provider_label, env_var)
-        return f"{provider_label} request failed ({status}): {detail or 'No error detail.'}"
+        context_error = any(marker in f"{error_type} {detail}".lower() for marker in (
+            "context_length_exceeded", "maximum context length", "context window",
+            "prompt is too long", "input is too long", "too many input tokens",
+        ))
+        return BackendFailure(
+            f"{provider_label} request failed ({status}): {detail or 'No error detail.'}",
+            code="context_window_exceeded" if context_error else "model_request_failed",
+        )
 
     def _parse_api_error(self, body: str) -> tuple[str, str | None]:
         detail = body.strip()
@@ -567,16 +892,18 @@ class BaseBackend:
         return detail or "No error detail.", error_type
 
     def _missing_api_key_message(self, provider_label: str, env_var: str) -> str:
-        return (
+        return BackendFailure(
             f"{provider_label} API key is not configured. "
-            f"Add it during onboarding or set {env_var}."
+            f"Add it during onboarding or set {env_var}.",
+            code="model_authentication_failed",
         )
 
     def _invalid_api_key_message(self, provider_label: str, env_var: str) -> str:
-        return (
+        return BackendFailure(
             f"{provider_label} credentials were rejected. "
             f"Check {env_var} or update the saved {provider_label} API key in Anomx. "
-            "The key may be invalid, expired, or revoked."
+            "The key may be invalid, expired, or revoked.",
+            code="model_authentication_failed",
         )
 
     def _looks_like_invalid_api_key(
@@ -603,7 +930,7 @@ class BaseBackend:
                     "expired",
                 )
             )
-        if provider_key in {"anthropic", "desy", "blablador"}:
+        if provider_key in {"anthropic", "desy", "blablador", "kimi"}:
             return status == 401 or error_type == "authentication_error"
         return False
 
@@ -618,6 +945,8 @@ class BaseBackend:
     ) -> ModelRequestStreamResponse:
         max_attempts = MODEL_REQUEST_RETRY_COUNT + 1
         for attempt in range(max_attempts):
+            if getattr(self.runtime, "before_model_request", None) is not None:
+                self.runtime.before_model_request()
             try:
                 return stream_once()
             except urllib.error.HTTPError as error:
@@ -645,7 +974,7 @@ class BaseBackend:
                 ):
                     return ""
             except (OSError, urllib.error.URLError, TimeoutError) as error:
-                message = f"{provider_label} request failed: {error}"
+                message = BackendFailure(f"{provider_label} request failed: {error}")
                 if attempt >= MODEL_REQUEST_RETRY_COUNT:
                     return message
                 delay = self._model_request_retry_delay(attempt)
@@ -658,7 +987,7 @@ class BaseBackend:
                     status_callback,
                 ):
                     return ""
-        return f"{provider_label} request failed."
+        return BackendFailure(f"{provider_label} request failed.")
 
     @staticmethod
     def _model_request_retry_delay(attempt: int) -> float:
@@ -891,10 +1220,7 @@ class BaseBackend:
         block["input"] = {"raw_input": raw_json}
 
     def _max_output_tokens(self, model: str, fallback: int) -> int:
-        metadata = model_metadata(model)
-        if metadata is None or metadata.max_output_tokens is None:
-            return fallback
-        return metadata.max_output_tokens
+        return model_output_token_budget(model, fallback)
 
     def _openai_reasoning_config(
         self,
@@ -928,7 +1254,13 @@ class BaseBackend:
         return intensity if intensity in supported else None
 
     def _anthropic_thinking_config(self, model: str) -> dict[str, Any]:
-        if model in {"claude-opus-4-8", "claude-sonnet-4-6"}:
+        if model in {
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        }:
             return {"type": "adaptive", "display": "summarized"}
         max_tokens = self._max_output_tokens(model, 4_096)
         budget_tokens = max(1_024, min(2_048, max_tokens - 1))
@@ -1199,6 +1531,16 @@ class BaseBackend:
             "Please only return a plain text name of 2-3 words for this directory "
             "in a project style. No quotes. No trailing punctuation."
         )
+
+    def _context_summary_system_prompt(self) -> str:
+        return context_summary_system_prompt()
+
+    def _context_summary_user_prompt(
+        self,
+        messages: list[dict[str, Any]],
+        previous_summary: str,
+    ) -> str:
+        return context_summary_user_prompt(messages, previous_summary)
 
     def _continuation_system_prompt(self) -> str:
         return (

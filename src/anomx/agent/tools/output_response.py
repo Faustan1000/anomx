@@ -62,7 +62,9 @@ class OutputResponseTool(BaseTool):
                     },
                     "end_turn": {
                         "type": "boolean",
-                        "description": "Whether the agent should finish after rendering these outputs.",
+                        "description": (
+                            "Whether the agent should finish after rendering these outputs."
+                        ),
                     },
                 },
                 ["outputs", "end_turn"],
@@ -73,7 +75,10 @@ class OutputResponseTool(BaseTool):
         if not context.runtime.can_output_response():
             return context.json_result(
                 {
-                    "error": "output_response is only available inside connected Anomx Platform agent runs.",
+                    "error": (
+                        "output_response is only available inside connected Anomx Platform "
+                        "agent runs."
+                    ),
                     "ok": False,
                 }
             )

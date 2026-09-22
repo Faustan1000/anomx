@@ -20,18 +20,18 @@ from anomx.agent.helpers.state import (
     running_process_snapshots,
 )
 from anomx.agent.runtime import (
-    context_usage_percent,
+    format_token_count,
 )
 from anomx.agent.skills import (
     Skill,
 )
 from anomx.agent.store import (
     SessionRecord,
-    model_context_window,
     normalize_thinking_intensity,
     thinking_intensity_options,
 )
 from anomx.agent.ui.constants import (
+    ACTIVITY_FRAME_SECONDS,
     PLAN_STEP_REVEAL_SECONDS,
     START_HINT_REVEAL_SECONDS,
     STARTUP_MATRIX_ALPHABET,
@@ -161,6 +161,7 @@ class SessionViewMixin:
         command_selected: int = 0,
         file_suggestions: list[MenuChoice] | None = None,
         file_selected: int = 0,
+        file_reference_searching: bool = False,
         file_references: Mapping[str, str] | None = None,
         image_attachments: Mapping[str, Mapping[str, str]] | None = None,
         bottom_panel: BottomPanel | None = None,
@@ -234,7 +235,12 @@ class SessionViewMixin:
             else None
         )
         file_panel = (
-            self._file_reference_bottom_panel(file_suggestions or [], file_selected)
+            self._file_reference_bottom_panel(
+                file_suggestions or [],
+                file_selected,
+                active=bool(file_suggestions) or file_reference_searching,
+                searching=file_reference_searching,
+            )
             if bottom_panel is None and show_prompt_bar
             else None
         )
@@ -299,6 +305,7 @@ class SessionViewMixin:
                 for offset, line in enumerate(rendered[start : start + body_height])
             ]
         self._session_text_rows = {}
+        wave_frame = int(time.monotonic() / ACTIVITY_FRAME_SECONDS)
         for offset, (line_index, line) in enumerate(visible_rows):
             y = body_top + offset
             self._session_text_rows[y] = SessionTextRow(
@@ -313,7 +320,7 @@ class SessionViewMixin:
                     y,
                     SessionMouseAction("toggle_pinned_user", 0, line.expansion_key),
                 )
-            elif line.role == "work_summary":
+            elif line.role in {"work_summary", "work_active"}:
                 self._add_click_target(y, SessionMouseAction("toggle_work", 0, line.meta))
             elif line.expansion_key and (
                 self._is_expandable_work_role(line.role)
@@ -330,12 +337,17 @@ class SessionViewMixin:
                     4,
                     line.text,
                     width - 8,
-                    working_frame,
+                    wave_frame,
                 )
                 self._draw_session_selection(stdscr, y, 4, line_index, line.text, width - 8)
                 continue
             if line.role in {"work_box", "work_box_danger"}:
                 self._draw_work_box_line(stdscr, y, 4, line.text, width - 8, line.role)
+                if line.activity_wave:
+                    self._draw_activity_wave(
+                        stdscr, y, 6, line.text[2:-2].rstrip(), width - 12,
+                        wave_frame, self._line_attr(line.role),
+                    )
                 self._draw_session_selection(stdscr, y, 4, line_index, line.text, width - 8)
                 continue
             if line.role == "user_box":
@@ -348,6 +360,10 @@ class SessionViewMixin:
                 continue
             default_attr = self._line_attr(line.role)
             self._draw_line_with_inline_code(stdscr, y, 4, line.text, width - 8, default_attr)
+            if line.activity_wave:
+                self._draw_activity_wave(
+                    stdscr, y, 4, line.text, width - 8, wave_frame, default_attr,
+                )
             self._draw_session_selection(stdscr, y, 4, line_index, line.text, width - 8)
 
         should_draw_start_hints = self._should_draw_start_hints(
@@ -823,9 +839,8 @@ class SessionViewMixin:
         }.get(intensity, "")
 
     def _context_status(self, session: SessionRecord, model: str) -> str:
-        context_window = model_context_window(model)
-        if context_window is None:
-            return ""
+        usage_snapshot = self._session_usage_snapshots.get(session.path)
+        usage_tokens = usage_snapshot.context_tokens if usage_snapshot is not None else 0
         cache_key = self._session_cache_key(session.path)
         if cache_key is not None:
             cached = self._context_status_cache.get(session.path)
@@ -834,15 +849,15 @@ class SessionViewMixin:
                 and cached[0] == cache_key[0]
                 and cached[1] == cache_key[1]
                 and cached[2] == model
+                and cached[4] == usage_tokens
             ):
                 return cached[3]
 
         if not self._has_user_messages(session.path):
             status = ""
         else:
-            used_tokens = self.runtime.estimate_session_context_tokens(session.path)
-            percent_used = context_usage_percent(used_tokens, context_window)
-            status = f"{percent_used}% Context"
+            used_tokens = usage_tokens or self.runtime.estimate_session_context_tokens(session.path)
+            status = format_token_count(used_tokens) if used_tokens > 0 else ""
 
         if cache_key is not None:
             self._context_status_cache[session.path] = (
@@ -850,6 +865,7 @@ class SessionViewMixin:
                 cache_key[1],
                 model,
                 status,
+                usage_tokens,
             )
         return status
 

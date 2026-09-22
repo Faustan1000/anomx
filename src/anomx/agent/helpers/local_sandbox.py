@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from shlex import split as shell_split
 
 from anomx.agent.helpers.tool_manager import (
     COMMAND_TIMEOUT_SECONDS,
+    WORKING_DIRECTORY_COMMAND_PATTERN,
     command_timeout_output,
 )
 
@@ -470,17 +474,22 @@ class LocalSandboxSession:
 
     def _run_shell_subprocess(self, command: str, *, timeout: float) -> str:
         shell = shutil.which("bash") or shutil.which("sh") or "/bin/sh"
-        result = subprocess.run(
-            command,
-            cwd=self.current_dir,
-            env=self.env,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            errors="backslashreplace",
-            shell=True,
-            executable=shell,
-        )
+        marker = self._working_directory_marker(command)
+        try:
+            result = subprocess.run(
+                command if marker is None else self._with_directory_capture(command, marker),
+                cwd=self.current_dir,
+                env=self.env,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                errors="backslashreplace",
+                shell=True,
+                executable=shell,
+            )
+        finally:
+            if marker is not None:
+                self._sync_working_directory(marker)
         output = "\n".join(
             part for part in (result.stdout.strip(), result.stderr.strip()) if part
         )
@@ -493,6 +502,43 @@ class LocalSandboxSession:
         return self._limit_output(
             output or f"Command exited with status {result.returncode}."
         )
+
+    def _working_directory_marker(self, command: str) -> Path | None:
+        """Return a temporary file that records where a shell command ends up."""
+
+        if command.endswith("\\") or not WORKING_DIRECTORY_COMMAND_PATTERN.search(command):
+            return None
+        try:
+            handle, marker_path = tempfile.mkstemp(prefix="anomx-cwd-", suffix=".path")
+        except OSError:
+            return None
+        os.close(handle)
+        return Path(marker_path)
+
+    def _with_directory_capture(self, command: str, marker: Path) -> str:
+        """Append the working directory capture that follows a shell command."""
+
+        return (
+            f"{command}\n"
+            "__anomx_status=$?\n"
+            f"pwd > {shlex.quote(str(marker))} 2>/dev/null\n"
+            "exit $__anomx_status\n"
+        )
+
+    def _sync_working_directory(self, marker: Path) -> None:
+        """Adopt the working directory a completed shell command left behind."""
+
+        try:
+            recorded = marker.read_text(errors="replace").strip()
+        except OSError:
+            recorded = ""
+        with suppress(OSError):
+            marker.unlink()
+        if not recorded:
+            return
+        target = Path(recorded)
+        if target.is_dir() and self._inside_root(target.resolve()):
+            self.current_dir = target.resolve()
 
     def _run_subprocess(self, parts: list[str], *, timeout: float) -> str:
         result = subprocess.run(

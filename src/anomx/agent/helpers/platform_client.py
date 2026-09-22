@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from anomx import __version__
 from anomx.agent.store import AnomxHome
+from anomx.agent.skills import sync_platform_skills
 
 DEFAULT_TIMEOUT_SECONDS = 10
 
@@ -183,7 +184,9 @@ def _try_platform_heartbeat(
 def _store_platform_context(home: AnomxHome, payload: dict[str, Any]) -> None:
     config = home.load_config()
     config["platform_instructions"] = str(payload.get("platform_instructions") or "").strip()
+    config["custom_instructions"] = str(payload.get("custom_instructions") or "").strip()
     home.save_config(config)
+    sync_platform_skills(home.skills_dir, payload.get("skills"))
 
 
 def _store_platform_url(home: AnomxHome, connection: dict[str, str], url: str) -> None:

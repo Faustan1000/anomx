@@ -135,17 +135,19 @@ def object_schema(
 def statement_property(description: str) -> JsonSchema:
     """Return the common statement property schema."""
 
-    return {"type": "string", "description": description}
+    return {
+        "type": "string",
+        "description": (
+            f"{description} Use 3–7 words (at most 60 characters): a short action and target, "
+            "such as 'Reading channel metadata'. No rationale, preamble, or full sentences."
+        ),
+    }
 
 
 def operator_tool_detail(tool_name: str, arguments: dict[str, Any]) -> str:
     """Return a human-readable summary for a structured tool call."""
 
-    parameters = {
-        key: value
-        for key, value in arguments.items()
-        if key != "statement"
-    }
+    parameters = {key: value for key, value in arguments.items() if key != "statement"}
     if not parameters:
         return f"Tool: {tool_name}\nParameters: none"
     return (
@@ -187,6 +189,10 @@ def default_tool_statement(tool_name: str) -> str:
         "websearch": "Searching web",
         "webfetch": "Fetching web page",
         "use_anomx_api": "Calling Anomx API",
+        "get_anomx_object_details": "Loading Anomx object",
+        "search_anomx_objects": "Searching Anomx objects",
+        "search_anomx_data_channels": "Searching Anomx data channels",
+        "get_anomx_data_channel_history": "Loading Anomx channel history",
         "read": "Reading file",
         "list": "Listing directory",
         "glob": "Finding files",

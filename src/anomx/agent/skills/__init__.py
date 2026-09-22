@@ -8,14 +8,22 @@ from dataclasses import dataclass
 from importlib.resources import files
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-SkillSource = Literal["builtin", "user"]
+SkillSource = Literal["builtin", "platform", "user"]
 
 BUILTIN_SKILL_PACKAGE = "anomx.agent.skills"
 SKILL_README_NAMES = ("README.md", "readme.md")
 BUILTIN_MARKER_NAME = ".anomx_builtin"
-STARTER_SKILL_COMMANDS = ("map-folder", "find-issues", "make-report")
+PLATFORM_MARKER_NAME = ".anomx_platform"
+DEFAULT_PLATFORM_SKILL_COMMANDS = (
+    "use-anomx-api",
+    "manage-recommendations",
+    "retrieve-data",
+    "manage-data",
+    "manage-jobs",
+    "manage-systems",
+)
 _COMMAND_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
@@ -31,6 +39,9 @@ class Skill:
     hidden: bool = False
     system: bool = False
     path: Path | None = None
+    keywords: tuple[str, ...] = ()
+    # Django/Anomx model references such as ``data_dataset`` or ``jobs_job``.
+    model_references: tuple[str, ...] = ()
 
     @property
     def slash_command(self) -> str:
@@ -143,6 +154,7 @@ def sync_builtin_skills(skills_dir: Path, *, include_system: bool = False) -> No
 
     skills_dir.mkdir(parents=True, exist_ok=True)
     skill_root = files(BUILTIN_SKILL_PACKAGE)
+    desired_commands: set[str] = set()
     for resource in sorted(skill_root.iterdir(), key=lambda item: item.name):
         source_readme = _resource_readme(resource) if resource.is_dir() else None
         if source_readme is None and not resource.name.endswith(".md"):
@@ -157,6 +169,7 @@ def sync_builtin_skills(skills_dir: Path, *, include_system: bool = False) -> No
         )
         if skill.system and not include_system:
             continue
+        desired_commands.add(skill.command)
 
         target_dir = skills_dir / skill.command
         marker_path = target_dir / BUILTIN_MARKER_NAME
@@ -173,6 +186,55 @@ def sync_builtin_skills(skills_dir: Path, *, include_system: bool = False) -> No
                 encoding="utf-8",
             )
         marker_path.write_text("synced bundled Anomx skill\n", encoding="utf-8")
+
+    for target_dir in skills_dir.iterdir():
+        if not target_dir.is_dir() or not (target_dir / BUILTIN_MARKER_NAME).exists():
+            continue
+        if target_dir.name not in desired_commands:
+            shutil.rmtree(target_dir)
+
+
+def sync_platform_skills(skills_dir: Path, payload: object) -> None:
+    """Create and update platform-managed skills without touching local user skills."""
+
+    skills_dir.mkdir(parents=True, exist_ok=True)
+    if not isinstance(payload, list):
+        return
+    records = payload
+    desired_commands: set[str] = set()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        command = normalize_skill_command(str(record.get("command") or record.get("name") or ""))
+        if not is_valid_skill_command(command):
+            continue
+        desired_commands.add(command)
+        target_dir = skills_dir / command
+        platform_marker = target_dir / PLATFORM_MARKER_NAME
+        builtin_marker = target_dir / BUILTIN_MARKER_NAME
+        if target_dir.exists() and not platform_marker.exists() and not builtin_marker.exists():
+            continue
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        skill = Skill(
+            command=command,
+            title=str(record.get("name") or command).strip() or command,
+            description=str(record.get("description") or "").strip(),
+            body=str(record.get("instructions") or "").strip(),
+            source="platform",
+            path=target_dir,
+            keywords=_string_tuple(record.get("keywords")),
+            model_references=_string_tuple(record.get("model_references")),
+        )
+        (target_dir / "README.md").write_text(skill_to_markdown(skill), encoding="utf-8")
+        platform_marker.write_text("synced Anomx Platform skill\n", encoding="utf-8")
+
+    for target_dir in skills_dir.iterdir():
+        if not target_dir.is_dir() or not (target_dir / PLATFORM_MARKER_NAME).exists():
+            continue
+        if target_dir.name not in desired_commands:
+            shutil.rmtree(target_dir)
 
 
 def parse_skill_markdown(
@@ -203,6 +265,10 @@ def parse_skill_markdown(
         hidden=hidden,
         system=system,
         path=path,
+        keywords=_comma_separated_tuple(metadata.get("keywords")),
+        model_references=_comma_separated_tuple(
+            metadata.get("object_models") or metadata.get("models")
+        ),
     )
 
 
@@ -214,6 +280,12 @@ def skill_to_markdown(skill: Skill) -> str:
         f"command: {skill.command}",
         f"description: {_single_line(skill.description)}",
     ]
+    if skill.source == "platform":
+        frontmatter.append(f"name: {_single_line(skill.title)}")
+    if skill.keywords:
+        frontmatter.append(f"keywords: {', '.join(skill.keywords)}")
+    if skill.model_references:
+        frontmatter.append(f"object_models: {', '.join(skill.model_references)}")
     if skill.hidden:
         frontmatter.append("hidden: true")
     if skill.system:
@@ -228,6 +300,11 @@ def skill_invocation_prompt(skill: Skill, arguments: str = "") -> str:
     sections = [
         f"Use the Anomx skill /{skill.command}: {skill.title}.",
         f"Description: {skill.description}",
+        (
+            "Applicable Anomx object types: " + ", ".join(skill.model_references)
+            if skill.model_references
+            else "Applicable Anomx object types: all"
+        ),
         "Skill instructions:",
         skill.body.strip(),
     ]
@@ -297,6 +374,22 @@ def _metadata_bool(value: object) -> bool:
     if not isinstance(value, str):
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _string_tuple(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(item or "").strip() for item in value if str(item or "").strip()
+        )
+    )
+
+
+def _comma_separated_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, str):
+        return ()
+    return tuple(dict.fromkeys(item.strip() for item in value.split(",") if item.strip()))
 
 
 def _single_line(value: str) -> str:

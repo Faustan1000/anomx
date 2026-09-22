@@ -21,11 +21,6 @@ class StartSubagentTool(BaseTool):
             parameters=object_schema(
                 {
                     "statement": statement_property(statement_description),
-                    "agent_kind": {
-                        "type": "string",
-                        "enum": ["general", "explore", "platform"],
-                        "description": "Kind of subagent to start.",
-                    },
                     "name": {
                         "type": "string",
                         "description": "Short display name for the subagent.",
@@ -35,7 +30,7 @@ class StartSubagentTool(BaseTool):
                         "description": "Complete task prompt for the subagent.",
                     },
                 },
-                ["statement", "agent_kind", "name", "prompt"],
+                ["statement", "name", "prompt"],
             ),
             aliases=("start_agent",),
         )
@@ -43,30 +38,11 @@ class StartSubagentTool(BaseTool):
     def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> str:
         context.emit_operator_statement(self.name, arguments)
         if not context.runtime.agent_spec.can_spawn_subagents:
-            return context.json_result({"error": "Only the build agent can start subagents."})
+            return context.json_result({"error": "Only the main agent can start subagents."})
         if context.session_path is None:
             return context.json_result({"error": "start_subagent requires a session."})
 
-        kind_text = str(
-            arguments.get("agent_kind") or arguments.get("kind") or "general"
-        ).strip().lower()
-        try:
-            kind = AgentKind(kind_text)
-        except ValueError:
-            return context.json_result(
-                {
-                    "error": "agent_kind must be one of: general, explore, platform.",
-                    "allowed_agent_kinds": ["general", "explore", "platform"],
-                }
-            )
-        if kind not in {AgentKind.GENERAL, AgentKind.EXPLORE, AgentKind.PLATFORM}:
-            return context.json_result(
-                {"error": f"{kind.value} cannot be launched as a subagent."}
-            )
-        if kind == AgentKind.PLATFORM and not context.runtime.has_platform_connection():
-            return context.json_result(
-                {"error": "The platform subagent requires a connected Anomx Platform."}
-            )
+        kind = AgentKind.SUB
 
         prompt = str(arguments.get("prompt", "")).strip()
         if not prompt:
@@ -74,9 +50,7 @@ class StartSubagentTool(BaseTool):
 
         with context.runtime._subagent_lock:
             visible_agents = [
-                agent
-                for agent in context.runtime._subagents.values()
-                if agent.status != "removed"
+                agent for agent in context.runtime._subagents.values() if agent.status != "removed"
             ]
             if len(visible_agents) >= SUBAGENT_MAX_CONCURRENT:
                 return context.json_result(
@@ -109,7 +83,7 @@ class StartSubagentTool(BaseTool):
             context.runtime.session_allowed_commands,
             context.runtime.session_rejected_commands,
             context.runtime.tool_manager.mode,
-            role=kind.value,
+            agent_kind=kind,
             cancel_event=state.cancel_event,
             workspace_root=context.runtime.workspace_root,
             process_owner_id=agent_id,
@@ -123,6 +97,7 @@ class StartSubagentTool(BaseTool):
                 if local_sandbox_session is not None
                 else False
             ),
+            additional_instructions=context.runtime.additional_instructions,
         )
         state.runtime = child_runtime
         child_runtime._parent_session_id = session_id_from_path(context.session_path)

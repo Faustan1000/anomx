@@ -14,9 +14,13 @@ from anomx.agent.helpers.state import (
     subagent_snapshots,
 )
 from anomx.agent.helpers.utils import parse_agent_kind
+from anomx.agent.runtime import (
+    format_token_count,
+)
 from anomx.agent.store import (
     SessionRecord,
 )
+from anomx.agent.ui.constants import ACTIVITY_FRAME_SECONDS
 from anomx.agent.ui.models import (
     ActivityDetailEntry,
     ActivityItem,
@@ -71,7 +75,7 @@ class SubagentViewMixin:
                     scroll = viewport.scroll
                 key = self._read_nonblocking_key(stdscr)
                 if key is None:
-                    time.sleep(0.08)
+                    time.sleep(ACTIVITY_FRAME_SECONDS)
                     frame += 1
                     continue
                 if self._is_escape(key) or self._is_ctrl_c(key):
@@ -204,8 +208,8 @@ class SubagentViewMixin:
 
     def _subagent_right_text(self, subagent: SubagentSnapshot) -> str:
         parts: list[str] = []
-        if subagent.context_percent:
-            parts.append(f"{subagent.context_percent}% Context")
+        if subagent.context_tokens:
+            parts.append(format_token_count(subagent.context_tokens))
         state = self._subagent_state_label(subagent)
         if state:
             parts.append(state)

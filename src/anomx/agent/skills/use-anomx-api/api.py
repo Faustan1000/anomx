@@ -13,7 +13,6 @@ from urllib.parse import urlencode, urljoin, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-ROOT_ONLY_PATHS = frozenset({"/docs", "/openapi.json"})
 
 
 def call_api(
@@ -89,13 +88,12 @@ def _required_env(*names: str) -> str:
 
 
 def _build_url(base_url: str, path: str, query: dict[str, Any] | None) -> str:
-    root_path = path if path.startswith("/") else f"/{path}"
     if path.startswith(("http://", "https://")):
+        base = urlparse(base_url)
+        requested = urlparse(path)
+        if (requested.scheme, requested.netloc) != (base.scheme, base.netloc):
+            raise RuntimeError("Absolute API URLs must use the connected platform origin.")
         url = path
-    elif root_path in ROOT_ONLY_PATHS:
-        parsed = urlparse(base_url)
-        origin = urlunparse((parsed.scheme, parsed.netloc, "", "", "", ""))
-        url = urljoin(f"{origin.rstrip('/')}/", root_path.lstrip("/"))
     else:
         url = urljoin(f"{base_url.rstrip('/')}/", path.lstrip("/"))
     if query:
@@ -179,7 +177,7 @@ def _json_argument(value: str) -> Any:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Call the connected Anomx Platform API.")
     parser.add_argument("method", choices=("GET", "POST", "PUT", "PATCH", "DELETE"))
-    parser.add_argument("path", help="API path, for example /objects or /data/channels")
+    parser.add_argument("path", help="API path, for example /objects or /channels")
     parser.add_argument("--query", default="", help="JSON object of query parameters")
     parser.add_argument("--body", default="", help="JSON request body")
     parser.add_argument("--output-name", default="", help="Optional response filename stem")

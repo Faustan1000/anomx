@@ -7,6 +7,7 @@ import re
 import shlex
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Mapping, MutableSet, Sequence
@@ -168,19 +169,29 @@ SERIOUS_COMMANDS = (
     "crontab",
 )
 
-SANDBOX_SERIOUS_COMMANDS = (
-    "git",
-    "svn",
-    "hg",
-    "cvs",
-)
-
-SANDBOX_SERIOUS_COMMAND_NAMES = frozenset(SANDBOX_SERIOUS_COMMANDS)
-
 SHELL_METACHARS = frozenset({"&", ";", ">", "<", "`", "$", "\n"})
 PIPE_OPERATOR = "|"
 APPROVAL_COMMAND_NAMES = frozenset(APPROVE_COMMANDS)
 SERIOUS_COMMAND_NAMES = frozenset(SERIOUS_COMMANDS)
+SHELL_BUILTIN_COMMANDS = frozenset(
+    {
+        ".",
+        "alias",
+        "cd",
+        "eval",
+        "exec",
+        "export",
+        "popd",
+        "pushd",
+        "set",
+        "source",
+        "ulimit",
+        "umask",
+        "unalias",
+        "unset",
+    }
+)
+WORKING_DIRECTORY_COMMAND_PATTERN = re.compile(r"(?:^|[;&|(\n])\s*(?:cd|pushd|popd)\b")
 READ_ONLY_COMMAND_NAMES = frozenset(
     {
         "cat",
@@ -402,19 +413,18 @@ class CliToolManager:
         root: Path,
         session_allowed_commands: MutableSet[str] | None = None,
         session_rejected_commands: MutableSet[str] | None = None,
-        mode: AgentMode = AgentMode.CONFIRM,
+        mode: AgentMode = AgentMode.STANDARD,
         *,
         current_dir: Path | None = None,
         cancel_event: threading.Event | None = None,
         subprocess_env: Mapping[str, str] | None = None,
         strict_workspace: bool = False,
         trusted_roots: Sequence[Path] | None = None,
+        background_api_scoped: bool = False,
     ) -> None:
         self.root = root.expanduser().resolve()
         self.trusted_roots = self._normalize_trusted_roots(trusted_roots)
-        self.current_dir = (
-            self.root if current_dir is None else current_dir.expanduser().resolve()
-        )
+        self.current_dir = self.root if current_dir is None else current_dir.expanduser().resolve()
         if not self._inside_workspace(self.current_dir):
             self.current_dir = self.root
         self.session_allowed_commands = session_allowed_commands
@@ -423,6 +433,7 @@ class CliToolManager:
         self.cancel_event = cancel_event
         self.subprocess_env = dict(subprocess_env) if subprocess_env is not None else None
         self.strict_workspace = strict_workspace
+        self.background_api_scoped = background_api_scoped
 
     def set_mode(self, mode: AgentMode) -> None:
         """Set the active command execution mode."""
@@ -528,6 +539,54 @@ class CliToolManager:
             approval_callback,
         )
 
+    def authorize_platform_api_request(
+        self,
+        method: str,
+        path: str,
+        statement: str,
+        approval_callback: ApprovalCallback | None,
+    ) -> CommandResult | None:
+        """Authorize an Anomx API request through the command policy pipeline."""
+
+        normalized_method = method.strip().upper()
+        normalized_path = "/" + path.strip().split("?", 1)[0].strip("/")
+        canonical_request = f"anomx-api {normalized_method} {normalized_path}"
+        if normalized_method == "GET":
+            return None
+        if self.mode.policy.recommendations_only:
+            if self.background_api_scoped:
+                return None
+            if normalized_method == "POST" and normalized_path == "/recommendations":
+                return None
+            reason = (
+                "Background mode only permits platform reads and POST /recommendations "
+                "without a scoped API credential."
+            )
+            return CommandResult(
+                self._user_blocked_output(reason),
+                approved=False,
+                safety=CommandSafety.FORBIDDEN,
+                command=canonical_request,
+                reason=reason,
+                blocked_by_mode=True,
+            )
+
+        policy = CommandPolicy(
+            CommandSafety.APPROVE,
+            "This Anomx Platform API request can change persistent platform state.",
+            canonical_request,
+            f"api:{normalized_method}:{normalized_path}",
+            f"{normalized_method} {normalized_path}",
+            canonical_request,
+        )
+        authorization = self._authorize_policy(
+            policy,
+            canonical_request,
+            statement,
+            approval_callback,
+        )
+        return authorization if isinstance(authorization, CommandResult) else None
+
     def _authorize_policy(
         self,
         policy: CommandPolicy,
@@ -537,32 +596,50 @@ class CliToolManager:
     ) -> CommandPolicy | CommandResult:
         """Apply the active mode and optional user approval to a classified policy."""
 
+        mode_policy = self.mode.policy
         if policy.safety == CommandSafety.FORBIDDEN:
-            return CommandResult(
-                self._user_blocked_output(policy.reason),
-                approved=False,
-                safety=policy.safety,
-                command=policy.canonical_command,
-                reason=policy.reason,
+            if not mode_policy.bypass_command_policy or not policy.canonical_command:
+                return CommandResult(
+                    self._user_blocked_output(policy.reason),
+                    approved=False,
+                    safety=policy.safety,
+                    command=policy.canonical_command,
+                    reason=policy.reason,
+                )
+            policy = CommandPolicy(
+                CommandSafety.ALLOW,
+                f"Autonomous mode bypassed command policy: {policy.reason}",
+                policy.canonical_command,
+                policy.allowance_key,
+                policy.allowance_label,
+                policy.allowance_subject,
             )
 
-        serious_token = self._serious_token_in_command(policy.canonical_command)
-        if (
-            self.mode == AgentMode.AUTONOMOUS
-            and policy.safety == CommandSafety.APPROVE
-            and serious_token is not None
-        ):
-            reason = f"{serious_token} can modify or control the host system."
+        if mode_policy.read_only and policy.safety != CommandSafety.ALLOW:
+            reason = "Plan mode allows read operations only."
             return CommandResult(
                 self._user_blocked_output(reason),
                 approved=False,
-                safety=CommandSafety.FORBIDDEN,
+                safety=policy.safety,
                 command=policy.canonical_command,
                 reason=reason,
                 blocked_by_mode=True,
             )
 
-        if self._mode_allows_policy(policy):
+        if (
+            mode_policy.requires_approval_for_unremembered
+            and policy.safety == CommandSafety.ALLOW
+            and not self._session_allows_command(policy.canonical_command, True)
+        ):
+            policy = CommandPolicy(
+                CommandSafety.APPROVE,
+                "Standard mode requires approval for commands that are not remembered as approved.",
+                policy.canonical_command,
+                policy.allowance_key or self._allowance_key(policy.canonical_command),
+                policy.allowance_label or self._allowance_label(policy.canonical_command),
+                policy.allowance_subject or self._allowance_subject(policy.canonical_command),
+            )
+        elif self._mode_allows_policy(policy):
             policy = CommandPolicy(
                 CommandSafety.ALLOW,
                 (
@@ -624,9 +701,7 @@ class CliToolManager:
                 decision == ApprovalChoice.ALWAYS_ALLOW
                 and self.session_allowed_commands is not None
             ):
-                self.session_allowed_commands.add(
-                    policy.allowance_key or policy.canonical_command
-                )
+                self.session_allowed_commands.add(policy.allowance_key or policy.canonical_command)
 
         return policy
 
@@ -640,20 +715,7 @@ class CliToolManager:
     def _mode_allows_policy(self, policy: CommandPolicy) -> bool:
         """Return whether the active mode auto-allows an approval policy."""
 
-        if policy.safety != CommandSafety.APPROVE:
-            return False
-        serious_token = self._serious_token_in_command(policy.canonical_command)
-        if serious_token is not None:
-            return False
-        if self.mode == AgentMode.SANDBOX:
-            return self._sandbox_serious_token_in_command(policy.canonical_command) is None
-        if self.mode == AgentMode.AUTONOMOUS:
-            return True
-        if self._contains_approval_only_shell_syntax(policy.canonical_command):
-            return False
-        if self.mode == AgentMode.AUTO:
-            return False
-        return False
+        return policy.safety == CommandSafety.APPROVE and self.mode.policy.bypass_command_policy
 
     def run_cli_command(
         self,
@@ -676,9 +738,6 @@ class CliToolManager:
         normalized = self._normalize_command(command)
         if not normalized:
             return CommandPolicy(CommandSafety.FORBIDDEN, "Empty command.", normalized)
-
-        if self.mode == AgentMode.SANDBOX:
-            return self._classify_sandbox(normalized)
 
         policy_source = self._strip_heredoc_bodies(normalized)
         if self._session_rejects_command(normalized, include_session_allowances):
@@ -797,6 +856,7 @@ class CliToolManager:
         if self._has_pipe_operator(policy_source):
             if (
                 policy_source == normalized
+                and self._is_directly_executable_pipeline(normalized)
                 and self._classify_pipeline(policy_source).safety == CommandSafety.ALLOW
             ):
                 return self._execute_pipeline(
@@ -813,16 +873,27 @@ class CliToolManager:
                 long_running_callback=long_running_callback,
             )
         parts = shlex.split(normalized)
-        if parts[0] == "cd":
-            target = self._resolve_path(parts[1] if len(parts) > 1 else ".")
-            self.current_dir = target
-            return str(self.current_dir)
+        if not parts:
+            return "Command is empty."
+        if Path(parts[0]).name == "cd":
+            return self._change_directory(parts[1:])
         output = self._execute_subprocess(
             parts,
             long_running_callback=long_running_callback,
         )
         assert isinstance(output, str)
         return output
+
+    def _change_directory(self, arguments: list[str]) -> str:
+        """Move the session working directory for a plain cd command."""
+
+        if len(arguments) > 1:
+            return "cd accepts at most one path."
+        target = self._resolve_path(arguments[0] if arguments else ".")
+        if not target.is_dir():
+            return f"cd target is not a directory: {target}"
+        self.current_dir = target
+        return str(self.current_dir)
 
     def _classify_cd(self, parts: list[str], normalized: str) -> CommandPolicy:
         if len(parts) > 2:
@@ -924,8 +995,8 @@ class CliToolManager:
             )
             if forbidden is not None:
                 return CommandPolicy(CommandSafety.FORBIDDEN, forbidden.reason, normalized)
-            allowance_key, allowance_label, allowance_subject = (
-                self._compound_allowance_metadata(normalized, policies)
+            allowance_key, allowance_label, allowance_subject = self._compound_allowance_metadata(
+                normalized, policies
             )
             if all(policy.safety == CommandSafety.ALLOW for policy in policies):
                 return CommandPolicy(
@@ -1126,71 +1197,6 @@ class CliToolManager:
             subject = self._session_policy_subject(key)
             return key, f"{subject} commands", subject
         return normalized, "this exact command", "this command"
-
-    def _classify_sandbox(self, normalized: str) -> CommandPolicy:
-        """Classify a command in sandbox mode.
-
-        In sandbox mode, most commands are allowed. Only sandbox-serious
-        commands (git, svn, etc.) and standard serious host-control commands
-        require approval.
-        """
-        if self.strict_workspace:
-            if self._has_shell_syntax(normalized):
-                path_error = self._allowanced_shell_path_error(normalized)
-                if path_error is not None:
-                    return CommandPolicy(
-                        CommandSafety.FORBIDDEN,
-                        path_error,
-                        normalized,
-                        self._allowance_key(normalized),
-                        self._allowance_label(normalized),
-                        self._allowance_subject(normalized),
-                    )
-            with suppress(ValueError):
-                path_error = self._path_error(shlex.split(normalized))
-                if path_error is not None:
-                    return CommandPolicy(
-                        CommandSafety.FORBIDDEN,
-                        path_error,
-                        normalized,
-                        self._allowance_key(normalized),
-                        self._allowance_label(normalized),
-                        self._allowance_subject(normalized),
-                    )
-        if self._session_rejects_command(normalized, include_session_allowances=True):
-            return CommandPolicy(
-                CommandSafety.FORBIDDEN,
-                self._session_rejection_reason(self._allowance_key(normalized) or normalized),
-                normalized,
-                self._allowance_key(normalized),
-                self._allowance_label(normalized),
-                self._allowance_subject(normalized),
-            )
-        sandbox_serious = self._sandbox_serious_token_in_command(normalized)
-        if sandbox_serious is not None:
-            return CommandPolicy(
-                CommandSafety.APPROVE,
-                f"{sandbox_serious} can modify version control history.",
-                normalized,
-                self._allowance_key(normalized),
-                self._allowance_label(normalized),
-                self._allowance_subject(normalized),
-            )
-        serious_token = self._serious_token_in_command(normalized)
-        if serious_token is not None:
-            return CommandPolicy(
-                CommandSafety.APPROVE,
-                f"{serious_token} can modify or control the host system.",
-                normalized,
-                self._allowance_key(normalized),
-                self._allowance_label(normalized),
-                self._allowance_subject(normalized),
-            )
-        return CommandPolicy(
-            CommandSafety.ALLOW,
-            "Sandbox mode auto-allows this command.",
-            normalized,
-        )
 
     def _path_error(self, parts: list[str]) -> str | None:
         for part in self._path_candidate_arguments(parts):
@@ -1651,18 +1657,6 @@ class CliToolManager:
                     return Path(parts[0]).name
         return None
 
-    def _sandbox_serious_token_in_command(self, normalized: str) -> str | None:
-        policy_source = self._strip_heredoc_bodies(normalized)
-        for segment in self._shell_segments(
-            policy_source,
-            split_operators=frozenset({";", "&&", "||", "|", "\n"}),
-        ):
-            with suppress(ValueError):
-                parts = shlex.split(segment)
-                if parts and Path(parts[0]).name in SANDBOX_SERIOUS_COMMAND_NAMES:
-                    return Path(parts[0]).name
-        return None
-
     def _is_known_read_only_command(self, executable: str, parts: list[str]) -> bool:
         if executable in READ_ONLY_COMMAND_NAMES:
             return True
@@ -1734,8 +1728,7 @@ class CliToolManager:
 
     def _has_pipe_operator(self, normalized: str) -> bool:
         return any(
-            operator == PIPE_OPERATOR
-            for _, _, operator in self._shell_operator_spans(normalized)
+            operator == PIPE_OPERATOR for _, _, operator in self._shell_operator_spans(normalized)
         )
 
     def _has_compound_operator(self, normalized: str) -> bool:
@@ -1746,13 +1739,6 @@ class CliToolManager:
 
     def _has_shell_syntax(self, normalized: str) -> bool:
         return bool(self._shell_operator_spans(normalized))
-
-    def _contains_approval_only_shell_syntax(self, normalized: str) -> bool:
-        policy_source = self._strip_heredoc_bodies(normalized)
-        return any(
-            operator in {"$", "`", "&"}
-            for _, _, operator in self._shell_operator_spans(policy_source)
-        )
 
     def _pipeline_segments(self, normalized: str) -> list[str]:
         return self._shell_segments(normalized, split_operators=frozenset({PIPE_OPERATOR}))
@@ -1852,6 +1838,23 @@ class CliToolManager:
             stripped = re.sub(fd_redirect, "", stripped)
         return stripped.strip()
 
+    def _is_directly_executable_pipeline(self, normalized: str) -> bool:
+        """Return whether every pipeline segment can run without a shell."""
+
+        segments = self._pipeline_segments(normalized)
+        if len(segments) < 2:
+            return False
+        for segment in segments:
+            if self._has_shell_syntax(segment):
+                return False
+            try:
+                parts = shlex.split(segment)
+            except ValueError:
+                return False
+            if not parts or Path(parts[0]).name in SHELL_BUILTIN_COMMANDS:
+                return False
+        return True
+
     def _execute_pipeline(
         self,
         normalized: str,
@@ -1899,13 +1902,58 @@ class CliToolManager:
         *,
         long_running_callback: LongRunningCommandCallback | None = None,
     ) -> str:
-        output = self._execute_subprocess(
-            normalized,
-            shell=True,
-            long_running_callback=long_running_callback,
-        )
+        marker = self._working_directory_marker(normalized)
+        command = normalized if marker is None else self._with_directory_capture(normalized, marker)
+        try:
+            output = self._execute_subprocess(
+                command,
+                shell=True,
+                long_running_callback=long_running_callback,
+            )
+        finally:
+            if marker is not None:
+                self._sync_working_directory(marker)
         assert isinstance(output, str)
         return output
+
+    def _working_directory_marker(self, normalized: str) -> Path | None:
+        """Return a temporary file that records where a shell command ends up."""
+
+        if normalized.endswith("\\"):
+            return None
+        if not WORKING_DIRECTORY_COMMAND_PATTERN.search(self._strip_heredoc_bodies(normalized)):
+            return None
+        try:
+            handle, marker_path = tempfile.mkstemp(prefix="anomx-cwd-", suffix=".path")
+        except OSError:
+            return None
+        os.close(handle)
+        return Path(marker_path)
+
+    def _with_directory_capture(self, normalized: str, marker: Path) -> str:
+        """Append the working directory capture that follows a shell command."""
+
+        return (
+            f"{normalized}\n"
+            "__anomx_status=$?\n"
+            f"pwd > {shlex.quote(str(marker))} 2>/dev/null\n"
+            "exit $__anomx_status\n"
+        )
+
+    def _sync_working_directory(self, marker: Path) -> None:
+        """Adopt the working directory a completed shell command left behind."""
+
+        try:
+            recorded = marker.read_text(errors="replace").strip()
+        except OSError:
+            recorded = ""
+        with suppress(OSError):
+            marker.unlink()
+        if not recorded:
+            return
+        target = Path(recorded)
+        if target.is_dir():
+            self.current_dir = target
 
     def _execute_subprocess(
         self,
@@ -1926,7 +1974,7 @@ class CliToolManager:
                 stdin=subprocess.PIPE if input is not None else None,
             )
         except OSError as error:
-            return f"Command failed: {error}"
+            return f"Command could not be started: {error}"
         deadline = time.monotonic() + COMMAND_TIMEOUT_SECONDS
         started_at = time.monotonic()
         reported_long_running = False
@@ -1992,11 +2040,7 @@ class CliToolManager:
         hidden_count = len(lines) - head_count - tail_count
         abbreviated_lines = [
             *lines[:head_count],
-            (
-                "[... "
-                f"{hidden_count} More Rows omitted from the middle of this command output "
-                "...]"
-            ),
+            (f"[... {hidden_count} More Rows omitted from the middle of this command output ...]"),
         ]
         if tail_count:
             abbreviated_lines.extend(lines[-tail_count:])
@@ -2024,6 +2068,13 @@ class CliToolManager:
 
         self._terminate_process(process)
 
+    def _working_directory(self) -> Path:
+        """Return the working directory, falling back to the root when it is gone."""
+
+        if not self.current_dir.is_dir():
+            self.current_dir = self.root
+        return self.current_dir
+
     def _start_subprocess(self, command: str) -> subprocess.Popen[str]:
         normalized = self._normalize_command(command)
         if not normalized:
@@ -2034,8 +2085,9 @@ class CliToolManager:
         parts = shlex.split(normalized)
         if not parts:
             raise ValueError("empty command")
-        if parts[0] == "cd":
-            raise ValueError("cd cannot be started as an async process")
+        builtin = Path(parts[0]).name
+        if builtin in SHELL_BUILTIN_COMMANDS:
+            raise ValueError(f"{builtin} cannot be started as an async process")
         return self._open_subprocess(parts)
 
     def _open_subprocess(
@@ -2047,7 +2099,7 @@ class CliToolManager:
     ) -> subprocess.Popen[str]:
         return subprocess.Popen(
             command,
-            cwd=self.current_dir,
+            cwd=self._working_directory(),
             env=self.subprocess_env,
             shell=shell,
             stdin=stdin,

@@ -151,7 +151,15 @@ class InfoBoxComponentMixin:
                 self._add(stdscr, y, content_left, line, content_width, self._attr("light"))
                 y += 1
             remaining_height = max(1, content_height - (y - content_y))
-            label_width = min(28, max(14, content_width // 3))
+            longest_label = max(
+                (len(choice.label) for choice in choices if choice.selectable),
+                default=0,
+            )
+            label_width = min(
+                38,
+                max(14, content_width // 3),
+                max(28, longest_label),
+            )
             detail_x = content_left + label_width + 3
             detail_width = max(1, content_width - label_width - 3)
             selected = max(0, min(selected, len(choices) - 1))
@@ -171,6 +179,18 @@ class InfoBoxComponentMixin:
                 y += 1
             for choice_index in range(offset, min(len(choices), offset + visible_rows)):
                 choice = choices[choice_index]
+                if not choice.selectable:
+                    if choice.label:
+                        self._add(
+                            stdscr,
+                            y,
+                            content_left + 2,
+                            choice.label,
+                            content_width - 2,
+                            muted_attr,
+                        )
+                    y += 1
+                    continue
                 selected_row = choice_index == selected
                 attr = self._attr("accent") if selected_row else curses.A_NORMAL
                 marker = "›" if selected_row else " "

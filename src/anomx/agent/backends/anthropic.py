@@ -18,7 +18,16 @@ from anomx.agent.base.backends import (
     BackendTextCallback,
     BaseBackend,
     ThinkingTagStreamFilter,
+    anthropic_token_usage,
 )
+from anomx.agent.context_management import (
+    CONTINUE_AFTER_COMPRESSION_PROMPT,
+    ContextMessage,
+    projected_context_tokens,
+    transient_context_message,
+)
+from anomx.agent.exceptions import BackendFailure
+from anomx.agent.helpers.http_pool import pooled_https_post
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata
 
@@ -56,8 +65,9 @@ class AnthropicCompatibleBackend(BaseBackend):
             return self._missing_api_key_message(self.provider_label, self.env_var)
 
         self.runtime._status(callbacks.status)
+        context_entries = self.runtime.backend_conversation_entries(session_path)
         messages = self._anthropic_messages(
-            self.runtime.conversation_messages(session_path),
+            [entry.payload for entry in context_entries],
             self.provider_key,
             model,
         )
@@ -83,9 +93,23 @@ class AnthropicCompatibleBackend(BaseBackend):
                 callbacks.status,
             )
             if isinstance(response, str):
-                return response
+                recovered_entries = self._recover_context_window(
+                    response, session_path, context_entries, callbacks,
+                )
+                if recovered_entries is None:
+                    return response
+                context_entries = recovered_entries
+                messages = self._anthropic_messages(
+                    [entry.payload for entry in context_entries], self.provider_key, model,
+                )
+                payload = self._payload(
+                    session_path, model, messages,
+                    include_thinking=include_thinking, thinking_intensity=thinking_intensity,
+                )
+                continue
             if self.runtime._turn_aborted():
                 return ""
+            self._track_usage(response.usage, callbacks)
 
             tool_outputs = self._execute_anthropic_requested_tools(
                 response,
@@ -136,8 +160,40 @@ class AnthropicCompatibleBackend(BaseBackend):
                     assistant_content = list(response.content) or [
                         {"type": "text", "text": text}
                     ]
-                    messages.append({"role": "assistant", "content": assistant_content})
-                    messages.append({"role": "user", "content": continuation_prompt})
+                    pending_entries = self._anthropic_context_entries(response, ())
+                    pending_entries.append(
+                        transient_context_message("user", continuation_prompt)
+                    )
+                    context_entries.extend(pending_entries)
+                    context_entries, compressed = self.runtime.compress_in_turn_context(
+                        session_path,
+                        context_entries,
+                        current_context_tokens=projected_context_tokens(
+                            response.usage.input_tokens if response.usage else 0,
+                            response.usage.output_tokens if response.usage else 0,
+                            pending_entries[1:],
+                        ),
+                        status_callback=callbacks.status,
+                    )
+                    if compressed:
+                        context_entries.append(
+                            transient_context_message(
+                                "user",
+                                CONTINUE_AFTER_COMPRESSION_PROMPT,
+                            )
+                        )
+                        messages = self._anthropic_messages(
+                            [entry.payload for entry in context_entries],
+                            self.provider_key,
+                            model,
+                        )
+                    else:
+                        messages.append(
+                            {"role": "assistant", "content": assistant_content}
+                        )
+                        messages.append(
+                            {"role": "user", "content": continuation_prompt}
+                        )
                     payload = self._payload(
                         session_path,
                         model,
@@ -151,8 +207,35 @@ class AnthropicCompatibleBackend(BaseBackend):
                     callbacks.finish(final_text)
                 return final_text
 
-            messages.append({"role": "assistant", "content": list(response.content)})
-            messages.append({"role": "user", "content": tool_outputs})
+            pending_entries = self._anthropic_context_entries(response, tool_outputs)
+            context_entries.extend(pending_entries)
+            context_entries, compressed = self.runtime.compress_in_turn_context(
+                session_path,
+                context_entries,
+                current_context_tokens=projected_context_tokens(
+                    response.usage.input_tokens if response.usage else 0,
+                    response.usage.output_tokens if response.usage else 0,
+                    pending_entries[1:],
+                ),
+                status_callback=callbacks.status,
+            )
+            if compressed:
+                context_entries.append(
+                    transient_context_message(
+                        "user",
+                        CONTINUE_AFTER_COMPRESSION_PROMPT,
+                    )
+                )
+                messages = self._anthropic_messages(
+                    [entry.payload for entry in context_entries],
+                    self.provider_key,
+                    model,
+                )
+            else:
+                messages.append(
+                    {"role": "assistant", "content": list(response.content)}
+                )
+                messages.append({"role": "user", "content": tool_outputs})
             payload = self._payload(
                 session_path,
                 model,
@@ -161,10 +244,37 @@ class AnthropicCompatibleBackend(BaseBackend):
                 thinking_intensity=thinking_intensity,
             )
 
-        return (
-            f"{self.provider_label} reached the {MAX_TOOL_ITERATIONS}-step limit for a single "
-            "turn and stopped. Send a follow-up message to continue."
+        return BackendFailure(
+            f"{self.provider_label} tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches.",
+            code="tool_limit_exceeded",
         )
+
+    def _anthropic_context_entries(
+        self,
+        response: AnthropicStreamResponse,
+        tool_outputs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> list[ContextMessage]:
+        assistant_parts = [response.text.strip()] if response.text.strip() else []
+        assistant_parts.extend(
+            (
+                f"[Tool call: {tool_call.name}]\n"
+                f"{json.dumps(tool_call.input, ensure_ascii=False, sort_keys=True)}"
+            )
+            for tool_call in response.tool_calls
+        )
+        entries = [
+            transient_context_message("assistant", "\n\n".join(assistant_parts))
+        ]
+        if tool_outputs:
+            results = "\n\n".join(
+                (
+                    f"[Tool result: {output.get('tool_use_id', '')}]\n"
+                    f"{output.get('content', '')}"
+                )
+                for output in tool_outputs
+            )
+            entries.append(transient_context_message("user", results))
+        return entries
 
     def _payload(
         self,
@@ -182,9 +292,9 @@ class AnthropicCompatibleBackend(BaseBackend):
             fallback = 8_192
         payload: dict[str, Any] = {
             "model": model,
-            "system": self.runtime._instructions(session_path),
+            "system": self._cached_system_blocks(self.runtime._instructions(session_path)),
             "messages": messages,
-            "tools": self._anthropic_tools(),
+            "tools": self._cached_tools(self._anthropic_tools()),
             "max_tokens": self._max_output_tokens(model, fallback),
             "stream": True,
         }
@@ -194,6 +304,34 @@ class AnthropicCompatibleBackend(BaseBackend):
             if output_config:
                 payload["output_config"] = output_config
         return payload
+
+    @staticmethod
+    def _cached_system_blocks(instructions: str) -> list[dict[str, Any]]:
+        """Wrap the system prompt as a cacheable content block.
+
+        The system prompt (identity, workflow, tool descriptions, skills, memories) is
+        rebuilt fresh every turn but is almost entirely static within a session. Without
+        a cache breakpoint, every turn pays full input-token processing for it instead of
+        a cheap cache read, which is the single largest source of avoidable per-turn
+        latency in this loop.
+        """
+
+        return [
+            {
+                "type": "text",
+                "text": instructions,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+
+    @staticmethod
+    def _cached_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mark the tool schema list as cacheable via a breakpoint on its last entry."""
+
+        if not tools:
+            return tools
+        tools[-1] = {**tools[-1], "cache_control": {"type": "ephemeral"}}
+        return tools
 
     def _stream_response(
         self,
@@ -217,18 +355,19 @@ class AnthropicCompatibleBackend(BaseBackend):
 
         def stream_once() -> AnthropicStreamResponse | str:
             self.runtime._debug_log_step(self.provider_key, payload)
-            request = urllib.request.Request(
-                endpoint,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
-                method="POST",
-            )
+            request_body = json.dumps(payload).encode("utf-8")
             text_parts: list[str] = []
             text_filter = ThinkingTagStreamFilter()
             content_by_index: dict[int, dict[str, Any]] = {}
             tool_json_parts: dict[int, list[str]] = {}
             stop_reason: str | None = None
-            with urllib.request.urlopen(request, timeout=120) as response:
+            usage_payload: dict[str, Any] = {}
+            with pooled_https_post(
+                endpoint,
+                data=request_body,
+                headers=headers,
+                timeout=120,
+            ) as response:
                 for raw_line in response:
                     if self.runtime._turn_aborted():
                         return ""
@@ -240,7 +379,17 @@ class AnthropicCompatibleBackend(BaseBackend):
                         continue
                     event = cast(dict[str, Any], json.loads(event_data))
                     event_type = str(event.get("type", ""))
-                    if event_type == "content_block_start":
+                    if event_type == "message_start":
+                        message = event.get("message")
+                        if isinstance(message, dict):
+                            message_usage = message.get("usage")
+                            if isinstance(message_usage, dict):
+                                usage_payload.update(message_usage)
+                    elif event_type == "message_delta":
+                        delta_usage = event.get("usage")
+                        if isinstance(delta_usage, dict):
+                            usage_payload.update(delta_usage)
+                    elif event_type == "content_block_start":
                         index = event.get("index")
                         block = event.get("content_block")
                         if not isinstance(index, int) or not isinstance(block, dict):
@@ -336,7 +485,9 @@ class AnthropicCompatibleBackend(BaseBackend):
                         if isinstance(error, dict):
                             message = str(error.get("message", "")).strip()
                             if message:
-                                return f"{self.provider_label} request failed: {message}"
+                                return BackendFailure(
+                                    f"{self.provider_label} request failed: {message}"
+                                )
 
             for index in tuple(tool_json_parts):
                 self._finalize_anthropic_tool_input(content_by_index, tool_json_parts, index)
@@ -362,6 +513,7 @@ class AnthropicCompatibleBackend(BaseBackend):
                 tool_calls,
                 ordered_content,
                 stop_reason,
+                usage=anthropic_token_usage(usage_payload),
             )
 
         if self.runtime._turn_aborted():
@@ -597,3 +749,45 @@ class AnthropicBackend(AnthropicCompatibleBackend):
         except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
             return None
         return self._sanitize_continuation_statement(self.extract_anthropic_text(data))
+
+    def summarize_conversation(
+        self,
+        messages: list[dict[str, Any]],
+        previous_summary: str,
+        model: str,
+    ) -> str | None:
+        api_key = self._api_key(self.provider_key, self.env_var)
+        if api_key is None:
+            return None
+        request = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=json.dumps(
+                {
+                    "model": model,
+                    "system": self._context_summary_system_prompt(),
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": self._context_summary_user_prompt(
+                                messages,
+                                previous_summary,
+                            ),
+                        }
+                    ],
+                    "max_tokens": 4096,
+                    "stream": False,
+                }
+            ).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
+        except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
+            return None
+        return self.extract_anthropic_text(data).strip() or None

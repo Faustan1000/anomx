@@ -53,6 +53,34 @@ class ProviderOption:
 
 
 @dataclass(frozen=True)
+class ModelMenuOption:
+    """Curated model exposed by the CLI ``/model`` menu."""
+
+    provider_key: str
+    model: str
+    label: str
+
+
+@dataclass(frozen=True)
+class BackgroundWorkModelSetting:
+    """Configurable model used for one class of background work."""
+
+    config_key: str
+    label: str
+    description: str
+    default: str
+
+
+@dataclass(frozen=True)
+class ContextManagementOption:
+    """Selectable limit or target used by automatic context management."""
+
+    value: int
+    label: str
+    description: str
+
+
+@dataclass(frozen=True)
 class ModelMetadata:
     """Model information used for selection and context tracking."""
 
@@ -86,8 +114,8 @@ class SessionRecord:
     message_count: int = 0
     unread: bool = False
     last_user_at: str = ""
-    mode: AgentMode = AgentMode.CONFIRM
-    agent_kind: AgentKind = AgentKind.STANDARD
+    mode: AgentMode = AgentMode.STANDARD
+    agent_kind: AgentKind = AgentKind.MAIN
 
 
 @dataclass(frozen=True)
@@ -112,7 +140,16 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
     ProviderOption(
         "blablador",
         "JSC Blablador",
-        ("alias-code", "alias-fast", "alias-large", "alias-huge"),
+        (
+            "alias-kimi-k3-1m",
+            "alias-glm-huge",
+            "alias-deepseek-v4-flash-0731",
+            "alias-muse",
+            "alias-code",
+            "alias-fast",
+            "alias-large",
+            "alias-huge",
+        ),
         allow_custom_model=True,
         connect_hint="Connect to LLMs hosted on the Jülich Supercomputing Centre",
     ),
@@ -142,9 +179,122 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
         connect_hint="Connect to LLMs that you run on your machine via Ollama",
         requires_api_key=False,
     ),
+    ProviderOption(
+        "kimi",
+        "Kimi",
+        ("kimi-k3", "kimi-k2.7-code", "kimi-k2.6"),
+        allow_custom_model=True,
+        connect_hint="Connect to Kimi models hosted by Moonshot AI",
+    ),
 )
 
 AI_PROVIDER_KEYS = tuple(provider.key for provider in AI_PROVIDERS)
+
+MODEL_MENU_OPTIONS: tuple[ModelMenuOption, ...] = (
+    ModelMenuOption("openai", "gpt-6-astra", "6 Astra"),
+    ModelMenuOption("openai", "gpt-5.6-sol", "5.6 Sol"),
+    ModelMenuOption("openai", "gpt-5.6-terra", "5.6 Terra"),
+    ModelMenuOption("openai", "gpt-5.6-luna", "5.6 Luna"),
+    ModelMenuOption("openai", "gpt-5.5", "5.5"),
+    ModelMenuOption("openai", "gpt-5.4", "5.4"),
+    ModelMenuOption("openai", "gpt-5.4-mini", "5.4 Mini"),
+    ModelMenuOption("anthropic", "claude-fable-5-1", "Fable 5.1"),
+    ModelMenuOption("anthropic", "claude-opus-5", "Opus 5"),
+    ModelMenuOption("anthropic", "claude-sonnet-5", "Sonnet 5"),
+    ModelMenuOption("anthropic", "claude-haiku-4-5-20251001", "Haiku 4.5"),
+    ModelMenuOption("desy", "coding", "Coding"),
+    ModelMenuOption("desy", "desy-assistant", "Assistant"),
+    ModelMenuOption("desy", "reasoning", "Reasoning"),
+    ModelMenuOption("blablador", "alias-kimi-k3-1m", "Kimi K3"),
+    ModelMenuOption("blablador", "alias-glm-huge", "GLM 5.2 (AWQ INT4)"),
+    ModelMenuOption(
+        "blablador",
+        "alias-deepseek-v4-flash-0731",
+        "DeepSeek V4 Flash",
+    ),
+    ModelMenuOption("blablador", "alias-muse", "Muse Glimmer (30B)"),
+    ModelMenuOption("blablador", "alias-fast", "GPT OSS (120B)"),
+    ModelMenuOption("blablador", "alias-large", "Qwen 3.5 (122B)"),
+    ModelMenuOption("blablador", "alias-code", "Qwen 3.8 (27B)"),
+    ModelMenuOption("blablador", "alias-huge", "MiniMax M2.7"),
+)
+
+CURRENT_MODEL_SELECTION = "current"
+
+BACKGROUND_WORK_MODEL_SETTINGS: tuple[BackgroundWorkModelSetting, ...] = (
+    BackgroundWorkModelSetting(
+        "background_hard_work_model",
+        "Hard Work",
+        "e.g. computation of recommended next steps",
+        CURRENT_MODEL_SELECTION,
+    ),
+    BackgroundWorkModelSetting(
+        "background_medium_work_model",
+        "Medium Work",
+        "e.g. risk assessment of agent commands",
+        CURRENT_MODEL_SELECTION,
+    ),
+    BackgroundWorkModelSetting(
+        "background_easy_work_model",
+        "Easy Work",
+        "e.g. automatic naming of chats",
+        CURRENT_MODEL_SELECTION,
+    ),
+)
+
+CONTEXT_LENGTH_OPTIONS: tuple[ContextManagementOption, ...] = (
+    ContextManagementOption(
+        32_000,
+        "32k Tokens",
+        "For focused tasks and everyday conversations",
+    ),
+    ContextManagementOption(
+        64_000,
+        "64k Tokens",
+        "For detailed tasks and longer conversations",
+    ),
+    ContextManagementOption(
+        128_000,
+        "128k Tokens",
+        "For complex tasks and multi-file projects",
+    ),
+    ContextManagementOption(
+        256_000,
+        "256k Tokens",
+        "For large projects and extensive codebases",
+    ),
+    ContextManagementOption(
+        512_000,
+        "512k Tokens",
+        "For expansive projects and sustained workflows",
+    ),
+    ContextManagementOption(
+        1_000_000,
+        "1M Tokens",
+        "For extremely challenging tasks and long-running work",
+    ),
+)
+
+CONTEXT_COMPRESSION_TARGET_OPTIONS: tuple[ContextManagementOption, ...] = (
+    ContextManagementOption(
+        25,
+        "25%",
+        "For a good experience with simple conversations",
+    ),
+    ContextManagementOption(
+        50,
+        "50%",
+        "For a good balance between performance and cost",
+    ),
+    ContextManagementOption(
+        75,
+        "75%",
+        "For complex longer-running agentic tasks",
+    ),
+)
+
+DEFAULT_MAXIMUM_CONTEXT_TOKENS = 256_000
+DEFAULT_CONTEXT_COMPRESSION_TARGET_PERCENT = 50
 
 THINKING_INTENSITY_AUTO = "auto"
 THINKING_INTENSITY_OPTIONS: dict[str, ThinkingIntensityOption] = {
@@ -156,7 +306,12 @@ THINKING_INTENSITY_OPTIONS: dict[str, ThinkingIntensityOption] = {
     "minimal": ThinkingIntensityOption(
         "minimal",
         "Minimal",
-        "Fastest OpenAI reasoning mode",
+        "Use minimal reasoning on supported legacy models",
+    ),
+    "none": ThinkingIntensityOption(
+        "none",
+        "None",
+        "Disable reasoning for the fastest responses",
     ),
     "low": ThinkingIntensityOption(
         "low",
@@ -176,18 +331,97 @@ THINKING_INTENSITY_OPTIONS: dict[str, ThinkingIntensityOption] = {
     "xhigh": ThinkingIntensityOption(
         "xhigh",
         "Extra high",
-        "Claude long-horizon agentic work",
+        "Use extended reasoning for demanding agentic work",
     ),
     "max": ThinkingIntensityOption(
         "max",
         "Max",
-        "Claude maximum capability mode",
+        "Use maximum capability and token budget",
     ),
 }
 
+MODEL_THINKING_INTENSITIES: dict[tuple[str, str], tuple[str, ...]] = {
+    ("openai", "gpt-6-astra"): (
+        THINKING_INTENSITY_AUTO,
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ),
+    **{
+        ("openai", model): (
+            THINKING_INTENSITY_AUTO,
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        )
+        for model in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna")
+    },
+    **{
+        ("openai", model): (
+            THINKING_INTENSITY_AUTO,
+            "none",
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+        )
+        for model in ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini")
+    },
+    **{
+        ("anthropic", model): (
+            THINKING_INTENSITY_AUTO,
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        )
+        for model in (
+            "claude-fable-5-1",
+            "claude-opus-5",
+            "claude-sonnet-5",
+            "claude-opus-4-8",
+        )
+    },
+    **{
+        ("anthropic", model): (
+            THINKING_INTENSITY_AUTO,
+            "low",
+            "medium",
+            "high",
+            "max",
+        )
+        for model in ("claude-opus-4-6", "claude-sonnet-4-6")
+    },
+}
+
 MODEL_METADATA: dict[str, ModelMetadata] = {
-    "gpt-5.5": ModelMetadata("gpt-5.5", "GPT-5.5", 1_000_000, 128_000),
-    "gpt-5.4": ModelMetadata("gpt-5.4", "GPT-5.4", 1_000_000, 128_000),
+    "gpt-6-astra": ModelMetadata(
+        "gpt-6-astra",
+        "GPT-6 Astra",
+        1_050_000,
+        128_000,
+    ),
+    "gpt-5.6-sol": ModelMetadata("gpt-5.6-sol", "GPT-5.6 Sol", 1_050_000, 128_000),
+    "gpt-5.6-terra": ModelMetadata(
+        "gpt-5.6-terra",
+        "GPT-5.6 Terra",
+        1_050_000,
+        128_000,
+    ),
+    "gpt-5.6-luna": ModelMetadata(
+        "gpt-5.6-luna",
+        "GPT-5.6 Luna",
+        1_050_000,
+        128_000,
+    ),
+    "gpt-5.5": ModelMetadata("gpt-5.5", "GPT-5.5", 1_050_000, 128_000),
+    "gpt-5.4": ModelMetadata("gpt-5.4", "GPT-5.4", 1_050_000, 128_000),
     "gpt-5.4-mini": ModelMetadata("gpt-5.4-mini", "GPT-5.4 mini", 400_000, 128_000),
     "claude-opus-4-8": ModelMetadata(
         "claude-opus-4-8",
@@ -207,6 +441,88 @@ MODEL_METADATA: dict[str, ModelMetadata] = {
         200_000,
         64_000,
     ),
+    "claude-fable-5-1": ModelMetadata(
+        "claude-fable-5-1",
+        "Claude Fable 5.1",
+        1_000_000,
+        128_000,
+    ),
+    "claude-opus-5": ModelMetadata(
+        "claude-opus-5",
+        "Claude Opus 5",
+        1_000_000,
+        128_000,
+    ),
+    "claude-sonnet-5": ModelMetadata(
+        "claude-sonnet-5",
+        "Claude Sonnet 5",
+        1_000_000,
+        128_000,
+    ),
+    "coding": ModelMetadata("coding", "Coding", 1_048_576, 32_768),
+    "desy-assistant": ModelMetadata(
+        "desy-assistant",
+        "DESY Assistant",
+        256_000,
+        32_768,
+    ),
+    "reasoning": ModelMetadata("reasoning", "Reasoning", 128_000, 32_768),
+    "alias-kimi-k3-1m": ModelMetadata(
+        "alias-kimi-k3-1m",
+        "Kimi K3",
+        1_048_576,
+        None,
+    ),
+    "alias-glm-huge": ModelMetadata(
+        "alias-glm-huge",
+        "GLM 5.2 (AWQ INT4)",
+        1_048_576,
+        None,
+    ),
+    "alias-deepseek-v4-flash-0731": ModelMetadata(
+        "alias-deepseek-v4-flash-0731",
+        "DeepSeek V4 Flash",
+        1_048_576,
+        None,
+    ),
+    "alias-muse": ModelMetadata(
+        "alias-muse",
+        "Muse Glimmer (30B)",
+        None,
+        None,
+    ),
+    "alias-fast": ModelMetadata(
+        "alias-fast",
+        "GPT OSS (120B)",
+        131_072,
+        131_072,
+    ),
+    "alias-large": ModelMetadata(
+        "alias-large",
+        "Qwen 3.5 (122B)",
+        262_144,
+        32_768,
+    ),
+    "alias-code": ModelMetadata(
+        "alias-code",
+        "Qwen 3.8 (27B)",
+        262_144,
+        32_768,
+    ),
+    "alias-huge": ModelMetadata(
+        "alias-huge",
+        "MiniMax M2.7",
+        131_072,
+        32_768,
+    ),
+    "kimi-k3": ModelMetadata("kimi-k3", "Kimi K3", 1_048_576, 1_048_576),
+    "kimi-k2.7-code": ModelMetadata(
+        "kimi-k2.7-code",
+        "Kimi K2.7 Code",
+        262_144,
+        None,
+    ),
+    "kimi-k2.6": ModelMetadata("kimi-k2.6", "Kimi K2.6", 262_144, 262_144),
     "qwen3.6": ModelMetadata("qwen3.6", "Qwen 3.6", None, None),
     "qwen3-coder:30b": ModelMetadata("qwen3-coder:30b", "Qwen3 Coder 30B", None, None),
     "qwen2.5-coder:32b": ModelMetadata(
@@ -222,11 +538,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "onboarding_complete": False,
     "provider": "openai",
     "model": "gpt-5.5",
+    **{
+        setting.config_key: setting.default
+        for setting in BACKGROUND_WORK_MODEL_SETTINGS
+    },
+    "maximum_context_tokens": DEFAULT_MAXIMUM_CONTEXT_TOKENS,
+    "context_compression_target_percent": DEFAULT_CONTEXT_COMPRESSION_TARGET_PERCENT,
     "user_name": "",
     "thinking_intensity": THINKING_INTENSITY_AUTO,
     "max_output_tokens": 8192,
-    "agent_mode": AgentMode.CONFIRM.value,
-    "agent_kind": AgentKind.STANDARD.value,
+    "work_visualization": "default",
+    "agent_mode": AgentMode.STANDARD.value,
+    "agent_kind": AgentKind.MAIN.value,
     "require_trusted_repo": True,
     "history_persistence": "save_all",
     "debug_mode": False,
@@ -255,9 +578,13 @@ CONFIG_SCALAR_FIELDS = (
     "onboarding_complete",
     "provider",
     "model",
+    *(setting.config_key for setting in BACKGROUND_WORK_MODEL_SETTINGS),
+    "maximum_context_tokens",
+    "context_compression_target_percent",
     "user_name",
     "thinking_intensity",
     "max_output_tokens",
+    "work_visualization",
     "agent_mode",
     "agent_kind",
     "history_persistence",
@@ -320,6 +647,17 @@ def model_context_window(model: str) -> int | None:
     return None if metadata is None else metadata.context_window
 
 
+def model_output_token_budget(model: str, fallback: int = 32_768) -> int:
+    """Reserve a bounded output budget while leaving room for model input."""
+
+    metadata = model_metadata(model)
+    output_tokens = metadata.max_output_tokens if metadata is not None else None
+    context_window = model_context_window(model)
+    if context_window:
+        return min(output_tokens or fallback, context_window // 4)
+    return output_tokens or fallback
+
+
 def model_detail(model: str) -> str:
     """Return a compact model detail string for menus."""
 
@@ -347,23 +685,8 @@ def thinking_intensity_options(
 ) -> tuple[ThinkingIntensityOption, ...]:
     """Return supported thinking intensity options for a provider/model pair."""
 
-    if provider_key == "openai" and model.startswith("gpt-5"):
-        return tuple(
-            THINKING_INTENSITY_OPTIONS[value]
-            for value in (THINKING_INTENSITY_AUTO, "minimal", "low", "medium", "high")
-        )
-    if provider_key == "anthropic":
-        if model == "claude-opus-4-8":
-            return tuple(
-                THINKING_INTENSITY_OPTIONS[value]
-                for value in (THINKING_INTENSITY_AUTO, "low", "medium", "high", "xhigh", "max")
-            )
-        if model in {"claude-opus-4-6", "claude-sonnet-4-6"}:
-            return tuple(
-                THINKING_INTENSITY_OPTIONS[value]
-                for value in (THINKING_INTENSITY_AUTO, "low", "medium", "high", "max")
-            )
-    return ()
+    values = MODEL_THINKING_INTENSITIES.get((provider_key, model), ())
+    return tuple(THINKING_INTENSITY_OPTIONS[value] for value in values)
 
 
 def thinking_intensity_supported(provider_key: str, model: str) -> bool:
@@ -373,8 +696,9 @@ def thinking_intensity_supported(provider_key: str, model: str) -> bool:
 
 
 def _format_token_count(tokens: int) -> str:
-    if tokens >= 1_000_000 and tokens % 1_000_000 == 0:
-        return f"{tokens // 1_000_000}M"
+    if tokens >= 1_000_000:
+        millions = f"{tokens / 1_000_000:.2f}".rstrip("0").rstrip(".")
+        return f"{millions}M"
     if tokens >= 1_000 and tokens % 1_000 == 0:
         return f"{tokens // 1_000}K"
     return f"{tokens:,}"
@@ -385,6 +709,7 @@ class AnomxHome:
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = resolve_anomx_home() if root is None else root.expanduser()
+        self._session_record_cache: dict[Path, tuple[int, int, SessionRecord]] = {}
 
     @property
     def config_path(self) -> Path:
@@ -492,9 +817,24 @@ class AnomxHome:
         config.update(self._read_toml_object(self.config_path))
         config["agent_mode"] = AgentMode.parse(config.get("agent_mode")).value
         config["agent_kind"] = parse_agent_kind(config.get("agent_kind")).value
+        if config.get("work_visualization") not in ("default", "extended"):
+            config["work_visualization"] = "default"
         config["thinking_intensity"] = normalize_thinking_intensity(
             config.get("thinking_intensity")
         )
+        for setting in BACKGROUND_WORK_MODEL_SETTINGS:
+            if not str(config.get(setting.config_key) or "").strip():
+                config[setting.config_key] = CURRENT_MODEL_SELECTION
+        if config.get("maximum_context_tokens") not in {
+            option.value for option in CONTEXT_LENGTH_OPTIONS
+        }:
+            config["maximum_context_tokens"] = DEFAULT_MAXIMUM_CONTEXT_TOKENS
+        if config.get("context_compression_target_percent") not in {
+            option.value for option in CONTEXT_COMPRESSION_TARGET_OPTIONS
+        }:
+            config["context_compression_target_percent"] = (
+                DEFAULT_CONTEXT_COMPRESSION_TARGET_PERCENT
+            )
         config["history_persistence"] = "save_all"
         config["require_trusted_repo"] = True
         config["debug_mode"] = bool(config.get("debug_mode"))
@@ -515,9 +855,24 @@ class AnomxHome:
         merged.update(dict(config))
         merged["agent_mode"] = AgentMode.parse(merged.get("agent_mode")).value
         merged["agent_kind"] = parse_agent_kind(merged.get("agent_kind")).value
+        if merged.get("work_visualization") not in ("default", "extended"):
+            merged["work_visualization"] = "default"
         merged["thinking_intensity"] = normalize_thinking_intensity(
             merged.get("thinking_intensity")
         )
+        for setting in BACKGROUND_WORK_MODEL_SETTINGS:
+            if not str(merged.get(setting.config_key) or "").strip():
+                merged[setting.config_key] = CURRENT_MODEL_SELECTION
+        if merged.get("maximum_context_tokens") not in {
+            option.value for option in CONTEXT_LENGTH_OPTIONS
+        }:
+            merged["maximum_context_tokens"] = DEFAULT_MAXIMUM_CONTEXT_TOKENS
+        if merged.get("context_compression_target_percent") not in {
+            option.value for option in CONTEXT_COMPRESSION_TARGET_OPTIONS
+        }:
+            merged["context_compression_target_percent"] = (
+                DEFAULT_CONTEXT_COMPRESSION_TARGET_PERCENT
+            )
         merged["history_persistence"] = "save_all"
         merged["require_trusted_repo"] = True
         merged["debug_mode"] = bool(merged.get("debug_mode"))
@@ -684,9 +1039,7 @@ class AnomxHome:
         """Return the provider keys for every connected backend, in catalog order."""
 
         return [
-            provider.key
-            for provider in AI_PROVIDERS
-            if self.is_backend_connected(provider.key)
+            provider.key for provider in AI_PROVIDERS if self.is_backend_connected(provider.key)
         ]
 
     def set_backend_connected(self, provider: str, connected: bool) -> None:
@@ -698,7 +1051,11 @@ class AnomxHome:
 
         config = self.load_config()
         current = config.get("connected_backends", [])
-        keys = [str(entry).strip() for entry in current if str(entry).strip()] if isinstance(current, list) else []
+        keys = (
+            [str(entry).strip() for entry in current if str(entry).strip()]
+            if isinstance(current, list)
+            else []
+        )
         if connected and provider not in keys:
             keys.append(provider)
         elif not connected and provider in keys:
@@ -971,6 +1328,7 @@ class AnomxHome:
     @staticmethod
     def _sandbox_hash(project_path: Path) -> str:
         import hashlib
+
         raw = str(project_path.resolve()).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()[:6]
 
@@ -979,8 +1337,8 @@ class AnomxHome:
         cwd: Path,
         provider: str,
         model: str,
-        mode: AgentMode | str = AgentMode.CONFIRM,
-        agent_kind: AgentKind | str = AgentKind.STANDARD,
+        mode: AgentMode | str = AgentMode.STANDARD,
+        agent_kind: AgentKind | str = AgentKind.MAIN,
     ) -> SessionRecord:
         """Create an empty session transcript and index entry."""
 
@@ -1248,9 +1606,7 @@ class AnomxHome:
                 if not isinstance(payload, dict):
                     continue
                 event_type = (
-                    payload.get("type")
-                    if event.get("type") == "event_msg"
-                    else event.get("type")
+                    payload.get("type") if event.get("type") == "event_msg" else event.get("type")
                 )
                 if event_type not in {"user_message", "skill_invocation"}:
                     continue
@@ -1276,11 +1632,7 @@ class AnomxHome:
 
     @staticmethod
     def _trim_cli_usage(usage: Mapping[str, int], *, max_days: int = 371) -> dict[str, int]:
-        return {
-            key: int(usage[key])
-            for key in sorted(usage)[-max_days:]
-            if int(usage[key]) > 0
-        }
+        return {key: int(usage[key]) for key in sorted(usage)[-max_days:] if int(usage[key]) > 0}
 
     def update_session_title(self, session_path: Path, title: str) -> None:
         """Update the title stored in the session metadata event."""
@@ -1420,10 +1772,35 @@ class AnomxHome:
         records = [
             record
             for path in self.sessions_dir.rglob("*.jsonl")
-            if (record := self._read_session_record(path)) is not None
+            if (record := self._read_session_record_cached(path)) is not None
         ]
         records.sort(key=self._session_sort_key, reverse=True)
         return records if limit is None else records[:limit]
+
+    def _read_session_record_cached(self, path: Path) -> SessionRecord | None:
+        """Read a session record, reusing the in-process cache when the file is unchanged.
+
+        Session transcripts only grow with each turn, and `list_sessions` is called
+        repeatedly per app run (startup, project listings, animation checks). Without
+        this cache, every call re-parses the full JSONL body of every session ever
+        recorded, which scales with total chat history rather than what changed.
+        """
+
+        try:
+            stat = path.stat()
+        except OSError:
+            self._session_record_cache.pop(path, None)
+            return None
+        cache_key = (stat.st_mtime_ns, stat.st_size)
+        cached = self._session_record_cache.get(path)
+        if cached is not None and cached[:2] == cache_key:
+            return cached[2]
+        record = self._read_session_record(path)
+        if record is None:
+            self._session_record_cache.pop(path, None)
+            return None
+        self._session_record_cache[path] = (*cache_key, record)
+        return record
 
     def _session_sort_key(self, record: SessionRecord) -> tuple[str, int]:
         try:
@@ -1465,8 +1842,8 @@ class AnomxHome:
                 "title": record.title,
                 "unread": record.unread,
                 "last_user_at": record.last_user_at,
-            "agent_mode": record.mode.value,
-            "agent_kind": record.agent_kind.value,
+                "agent_mode": record.mode.value,
+                "agent_kind": record.agent_kind.value,
             },
         }
         self._append_jsonl(self.session_index_path, payload)
@@ -1653,15 +2030,11 @@ class AnomxHome:
 
         global_allowed = config.get("global_allowed_commands")
         if isinstance(global_allowed, list) and global_allowed:
-            lines.append(
-                f"global_allowed_commands = {json.dumps(global_allowed)}"
-            )
+            lines.append(f"global_allowed_commands = {json.dumps(global_allowed)}")
 
         global_rejected = config.get("global_rejected_commands")
         if isinstance(global_rejected, list) and global_rejected:
-            lines.append(
-                f"global_rejected_commands = {json.dumps(global_rejected)}"
-            )
+            lines.append(f"global_rejected_commands = {json.dumps(global_rejected)}")
 
         projects = config.get("projects")
         if isinstance(projects, dict):

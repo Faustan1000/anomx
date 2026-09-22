@@ -1,5 +1,11 @@
 """Terminal UI package for the Anomx agent."""
 
+# Re-exported so tests can patch `anomx.agent.ui.time.monotonic` / `.sleep` and have
+# it take effect: every view module does a plain `import time` and calls
+# `time.monotonic()`/`time.sleep()`, and since they all bind the same stdlib module
+# object, patching an attribute on it here reaches every view's calls too.
+import time  # noqa: F401
+
 from anomx.agent.ui.constants import (  # noqa: F401
     ABORT_AGENT_CONFIRM_NOTICE,
     ACTIVITY_DETAIL_MAX_LINES,
@@ -11,7 +17,6 @@ from anomx.agent.ui.constants import (  # noqa: F401
     FILE_REFERENCE_CACHE_SECONDS,
     FILE_REFERENCE_FIRST_LEVEL_LIMIT,
     FILE_REFERENCE_LIMIT,
-    FILE_REFERENCE_SCAN_LIMIT,
     IGNORED_FILE_REFERENCE_DIRS,
     IMAGE_DROP_CANDIDATE_PATTERN,
     MANUAL_INTERRUPT_MESSAGE,

@@ -13,7 +13,6 @@ from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 
-from anomx.agent.helpers.mode import AgentMode
 from anomx.agent.helpers.platform_client import (
     PlatformClientError,
     PlatformLoginResult,
@@ -38,6 +37,11 @@ from anomx.agent.skills import (
 )
 from anomx.agent.store import (
     AI_PROVIDERS,
+    BACKGROUND_WORK_MODEL_SETTINGS,
+    CONTEXT_COMPRESSION_TARGET_OPTIONS,
+    CONTEXT_LENGTH_OPTIONS,
+    CURRENT_MODEL_SELECTION,
+    MODEL_MENU_OPTIONS,
     ProjectRecord,
     ProviderOption,
     SessionRecord,
@@ -619,39 +623,187 @@ class ConfigViewMixin:
                 value = value[:cursor] + key + value[cursor:]
                 cursor += 1
 
-    def _connected_model_menu_choices(self, *, include_custom: bool = True) -> list[MenuChoice]:
-        """Return model choices aggregated across every connected backend."""
+    def _connected_model_menu_choices(self) -> list[MenuChoice]:
+        """Return curated model choices for every connected backend."""
 
+        connected_keys = set(self.home.connected_backend_keys())
         choices: list[MenuChoice] = []
-        connected_keys = self.home.connected_backend_keys()
-        for provider_key in connected_keys:
-            provider = provider_by_key(provider_key)
+        for option in MODEL_MENU_OPTIONS:
+            if option.provider_key not in connected_keys:
+                continue
+            provider = provider_by_key(option.provider_key)
             if provider is None:
                 continue
-            enriched = self._provider_with_discovered_models(provider)
-            for model in enriched.models:
-                info = model_detail(model)
-                detail = f"{provider.label} · {info}" if info else provider.label
-                choices.append(
-                    MenuChoice(
-                        model,
-                        f"{provider.key}{BACKEND_MODEL_CHOICE_SEPARATOR}{model}",
-                        detail,
-                    )
+            info = model_detail(option.model)
+            detail = f"{provider.label} · {info}" if info else provider.label
+            choices.append(
+                MenuChoice(
+                    option.label,
+                    f"{provider.key}{BACKEND_MODEL_CHOICE_SEPARATOR}{option.model}",
+                    detail,
                 )
-        if include_custom:
-            for provider_key in connected_keys:
-                provider = provider_by_key(provider_key)
-                if provider is None or not provider.allow_custom_model:
-                    continue
-                choices.append(
-                    MenuChoice(
-                        f"Custom {provider.label} model",
-                        f"{CUSTOM_MODEL_CHOICE_PREFIX}{BACKEND_MODEL_CHOICE_SEPARATOR}{provider.key}",
-                        f"Use a custom {provider.label} model name",
-                    )
-                )
+            )
         return choices
+
+    def _background_work_model_label(self, selection: object) -> str:
+        value = str(selection or "").strip()
+        if not value or value == CURRENT_MODEL_SELECTION:
+            return "Selection"
+        for option in MODEL_MENU_OPTIONS:
+            option_value = (
+                f"{option.provider_key}{BACKEND_MODEL_CHOICE_SEPARATOR}{option.model}"
+            )
+            if option_value == value:
+                return option.label
+        _, separator, model = value.partition(BACKEND_MODEL_CHOICE_SEPARATOR)
+        return model if separator else value
+
+    def _manage_settings_choices(self) -> tuple[MenuChoice, ...]:
+        config = self.home.load_config()
+        background_choices = tuple(
+            MenuChoice(
+                f"{setting.label}: "
+                f"{self._background_work_model_label(config.get(setting.config_key))}",
+                setting.config_key,
+                setting.description,
+            )
+            for setting in BACKGROUND_WORK_MODEL_SETTINGS
+        )
+        maximum_context_tokens = int(config["maximum_context_tokens"])
+        compression_target = int(config["context_compression_target_percent"])
+        context_label = next(
+            (
+                option.label.removesuffix(" Tokens")
+                for option in CONTEXT_LENGTH_OPTIONS
+                if option.value == maximum_context_tokens
+            ),
+            f"{maximum_context_tokens:,}",
+        )
+        return (
+            MenuChoice(
+                f"Work Visualization: {str(config['work_visualization']).title()}",
+                "work_visualization",
+                "Show the latest activity or every intermediate update",
+            ),
+            MenuChoice("", "", selectable=False),
+            MenuChoice("Background Work", "", selectable=False),
+            *background_choices,
+            MenuChoice("", "", selectable=False),
+            MenuChoice("Context Management", "", selectable=False),
+            MenuChoice(
+                f"Maximum Context: {context_label}",
+                "maximum_context_tokens",
+                "Compress conversations after this estimated context length",
+            ),
+            MenuChoice(
+                f"Compression Target: {compression_target}%",
+                "context_compression_target_percent",
+                "Reduce backend context to this share of the maximum length",
+            ),
+        )
+
+    def _background_work_setting_choices(self) -> tuple[MenuChoice, ...]:
+        """Compatibility view of the selectable background-work rows."""
+
+        return tuple(
+            choice
+            for choice in self._manage_settings_choices()
+            if choice.value.startswith("background_")
+        )
+
+    def _run_manage_settings_panel(self, stdscr: CursesWindow) -> None:
+        while True:
+            selected_setting = self._menu(
+                stdscr,
+                "Manage Settings",
+                "",
+                self._manage_settings_choices(),
+            )
+            if selected_setting is None:
+                return
+            setting = next(
+                (
+                    candidate
+                    for candidate in BACKGROUND_WORK_MODEL_SETTINGS
+                    if candidate.config_key == selected_setting
+                ),
+                None,
+            )
+            if setting is None:
+                if selected_setting == "work_visualization":
+                    selected_mode = self._menu(
+                        stdscr,
+                        "Work Visualization",
+                        "Choose how work is shown in all chats",
+                        (
+                            MenuChoice(
+                                "Default", "default", "Group tool calls; keep messages visible"
+                            ),
+                            MenuChoice("Extended", "extended", "Show every intermediate update"),
+                        ),
+                    )
+                    if selected_mode is not None:
+                        config = self.home.load_config()
+                        config["work_visualization"] = selected_mode
+                        self.home.save_config(config)
+                        self.work_visualization = selected_mode
+                        self._message_line_cache.clear()
+                        self._rendered_message_cache.clear()
+                    continue
+                if selected_setting == "maximum_context_tokens":
+                    selected_value = self._menu(
+                        stdscr,
+                        "Maximum Context",
+                        "Choose when automatic context compression begins",
+                        tuple(
+                            MenuChoice(
+                                option.label,
+                                str(option.value),
+                                option.description,
+                            )
+                            for option in CONTEXT_LENGTH_OPTIONS
+                        ),
+                    )
+                elif selected_setting == "context_compression_target_percent":
+                    selected_value = self._menu(
+                        stdscr,
+                        "Compression Target",
+                        "Choose the target after automatic compression",
+                        tuple(
+                            MenuChoice(
+                                option.label,
+                                str(option.value),
+                                option.description,
+                            )
+                            for option in CONTEXT_COMPRESSION_TARGET_OPTIONS
+                        ),
+                    )
+                else:
+                    continue
+                if selected_value is None:
+                    continue
+                config = self.home.load_config()
+                config[selected_setting] = int(selected_value)
+                self.home.save_config(config)
+                continue
+            selected_model = self._menu(
+                stdscr,
+                setting.label,
+                "Choose a model for this background work",
+                (
+                    MenuChoice(
+                        "Current Model",
+                        CURRENT_MODEL_SELECTION,
+                        "Use the currently selected model for background work",
+                    ),
+                    *self._connected_model_menu_choices(),
+                ),
+            )
+            if selected_model is None:
+                continue
+            config = self.home.load_config()
+            config[setting.config_key] = selected_model
+            self.home.save_config(config)
 
     def _resolve_model_choice(
         self,
@@ -1091,6 +1243,9 @@ class ConfigViewMixin:
                 if selected == "commands":
                     self._run_commands_panel(stdscr, current_session)
                     continue
+                if selected == "settings":
+                    self._run_manage_settings_panel(stdscr)
+                    continue
         finally:
             self.state = AgentState.NEW_SESSION
 
@@ -1139,6 +1294,11 @@ class ConfigViewMixin:
                 "Manage Commands",
                 "commands",
                 "Review globally approved and rejected commands",
+            ),
+            MenuChoice(
+                "Manage Settings",
+                "settings",
+                "Choose models for background work",
             ),
         )
 
@@ -1346,7 +1506,7 @@ class ConfigViewMixin:
                 config["sandbox_enabled"] = not currently_enabled
                 self.home.save_config(config)
                 if not currently_enabled:
-                    self._activate_agent_mode(AgentMode.SANDBOX)
+                    self._activate_agent_mode(self.agent_mode)
                 else:
                     self._activate_agent(self.active_agent.kind)
                 continue
@@ -1801,7 +1961,9 @@ class ConfigViewMixin:
         return f"{len(connected)} backends connected"
 
     def _backend_state_detail(self, provider: ProviderOption) -> str:
-        return "Connected" if self.home.is_backend_connected(provider.key) else provider.connect_hint
+        return (
+            "Connected" if self.home.is_backend_connected(provider.key) else provider.connect_hint
+        )
 
     def _manage_backends(self, stdscr: CursesWindow) -> None:
         while True:

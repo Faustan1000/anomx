@@ -7,7 +7,8 @@ import os
 from pathlib import Path
 
 from anomx import __version__
-from anomx.agent import AI_PROVIDER_KEYS, AnomxCliApp, AnomxHome, resolve_anomx_home
+
+AI_PROVIDER_KEYS = ("desy", "blablador", "anthropic", "openai", "ollama", "kimi")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -56,10 +57,17 @@ def main(argv: list[str] | None = None) -> int:
     """Run the CLI."""
     parser = build_parser()
     args = parser.parse_args(argv)
-    home_path = args.home if args.home is not None else resolve_anomx_home()
+    home_path = args.home if args.home is not None else _resolve_anomx_home()
     if args.print_home:
         print(home_path)
         return 0
+    return _run_interface(args, home_path)
+
+
+def _run_interface(args: argparse.Namespace, home_path: Path) -> int:
+    """Import and run the full interface after the lightweight entry phase."""
+
+    from anomx.agent import AnomxCliApp, AnomxHome
 
     provider = _startup_provider(args.provider, args.ollama)
     model = _startup_model(args.model)
@@ -68,8 +76,14 @@ def main(argv: list[str] | None = None) -> int:
         startup_provider=provider,
         startup_model=model,
         use_color=not args.no_color,
+        isolate_runtime=True,
     )
-    return app.run()
+    return int(app.run())
+
+
+def _resolve_anomx_home() -> Path:
+    configured = os.environ.get("ANOMX_HOME")
+    return Path(configured).expanduser() if configured else Path.home() / ".anomx"
 
 
 def _startup_provider(provider: str | None, ollama: bool) -> str | None:

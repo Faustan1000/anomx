@@ -7,6 +7,7 @@ from collections.abc import Callable
 from anomx.agent.backends.anthropic import AnthropicBackend
 from anomx.agent.backends.blablador import BlabladorBackend
 from anomx.agent.backends.desy_assistant import DesyAssistantBackend
+from anomx.agent.backends.kimi import KimiBackend
 from anomx.agent.backends.ollama import OllamaBackend
 from anomx.agent.backends.openai import OpenAIBackend
 from anomx.agent.base.backends import BaseBackend
@@ -19,6 +20,7 @@ BACKENDS: dict[str, BackendFactory] = {
     AnthropicBackend.provider_key: AnthropicBackend,
     DesyAssistantBackend.provider_key: DesyAssistantBackend,
     OllamaBackend.provider_key: OllamaBackend,
+    KimiBackend.provider_key: KimiBackend,
 }
 
 
@@ -35,6 +37,7 @@ __all__ = [
     "BaseBackend",
     "BlabladorBackend",
     "DesyAssistantBackend",
+    "KimiBackend",
     "OllamaBackend",
     "OpenAIBackend",
     "backend_for_provider",

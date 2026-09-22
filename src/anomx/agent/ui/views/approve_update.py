@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import curses
-import json
 import os
 import shutil
 import subprocess
 import sys
 import textwrap
-from urllib.request import urlopen
 
 from anomx import __version__
+from anomx.agent.startup import check_latest_version
 from anomx.agent.ui.models import (
     AgentState,
     CursesWindow,
@@ -26,46 +25,21 @@ class ApproveUpdateViewMixin:
         """Fetch the latest anomx version from PyPI.
         Returns the version string if newer, or None if up-to-date / unreachable.
         """
-        local = __version__
-        try:
-            with urlopen(
-                "https://pypi.org/pypi/anomx/json",
-                timeout=5,
-            ) as response:
-                data = json.loads(response.read().decode("utf-8"))
-            latest = str(data.get("info", {}).get("version", ""))
-        except Exception:
-            return None
-        if not latest:
-            return None
-        local_parts = [p for p in local.split(".")]
-        latest_parts = [p for p in latest.split(".")]
-        max_len = max(len(local_parts), len(latest_parts))
-        while len(local_parts) < max_len:
-            local_parts.append("0")
-        while len(latest_parts) < max_len:
-            latest_parts.append("0")
-        try:
-            local_tuple = tuple(int(p) if p.isdigit() else p for p in local_parts)
-            latest_tuple = tuple(int(p) if p.isdigit() else p for p in latest_parts)
-        except ValueError:
-            return None
-        try:
-            is_newer = latest_tuple > local_tuple
-        except TypeError:
-            is_newer = ".".join(str(p) for p in latest_parts) > ".".join(
-                str(p) for p in local_parts
-            )
-        if is_newer:
-            return latest
-        return None
+        return check_latest_version(__version__)
 
     def _run_version_check(self, stdscr: CursesWindow) -> bool:
         """Check PyPI for a newer version and prompt the user if one exists."""
         self.state = AgentState.VERSION_CHECK
         config = self.home.load_config()
         skipped = str(config.get("skipped_version", "") or "")
-        latest = self._check_latest_version()
+        startup_tasks = getattr(self, "_startup_tasks", None)
+        if startup_tasks is not None:
+            startup_tasks.poll()
+            if not startup_tasks.version_ready:
+                return True
+            latest = startup_tasks.latest_version
+        else:
+            latest = self._check_latest_version()
         if latest is None or latest == skipped:
             return True
         selected = 0

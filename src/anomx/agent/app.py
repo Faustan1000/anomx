@@ -12,8 +12,8 @@ import re
 import shlex
 import threading
 import time
-from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -22,8 +22,9 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from anomx.agent.base.agents import AgentKind, BaseAgent
+from anomx.agent.file_reference_search import FileReferenceSearchClient
 from anomx.agent.helpers.anomx_api import call_anomx_api, connection_from_home
-from anomx.agent.helpers.mode import AgentMode
+from anomx.agent.helpers.mode import AgentMode, next_agent_mode
 from anomx.agent.helpers.state import (
     latest_plan_steps,
     running_process_snapshots,
@@ -35,7 +36,7 @@ from anomx.agent.helpers.tool_manager import (
     command_allowance_display,
     discover_workspace_root,
 )
-from anomx.agent.helpers.utils import agent_spec, next_main_agent_kind, parse_agent_kind
+from anomx.agent.helpers.utils import agent_spec
 from anomx.agent.memories import MemoryKind, create_memory_record, write_memory
 from anomx.agent.model_catalog import discover_provider_models, merge_provider_models
 from anomx.agent.runtime import (
@@ -44,17 +45,19 @@ from anomx.agent.runtime import (
     QuestionResponse,
     RuntimeCallbacks,
     StatusCallback,
+    UsageSnapshot,
     backend_supports_image_input,
     image_mime_type,
 )
+from anomx.agent.runtime_process import RuntimeProcessClient
 from anomx.agent.skills import (
-    STARTER_SKILL_COMMANDS,
     Skill,
     load_builtin_skills,
     load_user_skills,
     skill_invocation_prompt,
     sync_builtin_skills,
 )
+from anomx.agent.startup import CliStartupProcess
 from anomx.agent.store import (
     AnomxHome,
     ProjectRecord,
@@ -69,6 +72,7 @@ from anomx.agent.ui.components.popup import PopupComponentMixin
 from anomx.agent.ui.components.prompt_bar import PromptBarComponentMixin
 from anomx.agent.ui.constants import (
     ABORT_AGENT_CONFIRM_NOTICE,
+    ACTIVITY_FRAME_SECONDS,
     COMMANDS,
     EXIT_ANOMX_CONFIRM_NOTICE,
     FILE_REFERENCE_CACHE_SECONDS,
@@ -80,6 +84,7 @@ from anomx.agent.ui.constants import (
     MANUAL_INTERRUPT_MESSAGE,
     PLAN_STEP_REVEAL_SECONDS,
     PROJECT_COMMANDS,
+    PROMPT_PASTE_COLLAPSE_THRESHOLD,
     PROMPT_PLACEHOLDERS,
     RAW_MOUSE_RE,
     RAW_MOUSE_SUFFIX_RE,
@@ -141,13 +146,16 @@ class AnomxCliApp(
         startup_provider: str | None = None,
         startup_model: str | None = None,
         use_color: bool = True,
+        isolate_runtime: bool = False,
     ) -> None:
         self.home = AnomxHome() if home is None else home
         self.home.ensure()
-        sync_builtin_skills(
-            self.home.skills_dir,
-            include_system=self.home.has_platform_connection(),
-        )
+        self.isolate_runtime = isolate_runtime
+        if not isolate_runtime:
+            sync_builtin_skills(
+                self.home.skills_dir,
+                include_system=True,
+            )
         self.cwd = (Path.cwd() if cwd is None else cwd).expanduser().resolve()
         self.project_path = self.cwd
         self.workspace_root = discover_workspace_root(self.cwd)
@@ -158,23 +166,28 @@ class AnomxCliApp(
         self.session_rejected_commands: set[str] = set()
         self._load_global_allowances()
         config = self.home.load_config()
-        self.active_agent = agent_spec(config.get("agent_kind"))
-        self.agent_mode = self.active_agent.approval_mode
-        if config.get("sandbox_enabled"):
-            self.agent_mode = AgentMode.SANDBOX
-        self.runtime = AgentRuntime(
-            self.home,
-            self.cwd,
-            self.session_allowed_commands,
-            self.session_rejected_commands,
-            self.agent_mode,
-            role=self.active_agent.kind.value,
-            workspace_root=self.workspace_root,
+        self.work_visualization = str(config["work_visualization"])
+        self.active_agent = agent_spec(AgentKind.MAIN)
+        configured_mode = AgentMode.parse(config.get("agent_mode"))
+        self.agent_mode = (
+            AgentMode.STANDARD
+            if configured_mode == AgentMode.BACKGROUND
+            else configured_mode
         )
+        self.runtime = self._create_runtime(self.agent_mode)
+        self._runtime_processes: list[RuntimeProcessClient] = []
+        if isinstance(self.runtime, RuntimeProcessClient):
+            self._runtime_processes.append(self.runtime)
         self.state = AgentState.ONBOARDING
         self._colors: dict[str, int] = {}
+        self._activity_wave_palettes: dict[bool, tuple[int, ...]] = {}
         self._accent_attr_name = "accent"
         self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
+        self._modal_prompt_text = ""
+        self._modal_prompt_cursor = 0
+        self._modal_prompt_pasted_spans: tuple[PromptPasteSpan, ...] = ()
+        self._modal_prompt_file_references: dict[str, str] = {}
+        self._modal_prompt_image_attachments: dict[str, dict[str, str]] = {}
         self._expanded_work_turns: set[str] = set()
         self._expanded_work_lines: set[str] = set()
         self._expanded_pinned_users: set[str] = set()
@@ -200,7 +213,8 @@ class AnomxCliApp(
                 list[MessageLine],
             ],
         ] = {}
-        self._context_status_cache: dict[Path, tuple[int, int, str, str]] = {}
+        self._context_status_cache: dict[Path, tuple[int, int, str, str, int]] = {}
+        self._session_usage_snapshots: dict[Path, UsageSnapshot] = {}
         self._config_cache: tuple[int, int, dict[str, Any]] | None = None
         self._start_hint_reveal_started_at: float | None = None
         self._click_targets: dict[int, list[SessionMouseAction]] = {}
@@ -217,10 +231,27 @@ class AnomxCliApp(
         self._file_reference_index_loaded = False
         self._file_reference_index_thread: threading.Thread | None = None
         self._file_reference_index_started_at = 0.0
+        self._file_reference_search = FileReferenceSearchClient(
+            self.workspace_root,
+            self._file_reference_index_path(),
+        )
         self._prepare_startup_during_loading = False
         self._startup_preparation: StartupPreparation | None = None
         self._active_session_turns: dict[Path, ActiveSessionTurn] = {}
         self._discovered_provider_models: dict[str, tuple[str, ...]] = {}
+        self._startup_tasks: CliStartupProcess | None = None
+
+    def prepare_background_startup(self, *, wait_for_runtime: bool = False) -> None:
+        """Warm external startup work without blocking terminal rendering."""
+
+        if self._startup_tasks is None:
+            self._startup_tasks = CliStartupProcess(self.home.root)
+            self._startup_tasks.start()
+        self._file_reference_search.start()
+        if isinstance(self.runtime, RuntimeProcessClient):
+            self.runtime.start()
+            if wait_for_runtime:
+                self.runtime.wait_until_ready()
 
     def prepare_startup_config(self) -> None:
         """Apply command-line startup provider/model overrides."""
@@ -272,23 +303,20 @@ class AnomxCliApp(
         """Run the full-screen terminal UI."""
 
         self.prepare_startup_config()
+        self.prepare_background_startup()
         try:
             return int(curses.wrapper(self._run))
         finally:
             self._disable_bracketed_paste()
+            if self._startup_tasks is not None:
+                self._startup_tasks.close()
+            self._file_reference_search.close()
+            if isinstance(self.runtime, RuntimeProcessClient):
+                self.runtime.close()
 
     def _run(self, stdscr: CursesWindow) -> int:
         self._configure_terminal(stdscr)
-        self._prepare_startup_during_loading = True
-        try:
-            self._run_startup_loading(stdscr)
-        finally:
-            self._prepare_startup_during_loading = False
-
-        if os.environ.pop("ANOMX_JUST_UPDATED", None):
-            pass
-        elif not self._run_version_check(stdscr):
-            return 1
+        self._poll_startup_tasks()
 
         while True:
             config = self.home.load_config()
@@ -313,7 +341,12 @@ class AnomxCliApp(
                 self._shutdown_sandbox_containers()
                 self.runtime.shutdown()
 
+    def _poll_startup_tasks(self) -> None:
+        if self._startup_tasks is not None:
+            self._startup_tasks.poll()
+
     def _configure_terminal(self, stdscr: CursesWindow) -> None:
+        self._activity_wave_palettes.clear()
         stdscr.keypad(True)
         curses.noecho()
         with suppress(curses.error):
@@ -387,6 +420,7 @@ class AnomxCliApp(
                 "matrix_brand": curses.color_pair(1) | curses.A_BOLD,
                 "brand_dot": curses.color_pair(brand_dot_pair) | curses.A_BOLD,
             }
+            self._configure_activity_wave_colors(default_fg, default_bg)
         else:
             self._colors = {
                 "accent": curses.A_BOLD,
@@ -467,6 +501,8 @@ class AnomxCliApp(
         return self._ensure_project_with_loading(stdscr)
 
     def _ensure_project_with_loading(self, stdscr: CursesWindow) -> ProjectRecord:
+        if self.isolate_runtime:
+            return self._ensure_project()
         result: queue.SimpleQueue[ProjectRecord] = queue.SimpleQueue()
 
         def run_project_setup() -> None:
@@ -503,6 +539,11 @@ class AnomxCliApp(
         stored_project = self.home.project_for_path(self.project_path)
         if stored_project is not None:
             return stored_project
+        if self.isolate_runtime:
+            return self.home.save_project(
+                self.project_path,
+                self._fallback_project_name(),
+            )
         name = ""
         outline = self._project_directory_outline(self.project_path)
         with suppress(Exception):
@@ -571,8 +612,11 @@ class AnomxCliApp(
             selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
             if delete_pending_index is not None and delete_pending_index >= len(sessions):
                 delete_pending_index = None
+            command_token = self._active_command_token(input_text, cursor)
             command_suggestions = (
-                self._filtered_project_commands(input_text) if input_text.startswith("/") else []
+                self._filtered_project_commands(command_token[2])
+                if command_token is not None
+                else []
             )
             if command_suggestions:
                 command_selected = min(command_selected, len(command_suggestions) - 1)
@@ -580,11 +624,15 @@ class AnomxCliApp(
                 command_selected = 0
             file_reference_token = self._active_file_reference_token(input_text, cursor)
             file_suggestions = (
-                self._filtered_file_references(file_reference_token[2])
+                self._background_file_reference_suggestions(file_reference_token[2])
                 if file_reference_token is not None
                 else []
             )
             file_selected = min(file_selected, len(file_suggestions) - 1) if file_suggestions else 0
+            file_search_active = (
+                file_reference_token is not None
+                and self._file_reference_search.is_searching(file_reference_token[2])
+            )
             scroll = self._draw_project(
                 stdscr,
                 project,
@@ -603,10 +651,8 @@ class AnomxCliApp(
                 file_selected=file_selected,
                 file_references=file_references,
                 file_reference_active=file_reference_token is not None,
+                file_reference_searching=file_search_active,
                 pasted_spans=pasted_spans,
-            )
-            file_search_active = (
-                file_reference_token is not None and self._file_reference_index_running()
             )
             animated = self._project_animation_active(sessions) or file_search_active
             if animated:
@@ -754,29 +800,62 @@ class AnomxCliApp(
                         )
                         file_selected = 0
                 elif action.kind == "command":
-                    command = command_suggestions[action.value].command
-                    result = self._handle_project_command(
-                        stdscr,
-                        command,
-                        command,
-                        project,
-                        sessions,
-                        selected,
-                        scroll,
-                    )
-                    if result == "exit":
-                        return 0
-                    if isinstance(result, SessionRecord):
-                        opened = self._open_project_session(stdscr, result)
-                        if isinstance(opened, int):
-                            return opened
-                    sessions = self._project_sessions(project.path)
-                    selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
-                    delete_pending_index = None
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
+                    suggestion = command_suggestions[action.value]
+                    if command_token is not None and self._command_token_is_inline(
+                        input_text,
+                        command_token,
+                    ):
+                        input_text, cursor = self._remove_command_token(
+                            input_text,
+                            command_token,
+                            pasted_spans,
+                        )
+                        result = self._handle_project_command_with_prompt(
+                            stdscr,
+                            suggestion.command,
+                            suggestion.command,
+                            project,
+                            sessions,
+                            selected,
+                            scroll,
+                            input_text,
+                            cursor,
+                            pasted_spans,
+                            file_references,
+                        )
+                        if result == "exit":
+                            return 0
+                        if isinstance(result, SessionRecord):
+                            opened = self._open_project_session(stdscr, result)
+                            if isinstance(opened, int):
+                                return opened
+                        sessions = self._project_sessions(project.path)
+                        selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
+                        command_selected = 0
+                    else:
+                        command = suggestion.command
+                        result = self._handle_project_command(
+                            stdscr,
+                            command,
+                            command,
+                            project,
+                            sessions,
+                            selected,
+                            scroll,
+                        )
+                        if result == "exit":
+                            return 0
+                        if isinstance(result, SessionRecord):
+                            opened = self._open_project_session(stdscr, result)
+                            if isinstance(opened, int):
+                                return opened
+                        sessions = self._project_sessions(project.path)
+                        selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
+                        delete_pending_index = None
+                        input_text = ""
+                        cursor = 0
+                        pasted_spans = []
+                        command_selected = 0
                 continue
             if self._is_raw_mouse_fragment_key(key):
                 continue
@@ -823,6 +902,40 @@ class AnomxCliApp(
                         pasted_spans,
                     )
                     file_selected = 0
+                    continue
+                if (
+                    command_token is not None
+                    and command_suggestions
+                    and self._command_token_is_inline(input_text, command_token)
+                ):
+                    suggestion = command_suggestions[command_selected]
+                    input_text, cursor = self._remove_command_token(
+                        input_text,
+                        command_token,
+                        pasted_spans,
+                    )
+                    result = self._handle_project_command_with_prompt(
+                        stdscr,
+                        suggestion.command,
+                        suggestion.command,
+                        project,
+                        sessions,
+                        selected,
+                        scroll,
+                        input_text,
+                        cursor,
+                        pasted_spans,
+                        file_references,
+                    )
+                    if result == "exit":
+                        return 0
+                    if isinstance(result, SessionRecord):
+                        opened = self._open_project_session(stdscr, result)
+                        if isinstance(opened, int):
+                            return opened
+                    sessions = self._project_sessions(project.path)
+                    selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
+                    command_selected = 0
                     continue
                 submitted = input_text.strip()
                 if submitted:
@@ -899,12 +1012,11 @@ class AnomxCliApp(
                 continue
             if self._is_backspace(key):
                 if cursor > 0:
-                    input_text, cursor = self._replace_prompt_range(
+                    input_text, cursor = self._delete_prompt_backward(
                         input_text,
-                        cursor - 1,
                         cursor,
-                        "",
                         pasted_spans,
+                        file_references,
                     )
                     command_selected = 0
                     file_selected = 0
@@ -1002,8 +1114,7 @@ class AnomxCliApp(
             return None
         if command == "/feedback":
             current_session = (
-                self._project_command_session(sessions, selected)
-                or self._ephemeral_session()
+                self._project_command_session(sessions, selected) or self._ephemeral_session()
             )
             self._send_cli_feedback(stdscr, current_session, submitted)
             return None
@@ -1016,6 +1127,36 @@ class AnomxCliApp(
         elif current_session is None:
             current_session = self._create_session()
         return self._handle_command(stdscr, command, current_session, submitted)
+
+    def _handle_project_command_with_prompt(
+        self,
+        stdscr: CursesWindow,
+        command: str,
+        submitted: str,
+        project: ProjectRecord,
+        sessions: Sequence[SessionRecord],
+        selected: int,
+        scroll: int,
+        input_text: str,
+        cursor: int,
+        pasted_spans: Sequence[PromptPasteSpan],
+        file_references: Mapping[str, str],
+    ) -> str | SessionRecord | None:
+        with self._preserve_modal_prompt(
+            input_text,
+            cursor,
+            pasted_spans,
+            file_references,
+        ):
+            return self._handle_project_command(
+                stdscr,
+                command,
+                submitted,
+                project,
+                sessions,
+                selected,
+                scroll,
+            )
 
     def _project_command_allowed(self, command: str) -> bool:
         return command in {spec.command for spec in self._project_command_specs()}
@@ -1058,6 +1199,17 @@ class AnomxCliApp(
         return sessions
 
     def _cleanup_stale_project_sessions(self, project: ProjectRecord) -> None:
+        if self.isolate_runtime:
+            threading.Thread(
+                target=self._cleanup_stale_project_sessions_in_runtime,
+                args=(project,),
+                name="anomx-runtime-cleanup",
+                daemon=True,
+            ).start()
+            return
+        self._cleanup_stale_project_sessions_in_runtime(project)
+
+    def _cleanup_stale_project_sessions_in_runtime(self, project: ProjectRecord) -> None:
         for session in self._project_sessions(project.path):
             if self._active_turn_for_session(session) is None:
                 self.runtime.cleanup_session_runtime_state(session.path)
@@ -1095,7 +1247,15 @@ class AnomxCliApp(
             self.home.set_session_unread(session.path, False)
             session = replace(session, unread=False)
         if self._active_turn_for_session(session) is None:
-            self.runtime.cleanup_session_runtime_state(session.path)
+            if self.isolate_runtime:
+                threading.Thread(
+                    target=self.runtime.cleanup_session_runtime_state,
+                    args=(session.path,),
+                    name="anomx-runtime-session-cleanup",
+                    daemon=True,
+                ).start()
+            else:
+                self.runtime.cleanup_session_runtime_state(session.path)
         return session
 
     def _latest_continuable_session(self) -> SessionRecord | None:
@@ -1114,6 +1274,8 @@ class AnomxCliApp(
 
     def _continue_session_statement(self, session: SessionRecord) -> str:
         workspace_name = self.workspace_root.name or str(self.workspace_root)
+        if self.isolate_runtime:
+            return self._fallback_continue_session_statement(session)
         with suppress(Exception):
             return self.runtime.suggest_session_continuation(
                 session.path,
@@ -1257,18 +1419,19 @@ class AnomxCliApp(
                 running_abort_key = ""
                 running_abort_deadline = 0.0
             messages = self._read_message_lines(current_session.path)
+            command_token = self._active_command_token(input_text, cursor)
             command_suggestions = (
                 (
-                    self._filtered_running_commands(input_text)
+                    self._filtered_running_commands(command_token[2])
                     if active_turn_running
-                    else self._filtered_commands(input_text)
+                    else self._filtered_commands(command_token[2])
                 )
-                if input_text.startswith("/")
+                if command_token is not None
                 else []
             )
             file_reference_token = self._active_file_reference_token(input_text, cursor)
             file_suggestions = (
-                self._filtered_file_references(file_reference_token[2])
+                self._background_file_reference_suggestions(file_reference_token[2])
                 if file_reference_token is not None and not active_turn_running
                 else []
             )
@@ -1277,6 +1440,11 @@ class AnomxCliApp(
             else:
                 command_selected = 0
             file_selected = min(file_selected, len(file_suggestions) - 1) if file_suggestions else 0
+            file_search_active = (
+                file_reference_token is not None
+                and not active_turn_running
+                and self._file_reference_search.is_searching(file_reference_token[2])
+            )
             viewport = self._draw_session(
                 stdscr,
                 current_session,
@@ -1288,6 +1456,7 @@ class AnomxCliApp(
                 command_selected,
                 file_suggestions=file_suggestions,
                 file_selected=file_selected,
+                file_reference_searching=file_search_active,
                 file_references=file_references,
                 image_attachments=image_attachments,
                 anchor_line=pinned_anchor,
@@ -1310,11 +1479,6 @@ class AnomxCliApp(
             )
             if viewport is not None:
                 scroll = viewport.scroll
-            file_search_active = (
-                file_reference_token is not None
-                and not active_turn_running
-                and self._file_reference_index_running()
-            )
             if (
                 active_turn_running
                 or self._session_animation_active(current_session.path)
@@ -1324,7 +1488,7 @@ class AnomxCliApp(
                     stdscr.nodelay(True)
                 key = self._read_nonblocking_key(stdscr)
                 if key is None:
-                    time.sleep(0.08)
+                    time.sleep(ACTIVITY_FRAME_SECONDS if active_turn_running else 0.08)
                     frame += 1
                     continue
                 with suppress(curses.error, AttributeError):
@@ -1363,11 +1527,16 @@ class AnomxCliApp(
                     with suppress(curses.error):
                         stdscr.nodelay(False)
                     try:
-                        command_result = self._handle_command(
+                        command_result = self._handle_command_with_prompt(
                             stdscr,
                             key_result.command,
                             current_session,
                             key_result.submitted,
+                            input_text,
+                            cursor,
+                            pasted_spans,
+                            file_references,
+                            image_attachments,
                         )
                     finally:
                         with suppress(curses.error):
@@ -1584,23 +1753,54 @@ class AnomxCliApp(
                         current_session.path,
                     )
                 elif mouse_action.kind == "command":
-                    command = command_suggestions[mouse_action.value].command
-                    command_result = self._handle_command(stdscr, command, current_session)
-                    if command_result == "exit":
-                        return 0
-                    if isinstance(command_result, SessionRecord):
-                        current_session = command_result
-                        self._activate_agent(current_session.agent_kind)
-                        self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                        scroll = 0
-                        pinned_anchor = None
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_selected = 0
-                    file_references = {}
-                    image_attachments = {}
+                    suggestion = command_suggestions[mouse_action.value]
+                    if command_token is not None and self._command_token_is_inline(
+                        input_text,
+                        command_token,
+                    ):
+                        input_text, cursor = self._remove_command_token(
+                            input_text,
+                            command_token,
+                            pasted_spans,
+                        )
+                        command_result = self._handle_command_with_prompt(
+                            stdscr,
+                            suggestion.command,
+                            current_session,
+                            suggestion.command,
+                            input_text,
+                            cursor,
+                            pasted_spans,
+                            file_references,
+                            image_attachments,
+                        )
+                        if command_result == "exit":
+                            return 0
+                        if isinstance(command_result, SessionRecord):
+                            current_session = command_result
+                            self._activate_agent(current_session.agent_kind)
+                            self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
+                            scroll = 0
+                            pinned_anchor = None
+                        command_selected = 0
+                    else:
+                        command = suggestion.command
+                        command_result = self._handle_command(stdscr, command, current_session)
+                        if command_result == "exit":
+                            return 0
+                        if isinstance(command_result, SessionRecord):
+                            current_session = command_result
+                            self._activate_agent(current_session.agent_kind)
+                            self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
+                            scroll = 0
+                            pinned_anchor = None
+                        input_text = ""
+                        cursor = 0
+                        pasted_spans = []
+                        command_selected = 0
+                        file_selected = 0
+                        file_references = {}
+                        image_attachments = {}
                 elif mouse_action.kind == "file_reference":
                     if file_reference_token is None:
                         continue
@@ -1673,23 +1873,54 @@ class AnomxCliApp(
                         current_session.path,
                     )
                 elif raw_mouse_action.kind == "command":
-                    command = command_suggestions[raw_mouse_action.value].command
-                    command_result = self._handle_command(stdscr, command, current_session)
-                    if command_result == "exit":
-                        return 0
-                    if isinstance(command_result, SessionRecord):
-                        current_session = command_result
-                        self._activate_agent(current_session.agent_kind)
-                        self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                        scroll = 0
-                        pinned_anchor = None
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_selected = 0
-                    file_references = {}
-                    image_attachments = {}
+                    suggestion = command_suggestions[raw_mouse_action.value]
+                    if command_token is not None and self._command_token_is_inline(
+                        input_text,
+                        command_token,
+                    ):
+                        input_text, cursor = self._remove_command_token(
+                            input_text,
+                            command_token,
+                            pasted_spans,
+                        )
+                        command_result = self._handle_command_with_prompt(
+                            stdscr,
+                            suggestion.command,
+                            current_session,
+                            suggestion.command,
+                            input_text,
+                            cursor,
+                            pasted_spans,
+                            file_references,
+                            image_attachments,
+                        )
+                        if command_result == "exit":
+                            return 0
+                        if isinstance(command_result, SessionRecord):
+                            current_session = command_result
+                            self._activate_agent(current_session.agent_kind)
+                            self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
+                            scroll = 0
+                            pinned_anchor = None
+                        command_selected = 0
+                    else:
+                        command = suggestion.command
+                        command_result = self._handle_command(stdscr, command, current_session)
+                        if command_result == "exit":
+                            return 0
+                        if isinstance(command_result, SessionRecord):
+                            current_session = command_result
+                            self._activate_agent(current_session.agent_kind)
+                            self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
+                            scroll = 0
+                            pinned_anchor = None
+                        input_text = ""
+                        cursor = 0
+                        pasted_spans = []
+                        command_selected = 0
+                        file_selected = 0
+                        file_references = {}
+                        image_attachments = {}
                 elif raw_mouse_action.kind == "file_reference":
                     if file_reference_token is None:
                         continue
@@ -1758,6 +1989,38 @@ class AnomxCliApp(
                         pasted_spans,
                     )
                     file_selected = 0
+                    continue
+                if (
+                    command_token is not None
+                    and command_suggestions
+                    and self._command_token_is_inline(input_text, command_token)
+                ):
+                    suggestion = command_suggestions[command_selected]
+                    input_text, cursor = self._remove_command_token(
+                        input_text,
+                        command_token,
+                        pasted_spans,
+                    )
+                    command_result = self._handle_command_with_prompt(
+                        stdscr,
+                        suggestion.command,
+                        current_session,
+                        suggestion.command,
+                        input_text,
+                        cursor,
+                        pasted_spans,
+                        file_references,
+                        image_attachments,
+                    )
+                    if command_result == "exit":
+                        return 0
+                    if isinstance(command_result, SessionRecord):
+                        current_session = command_result
+                        self._activate_agent(current_session.agent_kind)
+                        self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
+                        scroll = 0
+                        pinned_anchor = None
+                    command_selected = 0
                     continue
                 submitted = input_text.strip()
                 submitted_image_attachments = self._active_image_attachments(
@@ -1866,12 +2129,12 @@ class AnomxCliApp(
                 continue
             if self._is_backspace(key):
                 if cursor > 0:
-                    input_text, cursor = self._replace_prompt_range(
+                    input_text, cursor = self._delete_prompt_backward(
                         input_text,
-                        cursor - 1,
                         cursor,
-                        "",
                         pasted_spans,
+                        file_references,
+                        image_attachments,
                     )
                     command_selected = 0
                     file_selected = 0
@@ -2087,6 +2350,32 @@ class AnomxCliApp(
 
         self._message(stdscr, "Unknown Command", command)
         return current_session
+
+    def _handle_command_with_prompt(
+        self,
+        stdscr: CursesWindow,
+        command: str,
+        current_session: SessionRecord,
+        submitted: str,
+        input_text: str,
+        cursor: int,
+        pasted_spans: Sequence[PromptPasteSpan],
+        file_references: Mapping[str, str] | None = None,
+        image_attachments: Mapping[str, dict[str, str]] | None = None,
+    ) -> str | SessionRecord | None:
+        with self._preserve_modal_prompt(
+            input_text,
+            cursor,
+            pasted_spans,
+            file_references,
+            image_attachments,
+        ):
+            return self._handle_command(
+                stdscr,
+                command,
+                current_session,
+                submitted,
+            )
 
     def _open_session_panel(
         self,
@@ -2308,7 +2597,7 @@ class AnomxCliApp(
     def _start_session_turn(
         self,
         session: SessionRecord,
-        runtime: AgentRuntime | None = None,
+        runtime: AgentRuntime | RuntimeProcessClient | None = None,
     ) -> ActiveSessionTurn:
         existing = self._active_turn_for_session(session)
         if existing is not None:
@@ -2318,9 +2607,11 @@ class AnomxCliApp(
         result: dict[str, str] = {}
         self._activate_agent(session.agent_kind)
         turn_mode = self.agent_mode
+        turn_agent_kind = self.active_agent.kind
         turn_runtime = runtime or self._new_session_runtime(turn_mode)
-        turn_runtime.set_agent(self.active_agent.kind)
-        turn_runtime.set_mode(turn_mode)
+        if not isinstance(turn_runtime, RuntimeProcessClient):
+            turn_runtime.set_agent(turn_agent_kind)
+            turn_runtime.set_mode(turn_mode)
         turn_id = uuid4().hex
         started_at = time.monotonic()
 
@@ -2351,9 +2642,8 @@ class AnomxCliApp(
             approval_request = (
                 replace(request, evaluation=evaluation) if evaluation is not None else request
             )
-            automatic_choice = turn_runtime.agent_spec.approval_choice_for_evaluation(evaluation)
-            if automatic_choice is not None:
-                return automatic_choice
+            if evaluation is not None and turn_mode.policy.auto_approves_risk(evaluation.risk):
+                return ApprovalChoice.ALLOW
             events.put(
                 RuntimeUiEvent(
                     "approval",
@@ -2387,8 +2677,13 @@ class AnomxCliApp(
         def finish_callback(final_text: str) -> None:
             events.put(RuntimeUiEvent("finish", final_text))
 
+        def usage_callback(snapshot: UsageSnapshot) -> None:
+            self._session_usage_snapshots[session.path] = snapshot
+
         def run_backend() -> None:
             try:
+                turn_runtime.set_agent(turn_agent_kind)
+                turn_runtime.set_mode(turn_mode)
                 turn_runtime.init_sandbox(status_callback=status_callback)
                 result["response"] = turn_runtime.backend_response(
                     session.path,
@@ -2403,6 +2698,7 @@ class AnomxCliApp(
                         system_message=system_message_callback,
                         question=question_callback,
                         finish=finish_callback,
+                        usage=usage_callback,
                     ),
                 )
             except Exception as error:  # pragma: no cover - defensive thread boundary
@@ -2437,22 +2733,48 @@ class AnomxCliApp(
         worker.start()
         return turn
 
-    def _new_session_runtime(self, mode: AgentMode | None = None) -> AgentRuntime:
+    def _create_runtime(
+        self,
+        mode: AgentMode | None = None,
+    ) -> AgentRuntime | RuntimeProcessClient:
+        runtime_mode = self.agent_mode if mode is None else mode
+        if self.isolate_runtime:
+            return RuntimeProcessClient(
+                self.home,
+                self.cwd,
+                self.session_allowed_commands,
+                self.session_rejected_commands,
+                runtime_mode,
+                agent_kind=self.active_agent.kind,
+                workspace_root=self.workspace_root,
+            )
         return AgentRuntime(
             self.home,
             self.cwd,
             self.session_allowed_commands,
             self.session_rejected_commands,
-            self.agent_mode if mode is None else mode,
-            role=self.active_agent.kind.value,
+            runtime_mode,
+            agent_kind=self.active_agent.kind,
             workspace_root=self.workspace_root,
         )
 
-    def _foreground_session_runtime(self, mode: AgentMode | None = None) -> AgentRuntime:
+    def _new_session_runtime(
+        self,
+        mode: AgentMode | None = None,
+    ) -> AgentRuntime | RuntimeProcessClient:
+        runtime = self._create_runtime(mode)
+        if isinstance(runtime, RuntimeProcessClient):
+            self._runtime_processes.append(runtime)
+        return runtime
+
+    def _foreground_session_runtime(
+        self,
+        mode: AgentMode | None = None,
+    ) -> AgentRuntime | RuntimeProcessClient:
         for turn in self._active_session_turns.values():
             if turn.runtime is self.runtime and turn.worker is not None and turn.worker.is_alive():
                 return self._new_session_runtime(mode)
-        if mode is not None:
+        if mode is not None and not isinstance(self.runtime, RuntimeProcessClient):
             self.runtime.set_agent(self.active_agent.kind)
             self.runtime.set_mode(mode)
         return self.runtime
@@ -2463,7 +2785,10 @@ class AnomxCliApp(
             return None
         return turn
 
-    def _runtime_for_session(self, session: SessionRecord) -> AgentRuntime:
+    def _runtime_for_session(
+        self,
+        session: SessionRecord,
+    ) -> AgentRuntime | RuntimeProcessClient:
         turn = self._active_turn_for_session(session)
         return turn.runtime if turn is not None else self.runtime
 
@@ -2675,6 +3000,12 @@ class AnomxCliApp(
             turn.runtime.shutdown(turn.session.path)
             turn.completed = True
         self._active_session_turns.clear()
+        for runtime in self._runtime_processes:
+            if runtime is not self.runtime:
+                runtime.close()
+        self._runtime_processes = [
+            runtime for runtime in self._runtime_processes if runtime is self.runtime
+        ]
 
     def _shutdown_sandbox_containers(self) -> None:
         try:
@@ -2723,9 +3054,10 @@ class AnomxCliApp(
                     turn,
                     running_anchor,
                 )
+                command_token = self._active_command_token(input_text, cursor)
                 command_suggestions = (
-                    self._filtered_running_commands(input_text)
-                    if input_text.startswith("/")
+                    self._filtered_running_commands(command_token[2])
+                    if command_token is not None
                     else []
                 )
                 if command_suggestions:
@@ -2774,11 +3106,14 @@ class AnomxCliApp(
                         with suppress(curses.error):
                             stdscr.nodelay(False)
                         try:
-                            command_result = self._handle_command(
+                            command_result = self._handle_command_with_prompt(
                                 stdscr,
                                 key_result.command,
                                 session,
                                 key_result.submitted,
+                                input_text,
+                                cursor,
+                                pasted_spans,
                             )
                         finally:
                             with suppress(curses.error):
@@ -2909,7 +3244,7 @@ class AnomxCliApp(
                 )
                 if viewport is not None:
                     running_scroll = viewport.scroll
-                time.sleep(0.08)
+                time.sleep(ACTIVITY_FRAME_SECONDS)
                 frame += 1
         finally:
             with suppress(curses.error):
@@ -3032,15 +3367,16 @@ class AnomxCliApp(
         *,
         pasted: bool = False,
     ) -> tuple[str, int]:
-        replacement = f"\n\n{text}\n\n" if pasted else text
+        collapse_paste = pasted and len(text) > PROMPT_PASTE_COLLAPSE_THRESHOLD
+        replacement = f"\n\n{text}\n\n" if collapse_paste else text
         return self._replace_prompt_range(
             input_text,
             cursor,
             cursor,
             replacement,
             pasted_spans,
-            pasted=pasted,
-            pasted_character_count=len(text) if pasted else None,
+            pasted=collapse_paste,
+            pasted_character_count=len(text) if collapse_paste else None,
         )
 
     def _replace_prompt_range(
@@ -3066,6 +3402,61 @@ class AnomxCliApp(
             pasted_character_count=pasted_character_count,
         )
         return updated, bounded_start + len(replacement)
+
+    def _delete_prompt_backward(
+        self,
+        input_text: str,
+        cursor: int,
+        pasted_spans: list[PromptPasteSpan],
+        file_references: dict[str, str] | None = None,
+        image_attachments: dict[str, dict[str, str]] | None = None,
+    ) -> tuple[str, int]:
+        """Delete one character, or one complete highlighted prompt token."""
+
+        if cursor <= 0:
+            return input_text, cursor
+        labels = self._prompt_reference_labels(file_references, image_attachments)
+        start, end = self._prompt_atomic_backspace_range(
+            input_text,
+            cursor,
+            pasted_spans,
+            labels,
+        )
+        updated, updated_cursor = self._replace_prompt_range(
+            input_text,
+            start,
+            end,
+            "",
+            pasted_spans,
+        )
+        for references in (file_references, image_attachments):
+            if references is None:
+                continue
+            for label in tuple(references):
+                if not self._file_reference_label_pattern(label).search(updated):
+                    references.pop(label, None)
+        return updated, updated_cursor
+
+    def _prompt_atomic_backspace_range(
+        self,
+        input_text: str,
+        cursor: int,
+        pasted_spans: Sequence[PromptPasteSpan],
+        reference_labels: Mapping[str, str] | None = None,
+    ) -> tuple[int, int]:
+        bounded_cursor = max(0, min(cursor, len(input_text)))
+        for span in self._normalized_prompt_paste_spans(input_text, pasted_spans):
+            if span.end == bounded_cursor:
+                return span.start, span.end
+
+        for label in sorted(reference_labels or {}, key=len, reverse=True):
+            for match in self._file_reference_label_pattern(label).finditer(input_text):
+                if match.end() == bounded_cursor:
+                    end = match.end()
+                    if end < len(input_text) and input_text[end].isspace():
+                        end += 1
+                    return match.start(), end
+        return max(0, bounded_cursor - 1), bounded_cursor
 
     def _prompt_spans_after_replacement(
         self,
@@ -3290,6 +3681,29 @@ class AnomxCliApp(
             )
 
         if self._is_enter(key):
+            command_token = self._active_command_token(input_text, cursor)
+            if (
+                command_token is not None
+                and suggestions
+                and self._command_token_is_inline(input_text, command_token)
+            ):
+                suggestion = suggestions[command_selected]
+                updated_input, updated_cursor = self._remove_command_token(
+                    input_text,
+                    command_token,
+                    active_pasted_spans,
+                )
+                return RunningKeyResult(
+                    updated_input,
+                    updated_cursor,
+                    RUNNING_NOTICE,
+                    "light",
+                    abort_key,
+                    abort_deadline,
+                    0,
+                    suggestion.command,
+                    suggestion.command,
+                )
             submitted = input_text.strip()
             if not submitted:
                 return RunningKeyResult(
@@ -3623,7 +4037,29 @@ class AnomxCliApp(
                     command_selected,
                 )
             if action is not None and action.kind == "command":
-                command = suggestions[action.value].command
+                suggestion = suggestions[action.value]
+                command_token = self._active_command_token(input_text, cursor)
+                if command_token is not None and self._command_token_is_inline(
+                    input_text,
+                    command_token,
+                ):
+                    updated_input, updated_cursor = self._remove_command_token(
+                        input_text,
+                        command_token,
+                        active_pasted_spans,
+                    )
+                    return RunningKeyResult(
+                        updated_input,
+                        updated_cursor,
+                        RUNNING_NOTICE,
+                        "light",
+                        abort_key,
+                        abort_deadline,
+                        0,
+                        suggestion.command,
+                        suggestion.command,
+                    )
+                command = suggestion.command
                 active_pasted_spans.clear()
                 return RunningKeyResult(
                     "",
@@ -3718,7 +4154,29 @@ class AnomxCliApp(
                     command_selected,
                 )
             elif raw_mouse_action.kind == "command":
-                command = suggestions[raw_mouse_action.value].command
+                suggestion = suggestions[raw_mouse_action.value]
+                command_token = self._active_command_token(input_text, cursor)
+                if command_token is not None and self._command_token_is_inline(
+                    input_text,
+                    command_token,
+                ):
+                    updated_input, updated_cursor = self._remove_command_token(
+                        input_text,
+                        command_token,
+                        active_pasted_spans,
+                    )
+                    return RunningKeyResult(
+                        updated_input,
+                        updated_cursor,
+                        RUNNING_NOTICE,
+                        "light",
+                        abort_key,
+                        abort_deadline,
+                        0,
+                        suggestion.command,
+                        suggestion.command,
+                    )
+                command = suggestion.command
                 active_pasted_spans.clear()
                 return RunningKeyResult(
                     "",
@@ -3806,11 +4264,9 @@ class AnomxCliApp(
                     abort_deadline,
                     command_selected,
                 )
-            updated, updated_cursor = self._replace_prompt_range(
+            updated, updated_cursor = self._delete_prompt_backward(
                 input_text,
-                cursor - 1,
                 cursor,
-                "",
                 active_pasted_spans,
             )
             return RunningKeyResult(
@@ -3963,6 +4419,7 @@ class AnomxCliApp(
                         time.monotonic() + status_seconds if status_seconds is not None else None
                     )
                 elif status_text in {
+                    "Automatic Context Compression",
                     "Starting Sandbox",
                     "Pulling sandbox image",
                     "Starting sandbox container",
@@ -4015,7 +4472,7 @@ class AnomxCliApp(
                 if event.kind == "command":
                     role = "tool"
                 current_final = ""
-                if clean_text and render_events:
+                if clean_text and render_events and self.work_visualization == "extended":
                     self._fake_type_message(
                         stdscr,
                         session,
@@ -4156,7 +4613,7 @@ class AnomxCliApp(
 
     def _save_approval_memory(
         self,
-        runtime: AgentRuntime,
+        runtime: AgentRuntime | RuntimeProcessClient,
         request: CommandApprovalRequest,
         allowance_key: str,
         reason: str,
@@ -4209,6 +4666,8 @@ class AnomxCliApp(
         local_scroll = scroll
         local_anchor = anchor_line
         local_sticky_anchor = sticky_anchor
+        if self.isolate_runtime:
+            animate = False
         if not animate:
             self._draw_session(
                 stdscr,
@@ -4436,70 +4895,53 @@ class AnomxCliApp(
         }
 
     def _activate_agent(self, agent_kind: AgentKind | str) -> BaseAgent:
-        config = self.home.load_config()
-        sandbox_enabled = bool(config.get("sandbox_enabled"))
         active_agent = agent_spec(agent_kind)
-        agent_mode = active_agent.approval_mode
-        if agent_mode == AgentMode.SANDBOX:
-            if not sandbox_enabled:
-                agent_mode = AgentMode.CONFIRM
-        elif sandbox_enabled:
-            agent_mode = AgentMode.SANDBOX
         self.active_agent = active_agent
-        self.agent_mode = agent_mode
-        self.runtime.set_agent(active_agent.kind)
-        self.runtime.set_mode(agent_mode)
+        if not isinstance(self.runtime, RuntimeProcessClient):
+            self.runtime.set_agent(active_agent.kind)
+            self.runtime.set_mode(self.agent_mode)
         return active_agent
 
     def _activate_agent_mode(self, mode: AgentMode | str) -> AgentMode:
         """Compatibility hook for config flows that still update approval mode."""
 
-        config = self.home.load_config()
-        sandbox_enabled = bool(config.get("sandbox_enabled"))
-        agent_mode = AgentMode.parse(mode, self.active_agent.approval_mode)
-        if agent_mode == AgentMode.SANDBOX:
-            if not sandbox_enabled:
-                agent_mode = self.active_agent.approval_mode
-        elif sandbox_enabled:
-            agent_mode = AgentMode.SANDBOX
+        agent_mode = AgentMode.parse(mode, self.agent_mode)
+        if agent_mode == AgentMode.BACKGROUND:
+            agent_mode = AgentMode.STANDARD
         self.agent_mode = agent_mode
-        self.runtime.set_mode(agent_mode)
+        if not isinstance(self.runtime, RuntimeProcessClient):
+            self.runtime.set_mode(agent_mode)
         return agent_mode
 
     def _cycle_agent_mode(self, session: SessionRecord | None = None) -> AgentMode:
-        """Compatibility name: Shift+Tab now cycles main agents, not modes."""
+        """Cycle interactive execution modes."""
 
-        if self.agent_mode == AgentMode.SANDBOX:
-            return self.agent_mode
-        base_agent_kind = (
-            parse_agent_kind(session.agent_kind, self.active_agent.kind)
-            if session is not None
-            else self.active_agent.kind
+        next_mode = next_agent_mode(
+            self.agent_mode,
+            platform_connected=self.home.has_platform_connection(),
         )
-        next_kind = next_main_agent_kind(base_agent_kind)
-        active_agent = self._activate_agent(next_kind)
-        next_mode = self.agent_mode
+        self._activate_agent_mode(next_mode)
         if session is not None:
-            self.home.update_session_agent(session.path, active_agent.kind, next_mode)
+            self.home.update_session_agent(session.path, AgentKind.MAIN, next_mode)
         else:
             config = self.home.load_config()
-            config["agent_kind"] = active_agent.kind.value
+            config["agent_kind"] = AgentKind.MAIN.value
             config["agent_mode"] = next_mode.value
             self.home.save_config(config)
         return next_mode
 
     def _mode_hint_attr_name(self) -> str:
-        return self.active_agent.color
+        return self.agent_mode.policy.ui_attr
 
     def _sandbox_configured(self) -> bool:
-        return bool(self.home.load_config().get("sandbox_enabled"))
+        return bool(self._load_config_cached().get("sandbox_enabled"))
 
     def _sandbox_is_active(self) -> bool:
-        session = self.runtime.sandbox_session
-        if session is not None and session.is_running:
+        if isinstance(self.runtime, RuntimeProcessClient):
+            return self._sandbox_configured()
+        if self.runtime.is_sandbox_active():
             return True
-        config = self.home.load_config()
-        return bool(config.get("sandbox_enabled"))
+        return self._sandbox_configured()
 
     def _latest_user_anchor_line(self, stdscr: CursesWindow, session: SessionRecord) -> int | None:
         _, width = stdscr.getmaxyx()
@@ -4520,9 +4962,7 @@ class AnomxCliApp(
         turn: ActiveSessionTurn,
         fallback_anchor: int | None,
     ) -> int | None:
-        anchor_key = turn.anchor_expansion_key or self._latest_root_user_expansion_key(
-            session.path
-        )
+        anchor_key = turn.anchor_expansion_key or self._latest_root_user_expansion_key(session.path)
         if not anchor_key:
             return fallback_anchor
         turn.anchor_expansion_key = anchor_key
@@ -4659,12 +5099,7 @@ class AnomxCliApp(
         return load_user_skills(self.home.skills_dir)
 
     def _starter_skills(self) -> tuple[Skill, ...]:
-        skills_by_command = {skill.command: skill for skill in self._all_skills()}
-        return tuple(
-            skills_by_command[command]
-            for command in STARTER_SKILL_COMMANDS
-            if command in skills_by_command
-        )
+        return tuple(skill for skill in self._user_skills() if not skill.system)[:3]
 
     def _skill_for_command(self, command: str) -> Skill | None:
         command_name = command.removeprefix("/")
@@ -4761,6 +5196,90 @@ class AnomxCliApp(
     def _filtered_running_commands(self, input_text: str) -> list[CommandSpec]:
         return self._filtered_command_specs(input_text, self._running_command_specs())
 
+    def _active_command_token(
+        self,
+        input_text: str,
+        cursor: int,
+    ) -> tuple[int, int, str] | None:
+        """Return the slash-command token surrounding the cursor, anywhere in the prompt."""
+
+        bounded_cursor = max(0, min(cursor, len(input_text)))
+        token_start = input_text.rfind("/", 0, bounded_cursor)
+        if token_start < 0 or any(
+            character.isspace() for character in input_text[token_start:bounded_cursor]
+        ):
+            return None
+        fragment_start = token_start
+        while fragment_start > 0 and not input_text[fragment_start - 1].isspace():
+            fragment_start -= 1
+        if input_text[fragment_start:token_start].startswith("@"):
+            return None
+        token_end = bounded_cursor
+        while token_end < len(input_text) and not input_text[token_end].isspace():
+            token_end += 1
+        token = input_text[token_start:bounded_cursor]
+        return token_start, token_end, token
+
+    def _command_token_is_inline(
+        self,
+        input_text: str,
+        token: tuple[int, int, str],
+    ) -> bool:
+        return bool(input_text[: token[0]].strip())
+
+    def _remove_command_token(
+        self,
+        input_text: str,
+        token: tuple[int, int, str],
+        pasted_spans: list[PromptPasteSpan],
+    ) -> tuple[str, int]:
+        start, end, _query = token
+        if start > 0 and input_text[start - 1].isspace():
+            start -= 1
+        elif end < len(input_text) and input_text[end].isspace():
+            end += 1
+        return self._replace_prompt_range(
+            input_text,
+            start,
+            end,
+            "",
+            pasted_spans,
+        )
+
+    @contextmanager
+    def _preserve_modal_prompt(
+        self,
+        input_text: str,
+        cursor: int,
+        pasted_spans: Sequence[PromptPasteSpan],
+        file_references: Mapping[str, str] | None = None,
+        image_attachments: Mapping[str, dict[str, str]] | None = None,
+    ) -> Iterator[None]:
+        """Keep the current draft visible while a command popover is open."""
+
+        previous = (
+            self._modal_prompt_text,
+            self._modal_prompt_cursor,
+            self._modal_prompt_pasted_spans,
+            self._modal_prompt_file_references,
+            self._modal_prompt_image_attachments,
+        )
+        self._modal_prompt_text = input_text
+        self._modal_prompt_cursor = max(0, min(cursor, len(input_text)))
+        self._modal_prompt_pasted_spans = tuple(pasted_spans)
+        self._modal_prompt_file_references = dict(file_references or {})
+        self._modal_prompt_image_attachments = dict(image_attachments or {})
+        try:
+            yield
+        finally:
+            (
+                self._modal_prompt_text,
+                self._modal_prompt_cursor,
+                self._modal_prompt_pasted_spans,
+                self._modal_prompt_file_references,
+                self._modal_prompt_image_attachments,
+            ) = previous
+
     def _filtered_command_specs(
         self,
         input_text: str,
@@ -4799,6 +5318,18 @@ class AnomxCliApp(
         if not token.startswith("@"):
             return None
         return (token_start, token_end, token.removeprefix("@"))
+
+    def _background_file_reference_suggestions(self, query: str) -> list[MenuChoice]:
+        return [
+            MenuChoice(
+                result.label,
+                result.value,
+                "",
+                result.query,
+                result.highlight_spans,
+            )
+            for result in self._file_reference_search.suggestions(query)
+        ]
 
     def _filtered_file_references(self, query: str) -> list[MenuChoice]:
         normalized_query = query.strip()
@@ -5090,9 +5621,7 @@ class AnomxCliApp(
                 score += segment_score
                 spans.extend(self._offset_file_reference_spans(segment_spans, segment_start))
             else:
-                matches.append(
-                    (rank, score, start_index, self._merge_file_reference_spans(spans))
-                )
+                matches.append((rank, score, start_index, self._merge_file_reference_spans(spans)))
         if not matches:
             return None
         rank, score, _start_index, merged_spans = min(
@@ -5627,8 +6156,9 @@ class AnomxCliApp(
     ) -> tuple[str, int]:
         del cursor
         start, end, _query = token
+        display_label = self._file_reference_prompt_label(choice)
         suffix = "" if end < len(input_text) and input_text[end].isspace() else " "
-        replacement = f"{choice.label}{suffix}"
+        replacement = f"{display_label}{suffix}"
         if pasted_spans is None:
             updated = input_text[:start] + replacement + input_text[end:]
             cursor = start + len(replacement)
@@ -5640,8 +6170,13 @@ class AnomxCliApp(
                 replacement,
                 pasted_spans,
             )
-        file_references[choice.label] = choice.value
+        file_references[display_label] = choice.value
         return updated, cursor
+
+    def _file_reference_prompt_label(self, choice: MenuChoice) -> str:
+        value = choice.value.rstrip("/")
+        label = Path(value).name or Path(choice.label.rstrip("/")).name or choice.label
+        return f"{label}/" if choice.value.endswith("/") else label
 
     def _backend_message_for_prompt(
         self,

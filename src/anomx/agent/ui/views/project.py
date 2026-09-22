@@ -12,7 +12,6 @@ from anomx.agent.helpers.state import (
     running_process_snapshots,
     running_subagent_snapshots,
 )
-from anomx.agent.helpers.utils import agent_spec
 from anomx.agent.store import (
     ProjectRecord,
     SessionRecord,
@@ -49,6 +48,7 @@ class ProjectViewMixin:
         file_selected: int = 0,
         file_references: Mapping[str, str] | None = None,
         file_reference_active: bool = False,
+        file_reference_searching: bool = False,
         bottom_panel: BottomPanel | None = None,
         prompt_hint_suffix: str = "",
         pasted_spans: Sequence[PromptPasteSpan] | None = None,
@@ -108,6 +108,7 @@ class ProjectViewMixin:
             file_suggestions or [],
             file_selected,
             active=file_reference_active,
+            searching=file_reference_searching,
         )
         active_panel = bottom_panel or file_panel or command_panel
         if active_panel is not None:
@@ -368,7 +369,7 @@ class ProjectViewMixin:
         turn = self._active_turn_for_session(session)
         if turn is not None:
             return turn.agent_symbol or turn.mode.symbol
-        return agent_spec(session.agent_kind).symbol
+        return session.mode.symbol
 
     def _project_mouse_action(
         self,

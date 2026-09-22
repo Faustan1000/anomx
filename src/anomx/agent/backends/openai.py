@@ -18,7 +18,15 @@ from anomx.agent.base.backends import (
     OpenAIStreamResponse,
     OpenAIToolCall,
     ThinkingTagStreamFilter,
+    openai_token_usage,
 )
+from anomx.agent.context_management import (
+    CONTINUE_AFTER_COMPRESSION_PROMPT,
+    ContextMessage,
+    projected_context_tokens,
+    transient_context_message,
+)
+from anomx.agent.exceptions import BackendFailure
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata
 
@@ -46,12 +54,12 @@ class OpenAIBackend(BaseBackend):
 
         self.runtime._status(callbacks.status)
         reasoning = self._openai_reasoning_config(model, thinking_intensity)
+        context_entries = self.runtime.backend_conversation_entries(session_path)
         payload: dict[str, Any] = {
             "model": model,
             "instructions": self.runtime._instructions(session_path),
             "input": self._openai_messages(
-                self.runtime.conversation_messages(session_path),
-                model,
+                [entry.payload for entry in context_entries], model
             ),
             "reasoning": reasoning,
             "tools": self._openai_tools(),
@@ -72,9 +80,24 @@ class OpenAIBackend(BaseBackend):
                 callbacks.status,
             )
             if isinstance(response, str):
-                return response
+                recovered_entries = self._recover_context_window(
+                    response, session_path, context_entries, callbacks,
+                )
+                if recovered_entries is None:
+                    return response
+                context_entries = recovered_entries
+                payload = {
+                    **payload,
+                    "instructions": self.runtime._instructions(session_path),
+                    "input": self._openai_messages(
+                        [entry.payload for entry in context_entries], model,
+                    ),
+                }
+                payload.pop("previous_response_id", None)
+                continue
             if self.runtime._turn_aborted():
                 return ""
+            self._track_usage(response.usage, callbacks)
 
             tool_outputs = self._execute_requested_tools(
                 response,
@@ -94,23 +117,49 @@ class OpenAIBackend(BaseBackend):
                     if used_plan_guard:
                         plan_finish_attempts += 1
                     if response.response_id is None:
-                        return "OpenAI returned a continuation update without a response id."
+                        return BackendFailure(
+                            "OpenAI returned a continuation update without a response id."
+                        )
+                    pending_entries = self._openai_context_entries(response, ())
+                    pending_entries.append(
+                        transient_context_message("user", continuation_prompt)
+                    )
+                    context_entries.extend(pending_entries)
+                    context_entries, compressed = self.runtime.compress_in_turn_context(
+                        session_path,
+                        context_entries,
+                        current_context_tokens=projected_context_tokens(
+                            response.usage.input_tokens if response.usage else 0,
+                            response.usage.output_tokens if response.usage else 0,
+                            pending_entries[1:],
+                        ),
+                        status_callback=callbacks.status,
+                    )
+                    if compressed:
+                        context_entries.append(
+                            transient_context_message(
+                                "user",
+                                CONTINUE_AFTER_COMPRESSION_PROMPT,
+                            )
+                        )
                     payload = {
                         "model": model,
                         "instructions": self.runtime._instructions(session_path),
-                        "previous_response_id": response.response_id,
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": continuation_prompt,
-                            }
-                        ],
+                        "input": (
+                            self._openai_messages(
+                                [entry.payload for entry in context_entries], model
+                            )
+                            if compressed
+                            else [{"role": "user", "content": continuation_prompt}]
+                        ),
                         "reasoning": reasoning,
                         "tools": self._openai_tools(),
                         "tool_choice": "auto",
                         "max_tool_calls": OPENAI_MAX_TOOL_CALLS,
                         "stream": True,
                     }
+                    if not compressed:
+                        payload["previous_response_id"] = response.response_id
                     continue
                 final_text = response.text
                 if callbacks.finish is not None:
@@ -118,21 +167,72 @@ class OpenAIBackend(BaseBackend):
                 return final_text
 
             if response.response_id is None:
-                return "OpenAI requested tools but did not return a response id."
+                return BackendFailure("OpenAI requested tools but did not return a response id.")
+
+            pending_entries = self._openai_context_entries(response, tool_outputs)
+            context_entries.extend(pending_entries)
+            context_entries, compressed = self.runtime.compress_in_turn_context(
+                session_path,
+                context_entries,
+                current_context_tokens=projected_context_tokens(
+                    response.usage.input_tokens if response.usage else 0,
+                    response.usage.output_tokens if response.usage else 0,
+                    pending_entries[1:],
+                ),
+                status_callback=callbacks.status,
+            )
+            if compressed:
+                context_entries.append(
+                    transient_context_message(
+                        "user",
+                        CONTINUE_AFTER_COMPRESSION_PROMPT,
+                    )
+                )
 
             payload = {
                 "model": model,
                 "instructions": self.runtime._instructions(session_path),
-                "previous_response_id": response.response_id,
-                "input": tool_outputs,
+                "input": (
+                    self._openai_messages(
+                        [entry.payload for entry in context_entries], model
+                    )
+                    if compressed
+                    else tool_outputs
+                ),
                 "reasoning": reasoning,
                 "tools": self._openai_tools(),
                 "tool_choice": "auto",
                 "max_tool_calls": OPENAI_MAX_TOOL_CALLS,
                 "stream": True,
             }
+            if not compressed:
+                payload["previous_response_id"] = response.response_id
 
-        return f"OpenAI tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches."
+        return BackendFailure(
+            f"OpenAI tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches.",
+            code="tool_limit_exceeded",
+        )
+
+    def _openai_context_entries(
+        self,
+        response: OpenAIStreamResponse,
+        tool_outputs: tuple[dict[str, str], ...] | list[dict[str, str]],
+    ) -> list[ContextMessage]:
+        assistant_parts = [response.text.strip()] if response.text.strip() else []
+        assistant_parts.extend(
+            f"[Tool call: {tool_call.name}]\n{tool_call.arguments}"
+            for tool_call in response.tool_calls
+        )
+        entries = [
+            transient_context_message("assistant", "\n\n".join(assistant_parts))
+        ]
+        if tool_outputs:
+            results = "\n\n".join(
+                f"[Tool result: {output.get('call_id', '')}]\n{output.get('output', '')}"
+                for output in tool_outputs
+            )
+            entries.append(transient_context_message("user", results))
+        return entries
 
     def _stream_openai_response(
         self,
@@ -141,7 +241,7 @@ class OpenAIBackend(BaseBackend):
         delta_callback: BackendTextCallback | None,
         status_callback: BackendTextCallback | None,
     ) -> OpenAIStreamResponse | str:
-        def stream_once() -> OpenAIStreamResponse:
+        def stream_once() -> OpenAIStreamResponse | str:
             self.runtime._debug_log_step(self.provider_key, payload)
             request = urllib.request.Request(
                 "https://api.openai.com/v1/responses",
@@ -157,6 +257,7 @@ class OpenAIBackend(BaseBackend):
             text_filter = ThinkingTagStreamFilter()
             reasoning_parts: list[str] = []
             tool_calls: list[OpenAIToolCall] = []
+            usage_payload: dict[str, Any] | None = None
             with urllib.request.urlopen(request, timeout=120) as response:
                 for raw_line in response:
                     if self.runtime._turn_aborted():
@@ -169,6 +270,12 @@ class OpenAIBackend(BaseBackend):
                         break
                     event = cast(dict[str, Any], json.loads(event_data))
                     event_type = str(event.get("type", ""))
+                    if event_type in {"error", "response.failed", "response.incomplete"}:
+                        failure = event.get("response") or event
+                        return self._api_error(
+                            self.provider_key, self.provider_label, self.env_var,
+                            400, json.dumps(failure),
+                        )
                     if event_type == "response.output_text.delta":
                         delta = str(event.get("delta", ""))
                         if delta:
@@ -198,6 +305,9 @@ class OpenAIBackend(BaseBackend):
                             maybe_id = response_payload.get("id")
                             if isinstance(maybe_id, str):
                                 response_id = maybe_id
+                            maybe_usage = response_payload.get("usage")
+                            if isinstance(maybe_usage, dict):
+                                usage_payload = maybe_usage
             trailing_text = self._finish_visible_stream_text(text_filter, delta_callback)
             if trailing_text:
                 text_parts.append(trailing_text)
@@ -205,6 +315,7 @@ class OpenAIBackend(BaseBackend):
                 response_id,
                 "".join(text_parts).strip(),
                 tuple(tool_calls),
+                usage=openai_token_usage(usage_payload),
             )
 
         if self.runtime._turn_aborted():
@@ -433,3 +544,44 @@ class OpenAIBackend(BaseBackend):
         except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
             return None
         return self._sanitize_continuation_statement(self.extract_openai_text(data))
+
+    def summarize_conversation(
+        self,
+        messages: list[dict[str, Any]],
+        previous_summary: str,
+        model: str,
+    ) -> str | None:
+        api_key = self._api_key(self.provider_key, self.env_var)
+        if api_key is None:
+            return None
+        request = urllib.request.Request(
+            "https://api.openai.com/v1/responses",
+            data=json.dumps(
+                {
+                    "model": model,
+                    "instructions": self._context_summary_system_prompt(),
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": self._context_summary_user_prompt(
+                                messages,
+                                previous_summary,
+                            ),
+                        }
+                    ],
+                    "max_output_tokens": 4096,
+                    "stream": False,
+                }
+            ).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
+        except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
+            return None
+        return self.extract_openai_text(data).strip() or None

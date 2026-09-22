@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import textwrap
+import unicodedata
 from dataclasses import dataclass
 
 MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
@@ -12,6 +13,27 @@ TABLE_DELIMITER_RE = re.compile(r":?-{3,}:?")
 ESCAPED_PIPE_PLACEHOLDER = "\0PIPE\0"
 CODE_START = "\x01"
 CODE_END = "\x02"
+
+
+def terminal_cell_spans(text: str, width: int) -> list[tuple[int, str, int]]:
+    """Return visible glyphs with column offsets, keeping combining marks attached."""
+    spans: list[tuple[int, str, int]] = []
+    column = 0
+    for character in text:
+        if spans and (unicodedata.category(character) in {"Mn", "Me"}):
+            offset, glyph, cells = spans[-1]
+            spans[-1] = (offset, glyph + character, cells)
+            continue
+        # Joined emoji need a grapheme-aware terminal engine; leave such labels
+        # untouched instead of overwriting half of a composed glyph.
+        if unicodedata.category(character).startswith("C"):
+            return []
+        cells = 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+        if column + cells > width:
+            break
+        spans.append((column, character, cells))
+        column += cells
+    return spans
 
 
 @dataclass(frozen=True)

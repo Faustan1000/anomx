@@ -4,19 +4,36 @@ from __future__ import annotations
 
 import curses
 import hashlib
+import math
 import re
 import shutil
 import subprocess
 import textwrap
+from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from anomx.agent.base.backends import strip_thinking_tags
-from anomx.agent.helpers.terminal import CODE_END, CODE_START, markdown_to_terminal_rendered_lines
+from anomx.agent.helpers.terminal import (
+    CODE_END,
+    CODE_START,
+    markdown_to_terminal_rendered_lines,
+    terminal_cell_spans,
+)
+from anomx.agent.helpers.terminal_colors import (
+    blend_color,
+    read_terminal_theme,
+    terminal_color_index,
+)
 from anomx.agent.store import (
     SessionRecord,
 )
 from anomx.agent.ui.constants import (
+    ACTIVITY_WAVE_PAUSE_FRAMES,
+    ACTIVITY_WAVE_SHADE_COUNT,
+    ACTIVITY_WAVE_TRAVEL_FRAMES,
+    ACTIVITY_WAVE_WIDTH,
     TABLE_BORDER_CHARS,
 )
 from anomx.agent.ui.models import (
@@ -40,7 +57,7 @@ class MessagesComponentMixin:
             return self._attr("bold")
         if role == "meta_accent":
             return self._attr("accent")
-        if role in {"meta", "thought", "tool", "work_summary", "approved", "notice"}:
+        if role in {"meta", "thought", "tool", "work_summary", "work_active", "approved", "notice"}:
             return self._attr("light")
         if role == "code":
             return self._attr("accent")
@@ -119,7 +136,30 @@ class MessagesComponentMixin:
     ) -> list[MessageLine]:
         if working_text is None:
             return messages
+        activity_index = self._latest_activity_message_index(messages)
+        if activity_index is not None:
+            active_messages = list(messages)
+            active_messages[activity_index] = replace(messages[activity_index], activity_wave=True)
+            return active_messages
         return [*messages, MessageLine("working", working_text), MessageLine("meta", "")]
+
+    def _latest_activity_message_index(self, messages: list[MessageLine]) -> int | None:
+        """Choose one visible tool label, stopping at the current request boundary."""
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.role == "agent" or (message.role == "user" and not message.meta):
+                return None
+            if message.role in {"work_active", "work_summary"} and message.meta:
+                if (
+                    message.text.endswith(" · collapse")
+                    and index > 0
+                    and self._is_expandable_work_role(messages[index - 1].role)
+                ):
+                    return index - 1
+                return index
+            if self._is_expandable_work_role(message.role):
+                return index
+        return None
 
     def _messages_with_transient_state(
         self,
@@ -144,11 +184,75 @@ class MessagesComponentMixin:
         width: int,
         frame: int,
     ) -> None:
-        if self._is_waiting_status_text(text):
-            dots = "." * (((frame // 4) % 3) + 1)
-        else:
-            dots = "." * ((frame // 4) % 4)
-        self._add(stdscr, y, x, f"{text}{dots}", width, self._attr("light"))
+        attr = self._attr("light")
+        self._add(stdscr, y, x, text, width, attr)
+        self._draw_activity_wave(stdscr, y, x, text, width, frame, attr)
+
+    def _draw_activity_wave(
+        self,
+        stdscr: CursesWindow,
+        y: int,
+        x: int,
+        text: str,
+        width: int,
+        frame: int,
+        attr: int,
+    ) -> None:
+        """Move a soft cosine-shaped brightness crest through the text."""
+        label = text.removesuffix(" · collapse")
+        spans = terminal_cell_spans(label, max(0, width))
+        phase = frame % (ACTIVITY_WAVE_TRAVEL_FRAMES + ACTIVITY_WAVE_PAUSE_FRAMES)
+        if not spans:
+            return
+        label_width = spans[-1][0] + spans[-1][2]
+        radius = ACTIVITY_WAVE_WIDTH / 2
+        center = -radius + (label_width + 2 * radius) * phase / (ACTIVITY_WAVE_TRAVEL_FRAMES - 1)
+        palette = self._activity_wave_palettes.get(bool(attr & curses.A_REVERSE), ())
+        for column, glyph, cells in spans:
+            distance = abs(column + cells / 2 - center) / radius
+            strength = (
+                (1 + math.cos(math.pi * distance)) / 2
+                if phase < ACTIVITY_WAVE_TRAVEL_FRAMES and distance < 1 else 0
+            )
+            if palette:
+                shade = palette[round(strength * (len(palette) - 1))]
+                wave_attr = (attr & ~(curses.A_COLOR | curses.A_DIM)) | shade
+            elif strength >= 0.5:
+                wave_attr = attr ^ curses.A_DIM
+            else:
+                continue
+            self._add(stdscr, y, x + column, glyph, len(glyph), wave_attr)
+
+    def _configure_activity_wave_colors(self, default_fg: int, default_bg: int) -> None:
+        """Allocate shades without changing the terminal's color definitions."""
+        first_pair = 12  # Pairs 1–11 belong to the existing CLI palette.
+        color_count = getattr(curses, "COLORS", 0)
+        if (
+            color_count < 256
+            or getattr(curses, "COLOR_PAIRS", 0) < first_pair + 2 * ACTIVITY_WAVE_SHADE_COUNT
+        ):
+            return
+        theme = read_terminal_theme()
+        if theme is None:
+            return
+        foreground, background = theme
+        for reverse in (False, True):
+            shades = []
+            with suppress(curses.error):
+                for index in range(ACTIVITY_WAVE_SHADE_COUNT):
+                    progress = index / (ACTIVITY_WAVE_SHADE_COUNT - 1)
+                    color = (
+                        blend_color(foreground, background, 1 - 0.3 * progress)
+                        if reverse else blend_color(background, foreground, 0.55 + 0.3 * progress)
+                    )
+                    color_index = terminal_color_index(color, color_count)
+                    pair = first_pair + int(reverse) * ACTIVITY_WAVE_SHADE_COUNT + index
+                    curses.init_pair(
+                        pair, default_fg if reverse else color_index,
+                        color_index if reverse else default_bg,
+                    )
+                    shades.append(curses.color_pair(pair))
+                self._activity_wave_palettes[reverse] = tuple(shades)
 
     def _is_waiting_status_text(self, text: str) -> bool:
         return text == "Waiting" or text.startswith("Waiting ")
@@ -389,14 +493,16 @@ class MessagesComponentMixin:
 
         def append_turn_line(turn_id: str, line: MessageLine) -> None:
             nonlocal current_segment_key, current_turn_id
-            if not turn_id:
+            # Messages are transcript boundaries, even when they belong to the
+            # same runtime turn. Only adjacent tool/activity lines share a row.
+            if not turn_id or not self._is_expandable_work_role(line.role):
                 lines.append(line)
                 current_turn_id = ""
                 current_segment_key = ""
                 return
             if current_turn_id != turn_id or not current_segment_key:
                 segments = turn_segments.setdefault(turn_id, [])
-                current_segment_key = f"{turn_id}:{len(segments)}"
+                current_segment_key = turn_id if not segments else f"{turn_id}:{len(segments)}"
                 current_turn_id = turn_id
                 segments.append([])
                 turn_segment_by_key[current_segment_key] = segments[-1]
@@ -406,11 +512,10 @@ class MessagesComponentMixin:
 
         def append_turn_summary(turn_id: str, message: str) -> None:
             if not turn_id:
-                lines.append(MessageLine("work_summary", f"{message} · expand"))
+                lines.append(MessageLine("work_summary", message))
                 return
             if turn_id not in turn_segments:
-                append_turn_line(turn_id, MessageLine("meta", ""))
-                turn_segment_by_key[current_segment_key].clear()
+                return
             turn_summaries[turn_id] = message
 
         for event_index, event in enumerate(self._session_events(session_path)):
@@ -511,28 +616,35 @@ class MessagesComponentMixin:
                 turn_id = str(payload.get("turn_id", ""))
                 append_turn_summary(turn_id, message)
         rendered_lines: list[MessageLine] = []
-        collapsed_turns: set[str] = set()
-        for line in lines:
+        for line_index, line in enumerate(lines):
             if line.role != "__turn_placeholder__":
                 rendered_lines.append(line)
                 continue
             turn_id = line.text
             segment_key = line.meta
             summary = turn_summaries.get(turn_id)
-            if summary:
-                if turn_id in self._expanded_work_turns:
-                    rendered_lines.extend(turn_segment_by_key.get(segment_key, []))
-                    if segment_key == (turn_segment_keys.get(turn_id) or [""])[-1]:
-                        rendered_lines.append(
-                            MessageLine("work_summary", f"{summary} · collapse", turn_id)
-                        )
-                elif turn_id not in collapsed_turns:
-                    collapsed_turns.add(turn_id)
-                    rendered_lines.append(
-                        MessageLine("work_summary", f"{summary} · expand", turn_id)
-                    )
-                else:
-                    continue
+            if self.work_visualization == "default":
+                segment_lines = turn_segment_by_key.get(segment_key, [])
+                latest_statement = next(
+                    (entry.text for entry in reversed(segment_lines) if entry.text.strip()),
+                    "Thinking",
+                )
+                # A whole-turn duration only describes a group when there is
+                # one group. Separate groups retain their own action labels.
+                label = (
+                    summary
+                    if summary and len(turn_segment_keys[turn_id]) == 1
+                    else latest_statement
+                )
+                active = not summary and line_index == len(lines) - 1
+                expanded = segment_key in self._expanded_work_turns
+                if expanded:
+                    rendered_lines.extend(segment_lines)
+                rendered_lines.append(MessageLine(
+                    "work_active" if active else "work_summary",
+                    self._single_line_work_text(label) + (" · collapse" if expanded else ""),
+                    segment_key,
+                ))
             else:
                 rendered_lines.extend(turn_segment_by_key.get(segment_key, []))
         if cache_key is not None:
@@ -563,7 +675,7 @@ class MessagesComponentMixin:
         return stat.st_mtime_ns, stat.st_size
 
     def _expanded_work_turns_key(self) -> tuple[str, ...]:
-        return tuple(sorted(self._expanded_work_turns))
+        return (self.work_visualization, *sorted(self._expanded_work_turns))
 
     def _expanded_work_lines_key(self) -> tuple[str, ...]:
         return tuple(sorted(self._expanded_work_lines))
@@ -619,8 +731,15 @@ class MessagesComponentMixin:
             kind = self._message_kind(message.role)
             if rendered and previous_kind is not None and kind != previous_kind:
                 rendered.append(MessageLine("meta", ""))
+            message_start = len(rendered)
             if message.role == "user":
                 rendered.extend(self._render_user_message(message, width))
+            elif message.role in {"work_active", "work_summary"}:
+                rendered.append(MessageLine(
+                    message.role,
+                    self._ellipsized_statement_text(message.text, width),
+                    message.meta,
+                ))
             elif self._is_expandable_work_role(message.role):
                 rendered.extend(self._render_work_message(message, width))
             else:
@@ -638,6 +757,11 @@ class MessagesComponentMixin:
                             message.detail_body,
                         )
                     )
+            if message.activity_wave and len(rendered) > message_start:
+                # Expanded tool details keep the wave on the first title row.
+                wave_index = message_start + (rendered[message_start].role == "work_box")
+                if wave_index < len(rendered):
+                    rendered[wave_index] = replace(rendered[wave_index], activity_wave=True)
             previous_kind = kind
         return rendered
 

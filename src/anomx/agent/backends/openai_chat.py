@@ -18,8 +18,17 @@ from anomx.agent.base.backends import (
     OpenAIChatCompletionStreamResponse,
     OpenAIToolCall,
     ThinkingTagStreamFilter,
+    backend_supports_image_input,
+    chat_completion_token_usage,
     normalized_image_attachments,
 )
+from anomx.agent.context_management import (
+    CONTINUE_AFTER_COMPRESSION_PROMPT,
+    ContextMessage,
+    projected_context_tokens,
+    transient_context_message,
+)
+from anomx.agent.exceptions import BackendFailure
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata
 
@@ -28,6 +37,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
     """Shared agent loop for providers implementing Chat Completions."""
 
     chat_completions_endpoint = ""
+    preserve_reasoning_content = False
 
     def generate(
         self,
@@ -44,7 +54,12 @@ class OpenAICompatibleChatBackend(BaseBackend):
         if api_key is None:
             return self._missing_api_key_message(self.provider_label, self.env_var)
 
-        messages = self._chat_messages(session_path, model)
+        context_entries = self.runtime.backend_conversation_entries(session_path)
+        messages = self._chat_messages_from_entries(
+            session_path,
+            model,
+            context_entries,
+        )
         plan_finish_attempts = 0
         thought_only_followups = 0
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -59,9 +74,17 @@ class OpenAICompatibleChatBackend(BaseBackend):
                 callbacks.thought,
             )
             if isinstance(response, str):
-                return response
+                recovered_entries = self._recover_context_window(
+                    response, session_path, context_entries, callbacks,
+                )
+                if recovered_entries is None:
+                    return response
+                context_entries = recovered_entries
+                messages = self._chat_messages_from_entries(session_path, model, context_entries)
+                continue
             if self.runtime._turn_aborted():
                 return ""
+            self._track_usage(response.usage, callbacks)
 
             if response.assistant_message:
                 messages.append(response.assistant_message)
@@ -69,21 +92,44 @@ class OpenAICompatibleChatBackend(BaseBackend):
                 if not response.text and response.thoughts:
                     if thought_only_followups < 1:
                         thought_only_followups += 1
-                        messages.append(
-                            {
-                                "role": "user",
-                                "content": (
-                                    "Provide the final answer to the user's request now. "
-                                    "Return only that answer; do not include reasoning or "
-                                    "<think> tags."
-                                ),
-                            }
+                        followup = (
+                            "Provide the final answer to the user's request now. "
+                            "Return only that answer; do not include reasoning or "
+                            "<think> tags."
                         )
+                        pending_entries = self._chat_context_entries(response, ())
+                        pending_entries.append(
+                            transient_context_message("user", followup)
+                        )
+                        context_entries.extend(pending_entries)
+                        context_entries, compressed = (
+                            self.runtime.compress_in_turn_context(
+                                session_path,
+                                context_entries,
+                                current_context_tokens=projected_context_tokens(
+                                    response.usage.input_tokens if response.usage else 0,
+                                    response.usage.output_tokens if response.usage else 0,
+                                    pending_entries[1:],
+                                ),
+                                status_callback=callbacks.status,
+                            )
+                        )
+                        if compressed:
+                            context_entries.append(
+                                transient_context_message(
+                                    "user",
+                                    CONTINUE_AFTER_COMPRESSION_PROMPT,
+                                )
+                            )
+                            messages = self._chat_messages_from_entries(
+                                session_path,
+                                model,
+                                context_entries,
+                            )
+                        else:
+                            messages.append({"role": "user", "content": followup})
                         continue
-                    final_text = "The model did not provide a final answer."
-                    if callbacks.finish is not None:
-                        callbacks.finish(final_text)
-                    return final_text
+                    return BackendFailure("The model did not provide a final answer.")
                 continuation_prompt, used_plan_guard = self.runtime._continuation_prompt_after_text(
                     response.text,
                     callbacks,
@@ -93,23 +139,96 @@ class OpenAICompatibleChatBackend(BaseBackend):
                 if continuation_prompt is not None:
                     if used_plan_guard:
                         plan_finish_attempts += 1
-                    messages.append({"role": "user", "content": continuation_prompt})
+                    pending_entries = self._chat_context_entries(response, ())
+                    pending_entries.append(
+                        transient_context_message("user", continuation_prompt)
+                    )
+                    context_entries.extend(pending_entries)
+                    context_entries, compressed = self.runtime.compress_in_turn_context(
+                        session_path,
+                        context_entries,
+                        current_context_tokens=projected_context_tokens(
+                            response.usage.input_tokens if response.usage else 0,
+                            response.usage.output_tokens if response.usage else 0,
+                            pending_entries[1:],
+                        ),
+                        status_callback=callbacks.status,
+                    )
+                    if compressed:
+                        context_entries.append(
+                            transient_context_message(
+                                "user",
+                                CONTINUE_AFTER_COMPRESSION_PROMPT,
+                            )
+                        )
+                        messages = self._chat_messages_from_entries(
+                            session_path,
+                            model,
+                            context_entries,
+                        )
+                    else:
+                        messages.append(
+                            {"role": "user", "content": continuation_prompt}
+                        )
                     continue
                 if callbacks.finish is not None:
                     callbacks.finish(response.text)
                 return response.text or "No response."
 
-            messages.extend(
-                self._execute_chat_completion_tools(response, callbacks, session_path)
+            tool_messages = self._execute_chat_completion_tools(
+                response,
+                callbacks,
+                session_path,
             )
+            messages.extend(tool_messages)
+            pending_entries = self._chat_context_entries(response, tool_messages)
+            context_entries.extend(pending_entries)
+            context_entries, compressed = self.runtime.compress_in_turn_context(
+                session_path,
+                context_entries,
+                current_context_tokens=projected_context_tokens(
+                    response.usage.input_tokens if response.usage else 0,
+                    response.usage.output_tokens if response.usage else 0,
+                    pending_entries[1:],
+                ),
+                status_callback=callbacks.status,
+            )
+            if compressed:
+                context_entries.append(
+                    transient_context_message(
+                        "user",
+                        CONTINUE_AFTER_COMPRESSION_PROMPT,
+                    )
+                )
+                messages = self._chat_messages_from_entries(
+                    session_path,
+                    model,
+                    context_entries,
+                )
 
-        return f"{self.provider_label} tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches."
+        return BackendFailure(
+            f"{self.provider_label} tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches.",
+            code="tool_limit_exceeded",
+        )
 
     def _chat_messages(self, session_path: Path, model: str) -> list[dict[str, Any]]:
+        return self._chat_messages_from_entries(
+            session_path,
+            model,
+            self.runtime.backend_conversation_entries(session_path),
+        )
+
+    def _chat_messages_from_entries(
+        self,
+        session_path: Path,
+        model: str,
+        entries: list[ContextMessage],
+    ) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.runtime._instructions(session_path)}
         ]
-        for item in self.runtime.conversation_messages(session_path):
+        for entry in entries:
+            item = entry.payload
             role = str(item.get("role") or "user").strip()
             content = str(item.get("content") or "").strip()
             if role not in {"assistant", "system", "user"}:
@@ -117,8 +236,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
             images = normalized_image_attachments(item.get("images")) if role == "user" else ()
             supports_images = (
                 role == "user"
-                and self.provider_key == "blablador"
-                and model == "alias-code"
+                and backend_supports_image_input(self.provider_key, model)
             )
             if supports_images and images:
                 content_blocks: list[dict[str, Any]] = []
@@ -138,6 +256,30 @@ class OpenAICompatibleChatBackend(BaseBackend):
             messages.append({"role": role, "content": content})
         return messages
 
+    def _chat_context_entries(
+        self,
+        response: OpenAIChatCompletionStreamResponse,
+        tool_outputs: tuple[dict[str, str], ...] | list[dict[str, str]],
+    ) -> list[ContextMessage]:
+        assistant_parts = [response.text.strip()] if response.text.strip() else []
+        assistant_parts.extend(
+            f"[Tool call: {tool_call.name}]\n{tool_call.arguments}"
+            for tool_call in response.tool_calls
+        )
+        entries = [
+            transient_context_message("assistant", "\n\n".join(assistant_parts))
+        ]
+        if tool_outputs:
+            results = "\n\n".join(
+                (
+                    f"[Tool result: {output.get('tool_call_id', '')}]\n"
+                    f"{output.get('content', '')}"
+                )
+                for output in tool_outputs
+            )
+            entries.append(transient_context_message("user", results))
+        return entries
+
     def _chat_image_block(self, image: ImageAttachment) -> dict[str, Any] | None:
         encoded = self._image_base64(image)
         if encoded is None:
@@ -156,13 +298,16 @@ class OpenAICompatibleChatBackend(BaseBackend):
         *,
         stream: bool,
     ) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "tools": self._ollama_tools(),
             "tool_choice": "auto",
             "stream": stream,
         }
+        if stream:
+            payload["stream_options"] = {"include_usage": True}
+        return payload
 
     def _stream_chat_completion(
         self,
@@ -172,7 +317,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
         status_callback: BackendTextCallback | None,
         thought_callback: BackendTextCallback | None = None,
     ) -> OpenAIChatCompletionStreamResponse | str:
-        def stream_once() -> OpenAIChatCompletionStreamResponse:
+        def stream_once() -> OpenAIChatCompletionStreamResponse | str:
             self.runtime._debug_log_step(self.provider_key, payload)
             request = urllib.request.Request(
                 self.chat_completions_endpoint,
@@ -188,6 +333,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
             tagged_thoughts: list[str] = []
             reasoning_parts: list[str] = []
             tool_calls_by_index: dict[int, dict[str, Any]] = {}
+            usage_payload: dict[str, Any] | None = None
 
             def record_thought(thought: str) -> None:
                 normalized = self._normalized_thought(thought)
@@ -210,6 +356,14 @@ class OpenAICompatibleChatBackend(BaseBackend):
                     if not event_data or event_data == "[DONE]":
                         continue
                     event = cast(dict[str, Any], json.loads(event_data))
+                    if event.get("error"):
+                        return self._api_error(
+                            self.provider_key, self.provider_label, self.env_var,
+                            400, event_data,
+                        )
+                    event_usage = event.get("usage")
+                    if isinstance(event_usage, dict):
+                        usage_payload = event_usage
                     choices = event.get("choices")
                     if not isinstance(choices, list) or not choices:
                         continue
@@ -304,11 +458,15 @@ class OpenAICompatibleChatBackend(BaseBackend):
                     }
                     for tool_call in tool_calls
                 ]
+            if reasoning_parts and self.preserve_reasoning_content:
+                assistant_message["role"] = "assistant"
+                assistant_message["reasoning_content"] = "".join(reasoning_parts)
             return OpenAIChatCompletionStreamResponse(
                 "".join(text_parts).strip(),
                 tool_calls,
                 assistant_message,
                 tuple(tagged_thoughts),
+                usage=chat_completion_token_usage(usage_payload),
             )
 
         if self.runtime._turn_aborted():
@@ -421,20 +579,31 @@ class OpenAICompatibleChatBackend(BaseBackend):
             ).strip()
         return ""
 
-    def _simple_completion(self, system: str, user: str, model: str, *, timeout: int) -> str | None:
+    def _simple_completion(
+        self,
+        system: str,
+        user: str,
+        model: str,
+        *,
+        timeout: int,
+        max_tokens: int | None = None,
+    ) -> str | None:
         api_key = self._api_key(self.provider_key, self.env_var)
         if api_key is None:
             return None
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "stream": False,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
         return self._chat_completion_content(
             api_key,
-            {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                "stream": False,
-            },
+            payload,
             timeout=timeout,
         )
 
@@ -511,3 +680,18 @@ class OpenAICompatibleChatBackend(BaseBackend):
             timeout=8,
         )
         return self._sanitize_continuation_statement(value or "") if value else None
+
+    def summarize_conversation(
+        self,
+        messages: list[dict[str, Any]],
+        previous_summary: str,
+        model: str,
+    ) -> str | None:
+        value = self._simple_completion(
+            self._context_summary_system_prompt(),
+            self._context_summary_user_prompt(messages, previous_summary),
+            model,
+            timeout=120,
+            max_tokens=4096,
+        )
+        return value.strip() if value and value.strip() else None

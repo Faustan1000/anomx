@@ -250,3 +250,44 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
         except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
             return None
         return self._sanitize_continuation_statement(self.extract_anthropic_text(data))
+
+    def summarize_conversation(
+        self,
+        messages: list[dict[str, Any]],
+        previous_summary: str,
+        model: str,
+    ) -> str | None:
+        api_key = self._api_key(self.provider_key, self.env_var)
+        if api_key is None:
+            return None
+        request = urllib.request.Request(
+            DESY_MESSAGES_ENDPOINT,
+            data=json.dumps(
+                {
+                    "model": model,
+                    "system": self._context_summary_system_prompt(),
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": self._context_summary_user_prompt(
+                                messages,
+                                previous_summary,
+                            ),
+                        }
+                    ],
+                    "max_tokens": 4096,
+                    "stream": False,
+                }
+            ).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "X-API-Key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
+        except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
+            return None
+        return self.extract_anthropic_text(data).strip() or None

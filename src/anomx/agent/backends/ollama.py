@@ -16,7 +16,15 @@ from anomx.agent.base.backends import (
     OllamaStreamResponse,
     OllamaToolCall,
     ThinkingTagStreamFilter,
+    ollama_token_usage,
 )
+from anomx.agent.context_management import (
+    CONTINUE_AFTER_COMPRESSION_PROMPT,
+    ContextMessage,
+    projected_context_tokens,
+    transient_context_message,
+)
+from anomx.agent.exceptions import BackendFailure
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata
 
@@ -39,9 +47,13 @@ class OllamaBackend(BaseBackend):
         """Generate a response through a local Ollama server."""
 
         del thinking_intensity
+        context_entries = self.runtime.backend_conversation_entries(session_path)
         messages = [
             {"role": "system", "content": self.runtime._instructions(session_path)},
-            *self._ollama_messages(self.runtime.conversation_messages(session_path), model),
+            *self._ollama_messages(
+                [entry.payload for entry in context_entries],
+                model,
+            ),
         ]
         plan_finish_attempts = 0
         for _ in range(MAX_TOOL_ITERATIONS):
@@ -53,9 +65,20 @@ class OllamaBackend(BaseBackend):
             }
             response = self._stream_ollama_response(model, messages, callbacks)
             if isinstance(response, str):
-                return response
+                recovered_entries = self._recover_context_window(
+                    response, session_path, context_entries, callbacks,
+                )
+                if recovered_entries is None:
+                    return response
+                context_entries = recovered_entries
+                messages = [
+                    {"role": "system", "content": self.runtime._instructions(session_path)},
+                    *self._ollama_messages([entry.payload for entry in context_entries], model),
+                ]
+                continue
             if self.runtime._turn_aborted():
                 return ""
+            self._track_usage(response.usage, callbacks)
 
             if response.message:
                 messages.append(response.message)
@@ -72,22 +95,115 @@ class OllamaBackend(BaseBackend):
                 if continuation_prompt is not None:
                     if used_plan_guard:
                         plan_finish_attempts += 1
-                    messages.append({"role": "user", "content": continuation_prompt})
+                    pending_entries = self._ollama_context_entries(response, ())
+                    pending_entries.append(
+                        transient_context_message("user", continuation_prompt)
+                    )
+                    context_entries.extend(pending_entries)
+                    context_entries, compressed = self.runtime.compress_in_turn_context(
+                        session_path,
+                        context_entries,
+                        current_context_tokens=projected_context_tokens(
+                            response.usage.input_tokens if response.usage else 0,
+                            response.usage.output_tokens if response.usage else 0,
+                            pending_entries[1:],
+                        ),
+                        status_callback=callbacks.status,
+                    )
+                    if compressed:
+                        context_entries.append(
+                            transient_context_message(
+                                "user",
+                                CONTINUE_AFTER_COMPRESSION_PROMPT,
+                            )
+                        )
+                        messages = [
+                            {
+                                "role": "system",
+                                "content": self.runtime._instructions(session_path),
+                            },
+                            *self._ollama_messages(
+                                [entry.payload for entry in context_entries],
+                                model,
+                            ),
+                        ]
+                    else:
+                        messages.append(
+                            {"role": "user", "content": continuation_prompt}
+                        )
                     continue
                 final_text = text
                 if callbacks.finish is not None:
                     callbacks.finish(final_text)
                 return final_text
 
-            messages.extend(
-                self._execute_ollama_requested_tools(
-                    response,
-                    callbacks,
-                    session_path,
-                )
+            tool_messages = self._execute_ollama_requested_tools(
+                response,
+                callbacks,
+                session_path,
             )
+            messages.extend(tool_messages)
+            pending_entries = self._ollama_context_entries(response, tool_messages)
+            context_entries.extend(pending_entries)
+            context_entries, compressed = self.runtime.compress_in_turn_context(
+                session_path,
+                context_entries,
+                current_context_tokens=projected_context_tokens(
+                    response.usage.input_tokens if response.usage else 0,
+                    response.usage.output_tokens if response.usage else 0,
+                    pending_entries[1:],
+                ),
+                status_callback=callbacks.status,
+            )
+            if compressed:
+                context_entries.append(
+                    transient_context_message(
+                        "user",
+                        CONTINUE_AFTER_COMPRESSION_PROMPT,
+                    )
+                )
+                messages = [
+                    {
+                        "role": "system",
+                        "content": self.runtime._instructions(session_path),
+                    },
+                    *self._ollama_messages(
+                        [entry.payload for entry in context_entries],
+                        model,
+                    ),
+                ]
 
-        return f"Ollama tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches."
+        return BackendFailure(
+            f"Ollama tool loop stopped after {MAX_TOOL_ITERATIONS} tool batches.",
+            code="tool_limit_exceeded",
+        )
+
+    def _ollama_context_entries(
+        self,
+        response: OllamaStreamResponse,
+        tool_outputs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
+    ) -> list[ContextMessage]:
+        assistant_parts = [response.text.strip()] if response.text.strip() else []
+        assistant_parts.extend(
+            (
+                f"[Tool call: {tool_call.name}]\n"
+                f"{json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True)}"
+            )
+            for tool_call in response.tool_calls
+        )
+        entries = [
+            transient_context_message("assistant", "\n\n".join(assistant_parts))
+        ]
+        if tool_outputs:
+            results = "\n\n".join(
+                (
+                    f"[Tool result: {output.get('tool_name', '')}]\n"
+                    f"{output.get('content', '')}"
+                )
+                for output in tool_outputs
+            )
+            entries.append(transient_context_message("user", results))
+        return entries
 
     def _stream_ollama_response(
         self,
@@ -110,12 +226,13 @@ class OllamaBackend(BaseBackend):
             method="POST",
         )
 
-        def stream_once() -> OllamaStreamResponse:
+        def stream_once() -> OllamaStreamResponse | str:
             self.runtime._debug_log_step(self.provider_key, payload)
             thinking_parts: list[str] = []
             text_parts: list[str] = []
             text_filter = ThinkingTagStreamFilter()
             tool_calls: list[OllamaToolCall] = []
+            final_payload: dict[str, Any] | None = None
             with urllib.request.urlopen(request, timeout=120) as response:
                 self.runtime._status(callbacks.status, "Thinking")
                 for raw_line in response:
@@ -125,6 +242,13 @@ class OllamaBackend(BaseBackend):
                     if not stripped:
                         continue
                     data = cast(dict[str, Any], json.loads(stripped))
+                    if data.get("error"):
+                        return self._api_error(
+                            self.provider_key, self.provider_label, self.env_var,
+                            400, stripped,
+                        )
+                    if data.get("done") is True:
+                        final_payload = data
                     stream_message = data.get("message")
                     if not isinstance(stream_message, dict):
                         continue
@@ -183,6 +307,7 @@ class OllamaBackend(BaseBackend):
                 thought,
                 tuple(tool_calls),
                 assistant_message,
+                usage=ollama_token_usage(final_payload),
             )
 
         if self.runtime._turn_aborted():
@@ -390,3 +515,40 @@ class OllamaBackend(BaseBackend):
         if not isinstance(message, dict):
             return None
         return self._sanitize_continuation_statement(str(message.get("content", "")))
+
+    def summarize_conversation(
+        self,
+        messages: list[dict[str, Any]],
+        previous_summary: str,
+        model: str,
+    ) -> str | None:
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": self._context_summary_system_prompt()},
+                {
+                    "role": "user",
+                    "content": self._context_summary_user_prompt(
+                        messages,
+                        previous_summary,
+                    ),
+                },
+            ],
+            "stream": False,
+            "options": {"num_predict": 4096},
+        }
+        request = urllib.request.Request(
+            "http://127.0.0.1:11434/api/chat",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
+        except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
+            return None
+        message = data.get("message")
+        if not isinstance(message, dict):
+            return None
+        return str(message.get("content") or "").strip() or None
