@@ -2110,6 +2110,11 @@ class AnomxCliApp(
                     current_session.path
                 )
                 pinned_anchor = anchor_line
+                # A prior turn may have left the view scrolled away from the bottom
+                # (e.g. the user scrolled up to read earlier output). Without this,
+                # the new response streams in below the visible area and the view
+                # never follows it until the user manually scrolls down.
+                scroll = 0
                 running_notice = RUNNING_NOTICE
                 running_notice_role = "light"
                 running_abort_key = ""

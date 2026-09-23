@@ -1178,6 +1178,87 @@ def test_running_slash_commands_only_show_non_message_commands(tmp_path):
     assert app._filtered_running_commands("/map") == []
 
 
+def test_new_turn_resets_scroll_to_follow_the_growing_reply(tmp_path, monkeypatch):
+    class StopCapture(Exception):
+        pass
+
+    class Viewport:
+        def __init__(self, scroll):
+            self.scroll = scroll
+
+    class Window:
+        def __init__(self, keys):
+            self._keys = iter(keys)
+
+        def get_wch(self):
+            return next(self._keys)
+
+        def nodelay(self, _flag):
+            pass
+
+        def getmaxyx(self):
+            return 24, 80
+
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    app = AnomxCliApp(home=home, cwd=repo, use_color=False)
+
+    stop_event = threading.Event()
+    worker = threading.Thread(target=stop_event.wait)
+    worker.start()
+
+    def fake_start_session_turn(target_session, runtime=None):
+        del runtime
+        turn = ui_module.ActiveSessionTurn(
+            session=target_session,
+            runtime=app.runtime,
+            events=queue.SimpleQueue(),
+            result={},
+            turn_id="turn-1",
+            started_at=time.monotonic(),
+            worker=worker,
+            mode=AgentMode.STANDARD,
+        )
+        app._active_session_turns[app._session_turn_key(target_session)] = turn
+        return turn
+
+    monkeypatch.setattr(app, "_start_session_turn", fake_start_session_turn)
+
+    captured: list[tuple[int, bool]] = []
+
+    def fake_draw_session(_stdscr, _session, _messages, _input_text, _cursor, scroll, *_a, **kwargs):
+        # Session-title and message-anchor animations also call _draw_session (with a
+        # hardcoded scroll of 0) as one-off transitions; only a call carrying
+        # sticky_anchor is the main per-iteration render this test cares about.
+        if "sticky_anchor" not in kwargs:
+            return Viewport(scroll)
+        running = app._active_turn_for_session(session) is not None
+        captured.append((scroll, running))
+        if running:
+            raise StopCapture
+        return Viewport(scroll)
+
+    monkeypatch.setattr(app, "_draw_session", fake_draw_session)
+
+    # Scroll up (as if reading earlier output) before sending the next message.
+    window = Window([curses.KEY_PPAGE, "h", "i", "\n"])
+    try:
+        app._run_session(window, session)
+    except StopCapture:
+        pass
+    finally:
+        stop_event.set()
+        worker.join(timeout=1)
+
+    assert any(scroll > 0 for scroll, running in captured if not running)
+    # The first draw for the newly-started turn must be back at scroll 0 (bottom
+    # follow), not carrying over the scroll offset left by reading earlier output --
+    # otherwise the streaming reply grows off-screen and never auto-scrolls into view.
+    assert captured[-1] == (0, True)
+
+
 def test_running_enter_submits_plain_message(tmp_path):
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
