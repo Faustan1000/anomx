@@ -1010,6 +1010,46 @@ class ConfigViewMixin:
             choices.append(MenuChoice(option.label, option.value, detail))
         return tuple(choices)
 
+    def _apply_effort_argument(self, stdscr: CursesWindow, submitted: str) -> bool:
+        """Apply `/effort <level>` directly instead of opening the picker.
+
+        Returns True once the command is fully handled (whether or not an
+        argument was given), so callers should always return after calling this
+        rather than falling through to open the interactive picker as well.
+        """
+
+        _, _, argument = submitted.partition(" ")
+        argument = argument.strip().lower()
+        if not argument:
+            return False
+
+        config = self.home.load_config()
+        provider = provider_by_key(str(config.get("provider", "")))
+        model = str(config.get("model", ""))
+        options = thinking_intensity_options(provider.key, model) if provider else ()
+        if not options:
+            self._message(
+                stdscr,
+                "Effort",
+                f"{model or 'This model'} does not support reasoning effort.",
+            )
+            return True
+
+        matched = next((option for option in options if option.value == argument), None)
+        if matched is None:
+            valid = ", ".join(option.value for option in options)
+            self._message(
+                stdscr,
+                "Effort",
+                f"Unknown effort '{argument}' for {model}. Valid options: {valid}.",
+            )
+            return True
+
+        config["thinking_intensity"] = matched.value
+        self.home.save_config(config)
+        self._message(stdscr, "Effort", f"Reasoning effort for {model} set to {matched.label}.")
+        return True
+
     def _run_effort_panel(
         self,
         stdscr: CursesWindow,

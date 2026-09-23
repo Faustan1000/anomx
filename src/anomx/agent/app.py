@@ -1104,13 +1104,14 @@ class AnomxCliApp(
             )
             return None
         if command == "/effort":
-            self._run_project_effort_panel(
-                stdscr,
-                project,
-                sessions,
-                selected,
-                scroll,
-            )
+            if not self._apply_effort_argument(stdscr, submitted):
+                self._run_project_effort_panel(
+                    stdscr,
+                    project,
+                    sessions,
+                    selected,
+                    scroll,
+                )
             return None
         if command == "/feedback":
             current_session = (
@@ -2337,7 +2338,8 @@ class AnomxCliApp(
             self._run_model_panel(stdscr, current_session)
             return None
         if command == "/effort":
-            self._run_effort_panel(stdscr, current_session)
+            if not self._apply_effort_argument(stdscr, submitted):
+                self._run_effort_panel(stdscr, current_session)
             return None
         if command == "/feedback":
             self._send_cli_feedback(stdscr, current_session, submitted)

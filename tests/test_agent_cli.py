@@ -2864,6 +2864,54 @@ def test_run_effort_panel_reports_unsupported_model(tmp_path, monkeypatch):
     assert messages and messages[0][0] == "Effort"
 
 
+def test_effort_command_argument_sets_intensity_without_opening_picker(tmp_path, monkeypatch):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home.save_config({**home.load_config(), "provider": "desy", "model": "coding"})
+    home.create_session(repo, provider="desy", model="coding")
+    app = AnomxCliApp(home=home, use_color=False)
+
+    monkeypatch.setattr(
+        app,
+        "_bottom_menu",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("picker should not open")),
+    )
+    monkeypatch.setattr(app, "_message", lambda *_a, **_k: None)
+
+    assert app._apply_effort_argument(object(), "/effort none") is True
+    assert home.load_config()["thinking_intensity"] == "none"
+
+
+def test_effort_command_rejects_unknown_argument(tmp_path, monkeypatch):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home.save_config({**home.load_config(), "provider": "desy", "model": "coding"})
+    home.create_session(repo, provider="desy", model="coding")
+    app = AnomxCliApp(home=home, use_color=False)
+    messages: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        app,
+        "_message",
+        lambda _stdscr, title, message: messages.append((title, message)),
+    )
+
+    assert app._apply_effort_argument(object(), "/effort bogus") is True
+    assert home.load_config().get("thinking_intensity") != "bogus"
+    assert messages and "Unknown effort" in messages[0][1]
+
+
+def test_effort_command_without_argument_falls_back_to_picker(tmp_path):
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    home.create_session(repo, provider="openai", model="gpt-5.5")
+    app = AnomxCliApp(home=home, use_color=False)
+
+    assert app._apply_effort_argument(object(), "/effort") is False
+
+
 def test_update_session_model_persists_selection(tmp_path):
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"

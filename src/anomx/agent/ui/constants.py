@@ -20,7 +20,7 @@ COMMANDS = (
     CommandSpec("/rename", "Rename the current session"),
     CommandSpec("/config", "Edit configuration"),
     CommandSpec("/model", "Change model"),
-    CommandSpec("/effort", "Change reasoning effort"),
+    CommandSpec("/effort", "Change reasoning effort (e.g. /effort none)"),
     CommandSpec("/feedback", "Send feedback to the connected Anomx Platform"),
     CommandSpec("/exit", "Exit Anomx"),
 )
