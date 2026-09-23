@@ -1254,14 +1254,6 @@ class ConfigViewMixin:
                 if selected == "backend":
                     self._manage_backends(stdscr)
                     continue
-                if selected == "model":
-                    if self._run_model_panel(
-                        stdscr,
-                        current_session,
-                        bottom_popover=False,
-                    ):
-                        return
-                    continue
                 if selected == "platform":
                     self._configure_platform(stdscr, current_session)
                     continue
@@ -1307,7 +1299,6 @@ class ConfigViewMixin:
         config = self.home.load_config()
         return (
             MenuChoice("Manage Backends", "backend", self._backends_config_detail()),
-            MenuChoice("Choose Model", "model", "Pick a model from your connected backends"),
             platform_choice,
             MenuChoice("Manage Debug Mode", "debug", self._debug_config_detail(config)),
             MenuChoice(
