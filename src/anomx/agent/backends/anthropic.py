@@ -299,7 +299,7 @@ class AnthropicCompatibleBackend(BaseBackend):
             "stream": True,
         }
         if include_thinking:
-            payload["thinking"] = self._anthropic_thinking_config(model)
+            payload["thinking"] = self._anthropic_thinking_config(model, thinking_intensity)
             output_config = self._anthropic_output_config(model, thinking_intensity)
             if output_config:
                 payload["output_config"] = output_config

@@ -1253,7 +1253,11 @@ class BaseBackend:
         supported = {option.value for option in thinking_intensity_options(provider_key, model)}
         return intensity if intensity in supported else None
 
-    def _anthropic_thinking_config(self, model: str) -> dict[str, Any]:
+    def _anthropic_thinking_config(
+        self,
+        model: str,
+        thinking_intensity: str | None = None,
+    ) -> dict[str, Any]:
         if model in {
             "claude-fable-5-1",
             "claude-opus-5",
@@ -1262,6 +1266,12 @@ class BaseBackend:
             "claude-sonnet-4-6",
         }:
             return {"type": "adaptive", "display": "summarized"}
+        # Models outside the adaptive set have no way to let the backend decide
+        # whether reasoning is warranted, so without this check every turn paid for
+        # a forced 1k-2k reasoning budget before the visible answer even started,
+        # regardless of the user's thinking-intensity choice.
+        if normalize_thinking_intensity(thinking_intensity) == "none":
+            return {"type": "disabled"}
         max_tokens = self._max_output_tokens(model, 4_096)
         budget_tokens = max(1_024, min(2_048, max_tokens - 1))
         return {

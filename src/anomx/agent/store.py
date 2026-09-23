@@ -398,6 +398,18 @@ MODEL_THINKING_INTENSITIES: dict[tuple[str, str], tuple[str, ...]] = {
         )
         for model in ("claude-opus-4-6", "claude-sonnet-4-6")
     },
+    **{
+        ("desy", model): (
+            THINKING_INTENSITY_AUTO,
+            "none",
+            "low",
+            "medium",
+            "high",
+        )
+        # "reasoning" is DESY's dedicated reasoning model and intentionally has no
+        # user-selectable intensity (see test_thinking_intensity_options_are_model_specific).
+        for model in ("coding", "desy-assistant")
+    },
 }
 
 MODEL_METADATA: dict[str, ModelMetadata] = {

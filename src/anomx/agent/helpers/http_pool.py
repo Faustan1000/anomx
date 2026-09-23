@@ -104,6 +104,24 @@ def _connection_for(host: str, timeout: float) -> http.client.HTTPSConnection:
         return connection
 
 
+def reset_pool() -> None:
+    """Close and forget every pooled connection.
+
+    Used by tests to keep the process-global pool from leaking a live socket
+    (opened by a test that didn't fully mock the network layer) into unrelated
+    tests that run afterwards.
+    """
+
+    with _LOCK:
+        connections = list(_POOL.values())
+        _POOL.clear()
+    for connection in connections:
+        try:
+            connection.close()
+        except Exception:  # noqa: BLE001 - best-effort cleanup
+            pass
+
+
 def _discard(host: str, connection: http.client.HTTPSConnection) -> None:
     with _LOCK:
         if _POOL.get(host) is connection:
@@ -114,4 +132,4 @@ def _discard(host: str, connection: http.client.HTTPSConnection) -> None:
         pass
 
 
-__all__ = ["PooledStreamResponse", "pooled_https_post"]
+__all__ = ["PooledStreamResponse", "pooled_https_post", "reset_pool"]
