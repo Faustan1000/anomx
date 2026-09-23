@@ -103,6 +103,28 @@ def test_failed_compression_does_not_send_another_oversized_request(tmp_path, mo
     assert runtime.context_compression_state(session.path) is None
 
 
+def test_background_work_backend_resolves_with_env_var_only_api_key(tmp_path, monkeypatch):
+    """A DESY key set only via the environment must still resolve a summary model.
+
+    Reproduces "Context compression is required, but no summary model is
+    available": chat requests succeed because they check the environment
+    variable directly, but the background-work model lookup used for context
+    compression used to only check the stored auth file.
+    """
+
+    home = AnomxHome(tmp_path / "home")
+    home.save_config({**home.load_config(), "provider": "desy", "model": "coding"})
+    monkeypatch.setenv("DESY_ASSISTANT_API_KEY", "sk-env-only")
+    runtime = AgentRuntime(home, tmp_path)
+
+    background = runtime._background_work_backend("background_medium_work_model")
+
+    assert background is not None
+    backend, model = background
+    assert isinstance(backend, DesyAssistantBackend)
+    assert model == "coding"
+
+
 def test_desy_context_rejection_compresses_once_and_retries_without_repeating_tools(
     tmp_path, monkeypatch
 ):

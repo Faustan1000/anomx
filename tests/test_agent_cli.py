@@ -731,6 +731,22 @@ def test_api_key_is_written_to_owner_only_auth_file(tmp_path):
     assert mode == 0o600
 
 
+def test_has_api_key_recognizes_environment_variable(tmp_path, monkeypatch):
+    home = AnomxHome(tmp_path / "home")
+
+    assert home.has_api_key("desy") is False
+    assert "desy" not in home.connected_backend_keys()
+
+    monkeypatch.setenv("DESY_ASSISTANT_API_KEY", "sk-env-only")
+
+    # A key configured only via the provider's environment variable (common on a
+    # shared cluster) already makes real API calls succeed, so it must also count
+    # as "connected" here -- otherwise background-work model selection (used for
+    # context compression) can never find a summary model for that provider.
+    assert home.has_api_key("desy") is True
+    assert home.connected_backend_keys() == ["desy"]
+
+
 def test_platform_connection_is_written_to_owner_only_auth_file(tmp_path):
     home = AnomxHome(tmp_path / "home")
     home.set_platform_form_defaults(

@@ -50,6 +50,7 @@ class ProviderOption:
     allow_custom_model: bool = False
     connect_hint: str = "Connect to this AI backend"
     requires_api_key: bool = True
+    env_var: str = ""
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,7 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
         ("desy-assistant", "reasoning", "coding"),
         allow_custom_model=True,
         connect_hint="Connect to LLMs hosted on the Maxwell cluster",
+        env_var="DESY_ASSISTANT_API_KEY",
     ),
     ProviderOption(
         "blablador",
@@ -152,6 +154,7 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
         ),
         allow_custom_model=True,
         connect_hint="Connect to LLMs hosted on the Jülich Supercomputing Centre",
+        env_var="BLABLADOR_API_KEY",
     ),
     ProviderOption(
         "anthropic",
@@ -163,6 +166,7 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
         ),
         allow_custom_model=True,
         connect_hint="Connect to Claude models hosted by Anthropic",
+        env_var="ANTHROPIC_API_KEY",
     ),
     ProviderOption(
         "openai",
@@ -170,6 +174,7 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
         ("gpt-5.5", "gpt-5.4", "gpt-5.4-mini"),
         allow_custom_model=True,
         connect_hint="Connect to GPT models hosted by OpenAI",
+        env_var="OPENAI_API_KEY",
     ),
     ProviderOption(
         "ollama",
@@ -185,6 +190,7 @@ AI_PROVIDERS: tuple[ProviderOption, ...] = (
         ("kimi-k3", "kimi-k2.7-code", "kimi-k2.6"),
         allow_custom_model=True,
         connect_hint="Connect to Kimi models hosted by Moonshot AI",
+        env_var="MOONSHOT_API_KEY",
     ),
 )
 
@@ -1006,11 +1012,22 @@ class AnomxHome:
         self.save_auth(auth)
 
     def has_api_key(self, provider: str) -> bool:
-        """Return whether an API key is configured for a provider."""
+        """Return whether an API key is configured for a provider.
+
+        Checks the stored key first, then the provider's environment variable.
+        A key set only via the environment (a common way to configure this on a
+        shared cluster) still makes real API calls succeed, so without this check
+        the provider looks "connected" for chat but invisible to anything that
+        gates on `connected_backend_keys()` (background-work model selection,
+        context-compression summarization).
+        """
 
         auth = self.load_auth()
         api_keys = cast(dict[str, str], auth["api_keys"])
-        return bool(api_keys.get(provider))
+        if api_keys.get(provider):
+            return True
+        option = provider_by_key(provider)
+        return bool(option and option.env_var and os.environ.get(option.env_var))
 
     def remove_api_key(self, provider: str) -> None:
         """Remove a stored API key for a provider."""
