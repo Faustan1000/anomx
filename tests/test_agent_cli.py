@@ -1275,6 +1275,104 @@ def test_new_turn_resets_scroll_to_follow_the_growing_reply(tmp_path, monkeypatc
     assert captured[-1] == (0, True)
 
 
+def test_requeue_during_running_turn_resets_scroll_to_follow_the_growing_reply(
+    tmp_path, monkeypatch
+):
+    class StopCapture(Exception):
+        pass
+
+    class Viewport:
+        def __init__(self, scroll):
+            self.scroll = scroll
+
+    class Window:
+        def __init__(self, keys):
+            self._keys = iter(keys)
+
+        def get_wch(self):
+            return next(self._keys)
+
+        def nodelay(self, _flag):
+            pass
+
+        def getmaxyx(self):
+            return 24, 80
+
+    class FakeWorker:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            del timeout
+
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    app = AnomxCliApp(home=home, cwd=repo, use_color=False)
+
+    first_turn = ui_module.ActiveSessionTurn(
+        session=session,
+        runtime=app.runtime,
+        events=queue.SimpleQueue(),
+        result={},
+        turn_id="turn-1",
+        started_at=time.monotonic(),
+        worker=FakeWorker(),
+        mode=AgentMode.STANDARD,
+    )
+    app._active_session_turns[app._session_turn_key(session)] = first_turn
+
+    replacement_turn = ui_module.ActiveSessionTurn(
+        session=session,
+        runtime=app.runtime,
+        events=queue.SimpleQueue(),
+        result={},
+        turn_id="turn-2",
+        started_at=time.monotonic(),
+        worker=FakeWorker(),
+        mode=AgentMode.STANDARD,
+    )
+
+    def fake_start_session_turn(target_session, runtime=None):
+        del runtime
+        app._active_session_turns[app._session_turn_key(target_session)] = replacement_turn
+        return replacement_turn
+
+    monkeypatch.setattr(app, "_start_session_turn", fake_start_session_turn)
+    monkeypatch.setattr(app.runtime, "abort_current_turn", lambda _path: None)
+    monkeypatch.setattr(app, "_drain_session_turn_events", lambda *_a, **_kw: None)
+
+    # The replacement turn takes over the interrupted turn's turn_id for
+    # continuity, so identify it by object identity instead.
+    captured: list[tuple[int, bool]] = []
+
+    def fake_draw_session(_stdscr, _session, _messages, _input_text, _cursor, scroll, *_a, **kwargs):
+        if "sticky_anchor" not in kwargs:
+            return Viewport(scroll)
+        active = app._active_turn_for_session(session)
+        is_replacement = active is replacement_turn
+        captured.append((scroll, is_replacement))
+        if is_replacement:
+            raise StopCapture
+        return Viewport(scroll)
+
+    monkeypatch.setattr(app, "_draw_session", fake_draw_session)
+
+    # Scroll up to read earlier output while a turn is already running, then submit
+    # a correction that interrupts and requeues it.
+    window = Window([curses.KEY_PPAGE, "h", "i", "\n"])
+    try:
+        app._run_session(window, session)
+    except StopCapture:
+        pass
+
+    assert any(scroll > 0 for scroll, is_replacement in captured if not is_replacement)
+    # The first draw for the requeued turn must be back at scroll 0, not carrying
+    # over the offset left by reading earlier output while the prior turn ran.
+    assert captured[-1] == (0, True)
+
+
 def test_running_enter_submits_plain_message(tmp_path):
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"

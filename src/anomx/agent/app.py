@@ -1580,6 +1580,11 @@ class AnomxCliApp(
                 if key_result.back_requested:
                     return "project"
                 if key_result.submitted_message:
+                    # A prior turn may have left the view scrolled away from the
+                    # bottom; without resetting here, requeuing a message while a
+                    # turn is still running leaves the new streaming reply stuck
+                    # off-screen, same as the idle-submit case above.
+                    scroll = 0
                     self._interrupt_and_requeue_session_turn(
                         stdscr,
                         active_turn,
@@ -3182,6 +3187,10 @@ class AnomxCliApp(
                             back_requested=True,
                         )
                     if key_result.submitted_message:
+                        # See the matching reset in the idle-submit path: leaving
+                        # running_scroll non-zero here strands the new reply
+                        # off-screen when requeuing over an in-flight turn.
+                        running_scroll = 0
                         self._interrupt_and_requeue_session_turn(
                             stdscr,
                             turn,
