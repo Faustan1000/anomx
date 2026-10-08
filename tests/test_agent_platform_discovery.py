@@ -25,6 +25,8 @@ def respond(monkeypatch, payloads):
     responses = iter(payloads)
 
     def urlopen(request, **kwargs):
+        if "/channels/search?" in request.full_url:
+            raise HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO(b'{}'))
         calls.append(request)
         payload = next(responses)
         if isinstance(payload, Exception):
@@ -40,6 +42,64 @@ def respond(monkeypatch, payloads):
 
 def execute(runtime, name, **arguments):
     return json.loads(runtime._execute_tool(name, arguments, RuntimeCallbacks()))
+
+
+@pytest.mark.parametrize("paginated", [False, True])
+def test_object_search_keeps_references_without_inlining_full_objects(
+    runtime, monkeypatch, tmp_path, paginated,
+):
+    reference = "jobs_job-3d753a8c-cc5f-4543-9abd-891a5a166d8d"
+    item = {
+        "id": reference.split("-", 1)[1],
+        "name": "Detuning recording",
+        "identifier": "XFEL.RF/" + "LONG-PATH/" * 40 + "DETUNING",
+        "description": "Recorded detuning. " * 200,
+        "details": {"recursive_history": "measurement " * 40_000},
+        "last_value": list(range(10_000)),
+        "_anomx": {"object_reference": reference, "model_reference": "jobs_job"},
+    }
+    payload = {
+        "items": [item], "total": 30, "page": 1, "limit": 25,
+        "has_more": True, "next_page": 2, "next_offset": 25,
+    } if paginated else [item]
+    calls = respond(monkeypatch, [payload, item])
+    model_calls = []
+    runtime.context_optimizer = lambda *_: model_calls.append(True) or "Digest"
+    runtime.home.save_config({**runtime.home.load_config(), "maximum_context_tokens": 256_000})
+    session = runtime.home.create_session(tmp_path, provider="openai", model="gpt-5.5")
+    result = json.loads(runtime._execute_tool(
+        "search_anomx_objects", {"query": "detuning", "limit": 25},
+        RuntimeCallbacks(), session.path,
+    ))
+    summary = result["results"]["items"][0] if paginated else result["results"][0]
+    assert summary["object_reference"] == summary["_anomx"]["object_reference"] == reference
+    assert summary["identifier"] == item["identifier"]
+    assert summary["name"] == item["name"]
+    assert summary["description_truncated"] is True
+    assert "details" not in summary and "last_value" not in summary
+    assert result["result_mode"] == "summaries"
+    assert len(json.dumps(result)) < 5_000
+    assert model_calls == []
+    assert json.loads(Path(result["request"]["response_path"]).read_text()) == payload
+    if paginated:
+        assert {k: v for k, v in result["results"].items() if k != "items"} == {
+            k: v for k, v in payload.items() if k != "items"
+        }
+    details = execute(runtime, "get_anomx_object_details", object_reference=reference)
+    assert details["result_mode"] == "file"
+    assert json.loads(Path(details["result_path"]).read_text())["object"] == item
+    assert calls[1].full_url.endswith("/objects/" + reference)
+
+
+@pytest.mark.parametrize("payload", [{"error": "unavailable"}, {"items": ["invalid"]}])
+def test_object_search_invalid_payload_is_not_presented_as_empty_results(
+    runtime, monkeypatch, payload,
+):
+    respond(monkeypatch, [payload])
+    result = execute(runtime, "search_anomx_objects", query="detuning")
+    assert result["ok"] is False
+    assert "results" not in result
+    assert json.loads(Path(result["request"]["response_path"]).read_text()) == payload
 
 
 def test_live_channel_search_uses_deployed_routes_and_retains_pagination(runtime, monkeypatch):
@@ -86,6 +146,28 @@ def test_search_http_failure_is_not_a_successful_empty_result(runtime, monkeypat
     assert result["request"]["status_code"] == 404
     assert result["request"]["response"] == {"detail": "Not found."}
     assert "channels" not in result
+    assert len(calls) == 1
+
+
+def test_api_route_failure_does_not_present_django_debug_routes_as_instructions(
+    runtime, monkeypatch
+):
+    debug_page = b"<html>Django URL patterns: api/v1/data/channels, v1/data/channels</html>"
+    calls = respond(monkeypatch, [HTTPError(
+        "https://platform.test/api/channels", 404, "Not Found",
+        {"content-type": "text/html"}, io.BytesIO(debug_page),
+    )])
+
+    result = execute(runtime, "use_anomx_api", method="GET", path="/channels")
+
+    assert result["ok"] is False
+    assert result["status_code"] == 404
+    assert result["response_truncated"] is True
+    assert "routing/configuration error" in result["response"]["detail"]
+    assert "api/v1" not in json.dumps(result["response"])
+    assert json.loads(Path(result["response_path"]).read_text()) == {
+        "content": debug_page.decode(),
+    }
     assert len(calls) == 1
 
 
@@ -140,6 +222,8 @@ def test_background_runs_do_not_reintroduce_compression_metadata(runtime, monkey
     payload = {"items": items[20:40], "total": 45} if paginated else items
     respond(monkeypatch, [payload])
     result = execute(runtime, "get_background_runs", page=2)
+    if result.get("result_mode") == "file":
+        result = json.loads(Path(result["result_path"]).read_text())
     assert [run["id"] for run in result["runs"]] == [str(i) for i in range(20, 40)]
     assert result["next_page"] == 3
     assert result["total"] == 45

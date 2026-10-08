@@ -17,6 +17,8 @@ from enum import StrEnum
 from pathlib import Path
 
 from anomx.agent.helpers.mode import AgentMode
+from anomx.agent.helpers.read_only_python import read_only_python_paths
+from anomx.agent.helpers.tool_results import MAX_INLINE_RESULT_CHARACTERS, store_tool_result
 
 
 class CommandSafety(StrEnum):
@@ -70,6 +72,7 @@ class CommandApprovalRequest:
     evaluation: CommandRiskEvaluation | None = None
     agent_id: str = ""
     agent_name: str = ""
+    requires_user_approval: bool = False
 
 
 @dataclass(frozen=True)
@@ -413,7 +416,7 @@ class CliToolManager:
         root: Path,
         session_allowed_commands: MutableSet[str] | None = None,
         session_rejected_commands: MutableSet[str] | None = None,
-        mode: AgentMode = AgentMode.STANDARD,
+        mode: AgentMode = AgentMode.AUTOMATIC,
         *,
         current_dir: Path | None = None,
         cancel_event: threading.Event | None = None,
@@ -421,6 +424,7 @@ class CliToolManager:
         strict_workspace: bool = False,
         trusted_roots: Sequence[Path] | None = None,
         background_api_scoped: bool = False,
+        result_directory: Path | None = None,
     ) -> None:
         self.root = root.expanduser().resolve()
         self.trusted_roots = self._normalize_trusted_roots(trusted_roots)
@@ -434,6 +438,7 @@ class CliToolManager:
         self.subprocess_env = dict(subprocess_env) if subprocess_env is not None else None
         self.strict_workspace = strict_workspace
         self.background_api_scoped = background_api_scoped
+        self.result_directory = result_directory
 
     def set_mode(self, mode: AgentMode) -> None:
         """Set the active command execution mode."""
@@ -545,8 +550,10 @@ class CliToolManager:
         path: str,
         statement: str,
         approval_callback: ApprovalCallback | None,
+        *,
+        body: Mapping[str, object] | None = None,
     ) -> CommandResult | None:
-        """Authorize an Anomx API request through the command policy pipeline."""
+        """Enforce background scope without routing structured tools to command review."""
 
         normalized_method = method.strip().upper()
         normalized_path = "/" + path.strip().split("?", 1)[0].strip("/")
@@ -571,21 +578,7 @@ class CliToolManager:
                 blocked_by_mode=True,
             )
 
-        policy = CommandPolicy(
-            CommandSafety.APPROVE,
-            "This Anomx Platform API request can change persistent platform state.",
-            canonical_request,
-            f"api:{normalized_method}:{normalized_path}",
-            f"{normalized_method} {normalized_path}",
-            canonical_request,
-        )
-        authorization = self._authorize_policy(
-            policy,
-            canonical_request,
-            statement,
-            approval_callback,
-        )
-        return authorization if isinstance(authorization, CommandResult) else None
+        return None
 
     def _authorize_policy(
         self,
@@ -597,33 +590,30 @@ class CliToolManager:
         """Apply the active mode and optional user approval to a classified policy."""
 
         mode_policy = self.mode.policy
+        requires_user_approval = policy.safety == CommandSafety.FORBIDDEN
         if policy.safety == CommandSafety.FORBIDDEN:
-            if not mode_policy.bypass_command_policy or not policy.canonical_command:
+            if (
+                self.mode not in {AgentMode.AUTOMATIC, AgentMode.STANDARD}
+                or not policy.canonical_command
+                or self._session_rejects_command(policy.canonical_command, True)
+            ):
                 return CommandResult(
-                    self._user_blocked_output(policy.reason),
+                    f"Command blocked by deterministic policy: {policy.reason}"
+                    if self.mode == AgentMode.AUTONOMOUS
+                    else self._user_blocked_output(policy.reason),
                     approved=False,
                     safety=policy.safety,
                     command=policy.canonical_command,
                     reason=policy.reason,
+                    blocked_by_mode=self.mode == AgentMode.AUTONOMOUS,
                 )
             policy = CommandPolicy(
-                CommandSafety.ALLOW,
-                f"Autonomous mode bypassed command policy: {policy.reason}",
+                CommandSafety.APPROVE,
+                policy.reason,
                 policy.canonical_command,
                 policy.allowance_key,
                 policy.allowance_label,
                 policy.allowance_subject,
-            )
-
-        if mode_policy.read_only and policy.safety != CommandSafety.ALLOW:
-            reason = "Plan mode allows read operations only."
-            return CommandResult(
-                self._user_blocked_output(reason),
-                approved=False,
-                safety=policy.safety,
-                command=policy.canonical_command,
-                reason=reason,
-                blocked_by_mode=True,
             )
 
         if (
@@ -639,7 +629,7 @@ class CliToolManager:
                 policy.allowance_label or self._allowance_label(policy.canonical_command),
                 policy.allowance_subject or self._allowance_subject(policy.canonical_command),
             )
-        elif self._mode_allows_policy(policy):
+        elif not requires_user_approval and self._mode_allows_policy(policy):
             policy = CommandPolicy(
                 CommandSafety.ALLOW,
                 (
@@ -670,6 +660,7 @@ class CliToolManager:
                     allowance_key=policy.allowance_key,
                     allowance_label=policy.allowance_label,
                     allowance_subject=policy.allowance_subject,
+                    requires_user_approval=requires_user_approval,
                 )
             )
             if decision == ApprovalChoice.REJECT:
@@ -792,6 +783,9 @@ class CliToolManager:
             return CommandPolicy(CommandSafety.FORBIDDEN, "Empty command.", normalized)
 
         executable = Path(parts[0]).name
+        python_policy = self._read_only_python_policy(parts, normalized)
+        if python_policy is not None:
+            return python_policy
         path_error = self._path_error(parts)
         if path_error is not None:
             return self._path_approval_policy(path_error, normalized)
@@ -1138,6 +1132,9 @@ class CliToolManager:
             return CommandPolicy(CommandSafety.FORBIDDEN, "Empty command.", normalized)
 
         executable = Path(parts[0]).name
+        python_policy = self._read_only_python_policy(parts, normalized)
+        if python_policy is not None:
+            return python_policy
         path_error = self._path_error(parts)
         if path_error is not None:
             return self._path_approval_policy(path_error, normalized)
@@ -1198,7 +1195,26 @@ class CliToolManager:
             return key, f"{subject} commands", subject
         return normalized, "this exact command", "this command"
 
+    def _read_only_python_policy(self, parts: list[str], normalized: str) -> CommandPolicy | None:
+        paths = read_only_python_paths(parts)
+        if paths is None:
+            return None
+        for path in paths:
+            # Python does not expand '~' in open(), so use its literal path semantics.
+            resolved = (self.current_dir / path).resolve()
+            if not self._inside_workspace(resolved):
+                return self._path_approval_policy(
+                    f"Path is outside the trusted workspace: {path}", normalized
+                )
+        return CommandPolicy(CommandSafety.ALLOW, "Read-only Python data inspection.", normalized)
+
     def _path_error(self, parts: list[str]) -> str | None:
+        python_paths = read_only_python_paths(parts)
+        if python_paths is not None:
+            for path in python_paths:
+                if not self._inside_workspace((self.current_dir / path).resolve()):
+                    return f"Path is outside the trusted workspace: {path}"
+            return None
         for part in self._path_candidate_arguments(parts):
             if part.startswith("-") or "://" in part:
                 continue
@@ -1212,14 +1228,13 @@ class CliToolManager:
         return None
 
     def _path_approval_policy(self, reason: str, normalized: str) -> CommandPolicy:
-        safety = CommandSafety.FORBIDDEN if self.strict_workspace else CommandSafety.APPROVE
         resolved_reason = (
-            f"{reason} Strict sandbox mode does not permit path approvals."
+            f"{reason} This violates the configured workspace boundary."
             if self.strict_workspace
             else reason
         )
         return CommandPolicy(
-            safety,
+            CommandSafety.FORBIDDEN,
             resolved_reason,
             normalized,
             self._allowance_key(normalized),
@@ -1336,6 +1351,8 @@ class CliToolManager:
     def _allowanced_shell_path_error(self, normalized: str) -> str | None:
         policy_source = self._strip_heredoc_bodies(normalized)
         if not self._has_shell_syntax(policy_source):
+            with suppress(ValueError):
+                return self._path_error(shlex.split(policy_source))
             return None
 
         command_segments = self._shell_segments(
@@ -1616,8 +1633,9 @@ class CliToolManager:
             lines.extend(f"  - {root}" for root in extra_roots)
         if self.strict_workspace:
             lines.append(
-                "- Strict sandbox mode is active. You cannot request path approvals "
-                "or use shell syntax to leave the trusted workspace roots."
+                "- Workspace boundary checks are active. Paths outside trusted roots "
+                "require explicit user approval in Standard or Automatic mode and are "
+                "blocked in Autonomous mode. Approval does not change OS sandbox permissions."
             )
         return lines
 
@@ -1658,6 +1676,8 @@ class CliToolManager:
         return None
 
     def _is_known_read_only_command(self, executable: str, parts: list[str]) -> bool:
+        if executable in {"python", "python3"} and parts[1:] == ["-m", "json.tool"]:
+            return True
         if executable in READ_ONLY_COMMAND_NAMES:
             return True
         if executable == "find":
@@ -2028,6 +2048,10 @@ class CliToolManager:
 
     def _abbreviate_command_output(self, output: str) -> str:
         lines = output.splitlines()
+        if self.result_directory is not None and (
+            len(output) > MAX_INLINE_RESULT_CHARACTERS or len(lines) > MAX_COMMAND_OUTPUT_ROWS
+        ):
+            return store_tool_result(output, self.result_directory, tool="run_command")
         if len(lines) <= MAX_COMMAND_OUTPUT_ROWS:
             return output
         if MAX_COMMAND_OUTPUT_ROWS <= 0:

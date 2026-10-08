@@ -9,11 +9,13 @@ import sys
 import threading
 import time
 import tomllib
+import urllib.request
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
 
+import anomx.agent.base.backends as backends_module
 import anomx.agent.helpers.platform_client as platform_client_module
 import anomx.agent.helpers.tool_manager as tool_manager_module
 import anomx.agent.runtime as runtime_module
@@ -203,12 +205,12 @@ def test_require_trusted_repo_config_is_always_true(tmp_path):
 
 def test_agent_mode_config_defaults_and_normalizes(tmp_path):
     home = AnomxHome(tmp_path / "home")
-    assert home.load_config()["agent_mode"] == AgentMode.STANDARD.value
+    assert home.load_config()["agent_mode"] == AgentMode.AUTOMATIC.value
 
     home.ensure()
     home.config_path.write_text('agent_mode = "invalid"\n', encoding="utf-8")
 
-    assert home.load_config()["agent_mode"] == AgentMode.STANDARD.value
+    assert home.load_config()["agent_mode"] == AgentMode.AUTOMATIC.value
 
     home.config_path.write_text('agent_mode = "full-control"\n', encoding="utf-8")
 
@@ -590,9 +592,9 @@ def test_thinking_tag_filter_hides_complete_and_unfinished_reasoning():
     text_filter = ThinkingTagStreamFilter()
     visible, _ = text_filter.feed("<think>The user said hello. I should reply warmly.\n\nHi there!")
     assert visible == ""
-    assert text_filter.finish() == "Hi there!"
+    assert text_filter.finish() == ""
     assert text_filter.drain_completed_thoughts() == (
-        "The user said hello. I should reply warmly.",
+        "The user said hello. I should reply warmly.\n\nHi there!",
     )
 
 
@@ -661,7 +663,7 @@ def test_blablador_recovers_final_answer_after_unclosed_think_block(tmp_path, mo
     }
 
 
-def test_blablador_recovers_separated_final_text_from_unclosed_think_block(
+def test_blablador_never_promotes_structured_reasoning_to_final_text(
     tmp_path,
     monkeypatch,
 ):
@@ -700,9 +702,9 @@ def test_blablador_recovers_separated_final_text_from_unclosed_think_block(
         thoughts.append,
     )
 
-    assert response.text == "Hi Theo! How can I help you today?"
-    assert deltas == ["Hi Theo! How can I help you today?"]
-    assert thoughts == ["The user just said hello. I should reply warmly."]
+    assert response.text == ""
+    assert deltas == []
+    assert thoughts == ["The user just said hello. I should reply warmly.\n\nHi Theo! How can I help you today?"]
 
 
 def test_thinking_intensity_options_are_model_specific():
@@ -3526,38 +3528,14 @@ def test_prompt_bar_can_skip_top_rule_below_activity_panel(tmp_path):
 def test_agent_mode_cycles_and_updates_runtime(tmp_path):
     home = AnomxHome(tmp_path / "home")
     app = AnomxCliApp(home=home)
-
-    app._cycle_agent_mode()
     assert app.agent_mode == AgentMode.AUTOMATIC
-    assert app.runtime.tool_manager.mode == AgentMode.AUTOMATIC
-    assert app.active_agent.kind.value == "main"
-    assert app._mode_hint_attr_name() == "warning"
-    assert home.load_config()["agent_kind"] == "main"
-    assert home.load_config()["agent_mode"] == AgentMode.AUTOMATIC.value
-
-    app._cycle_agent_mode()
-    assert app.agent_mode == AgentMode.AUTONOMOUS
-    assert app.runtime.tool_manager.mode == AgentMode.AUTONOMOUS
-    assert app.active_agent.kind.value == "main"
-    assert app._mode_hint_attr_name() == "danger"
-    assert home.load_config()["agent_kind"] == "main"
-    assert home.load_config()["agent_mode"] == AgentMode.AUTONOMOUS.value
-
-    app._cycle_agent_mode()
-    assert app.agent_mode == AgentMode.PLAN
-    assert app.runtime.tool_manager.mode == AgentMode.PLAN
-    assert app.active_agent.kind.value == "main"
-    assert app._mode_hint_attr_name() == "light"
-    assert home.load_config()["agent_kind"] == "main"
-    assert home.load_config()["agent_mode"] == AgentMode.PLAN.value
-
-    app._cycle_agent_mode()
-    assert app.agent_mode == AgentMode.STANDARD
-    assert app.runtime.tool_manager.mode == AgentMode.STANDARD
-    assert app.active_agent.kind.value == "main"
-    assert app._mode_hint_attr_name() == "light"
-    assert home.load_config()["agent_kind"] == "main"
-    assert home.load_config()["agent_mode"] == AgentMode.STANDARD.value
+    for mode, attr in [(AgentMode.AUTONOMOUS, "danger"), (AgentMode.STANDARD, "light"), (AgentMode.AUTOMATIC, "warning")]:
+        app._cycle_agent_mode()
+        assert app.agent_mode == mode
+        assert app.runtime.tool_manager.mode == mode
+        assert app.active_agent.kind.value == "main"
+        assert app._mode_hint_attr_name() == attr
+        assert home.load_config()["agent_mode"] == mode.value
 
 
 def test_agent_mode_cycle_excludes_background_when_platform_is_connected(tmp_path):
@@ -3571,7 +3549,7 @@ def test_agent_mode_cycle_excludes_background_when_platform_is_connected(tmp_pat
         hostname="agent-host",
     )
     app = AnomxCliApp(home=home)
-    app._activate_agent_mode(AgentMode.PLAN)
+    app._activate_agent_mode(AgentMode.AUTONOMOUS)
 
     app._cycle_agent_mode()
 
@@ -3587,8 +3565,8 @@ def test_recommend_mode_is_unavailable_without_platform_connection(tmp_path):
 
     app = AnomxCliApp(home=home)
 
-    assert app.agent_mode == AgentMode.STANDARD
-    assert app._activate_agent_mode(AgentMode.RECOMMEND) == AgentMode.STANDARD
+    assert app.agent_mode == AgentMode.AUTOMATIC
+    assert app._activate_agent_mode(AgentMode.RECOMMEND) == AgentMode.AUTOMATIC
 
 
 def test_agent_mode_cycles_persist_on_selected_session(tmp_path):
@@ -3612,12 +3590,12 @@ def test_agent_mode_cycles_persist_on_selected_session(tmp_path):
         mode=AgentMode.STANDARD,
     )
 
-    assert next_mode == AgentMode.AUTOMATIC
-    assert stored_session.mode == AgentMode.AUTOMATIC
+    assert next_mode == AgentMode.AUTONOMOUS
+    assert stored_session.mode == AgentMode.AUTONOMOUS
     assert stored_session.agent_kind.value == "main"
     assert other_session.mode == AgentMode.STANDARD
-    assert app._session_mode_symbol(stored_session) == AgentMode.AUTOMATIC.symbol
-    assert home.load_config()["agent_mode"] == AgentMode.STANDARD.value
+    assert app._session_mode_symbol(stored_session) == AgentMode.AUTONOMOUS.symbol
+    assert home.load_config()["agent_mode"] == AgentMode.AUTOMATIC.value
 
 
 def test_app_normalizes_legacy_agent_kind_without_changing_mode(tmp_path):
@@ -3629,8 +3607,8 @@ def test_app_normalizes_legacy_agent_kind_without_changing_mode(tmp_path):
     app = AnomxCliApp(home=home)
 
     assert app.active_agent.kind.value == "main"
-    assert app.agent_mode == AgentMode.STANDARD
-    assert app.runtime.tool_manager.mode == AgentMode.STANDARD
+    assert app.agent_mode == AgentMode.AUTOMATIC
+    assert app.runtime.tool_manager.mode == AgentMode.AUTOMATIC
 
 
 def test_running_ctrl_c_confirmation_requests_interrupt_without_writing(tmp_path):
@@ -4806,9 +4784,9 @@ def test_openai_stream_retries_transient_http_errors_before_success(
             )
         return FakeResponse()
 
-    monkeypatch.setattr(runtime_module, "MODEL_REQUEST_RETRY_COUNT", 2)
-    monkeypatch.setattr(runtime_module, "MODEL_REQUEST_RETRY_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(runtime_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(backends_module, "MODEL_REQUEST_RETRY_COUNT", 2)
+    monkeypatch.setattr(backends_module, "MODEL_REQUEST_RETRY_INITIAL_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     response = runtime._stream_openai_response(
         "sk-test",
@@ -4820,7 +4798,7 @@ def test_openai_stream_retries_transient_http_errors_before_success(
     assert isinstance(response, runtime_module.OpenAIStreamResponse)
     assert response.text == "done"
     assert attempts == 3
-    assert statuses == ["Reconnecting", "Reconnecting"]
+    assert statuses == ["Reconnecting 1/2", "Reconnecting 2/2"]
 
 
 def test_openai_stream_returns_http_error_after_retries_are_exhausted(
@@ -4842,9 +4820,9 @@ def test_openai_stream_returns_http_error_after_retries_are_exhausted(
             fp=io.BytesIO(b'{"error":{"message":"temporary"}}'),
         )
 
-    monkeypatch.setattr(runtime_module, "MODEL_REQUEST_RETRY_COUNT", 2)
-    monkeypatch.setattr(runtime_module, "MODEL_REQUEST_RETRY_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(runtime_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(backends_module, "MODEL_REQUEST_RETRY_COUNT", 2)
+    monkeypatch.setattr(backends_module, "MODEL_REQUEST_RETRY_INITIAL_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     response = runtime._stream_openai_response(
         "sk-test",
@@ -4855,7 +4833,7 @@ def test_openai_stream_returns_http_error_after_retries_are_exhausted(
 
     assert response == "OpenAI request failed (503): temporary"
     assert attempts == 3
-    assert statuses == ["Reconnecting", "Reconnecting"]
+    assert statuses == ["Reconnecting 1/2", "Reconnecting 2/2"]
 
 
 def test_debug_normalizes_tool_blocks_as_message_keys():
@@ -5540,9 +5518,9 @@ def test_desy_stream_retries_transient_404_before_success(tmp_path, monkeypatch)
             )
         return FakeResponse()
 
-    monkeypatch.setattr(runtime_module, "MODEL_REQUEST_RETRY_COUNT", 1)
-    monkeypatch.setattr(runtime_module, "MODEL_REQUEST_RETRY_INITIAL_DELAY_SECONDS", 0.0)
-    monkeypatch.setattr(runtime_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(backends_module, "MODEL_REQUEST_RETRY_COUNT", 1)
+    monkeypatch.setattr(backends_module, "MODEL_REQUEST_RETRY_INITIAL_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     response = runtime._stream_desy_response(
         "sk-desy-test",
@@ -5554,7 +5532,7 @@ def test_desy_stream_retries_transient_404_before_success(tmp_path, monkeypatch)
     assert isinstance(response, runtime_module.AnthropicStreamResponse)
     assert response.text == "OK"
     assert attempts == 2
-    assert statuses == ["Reconnecting"]
+    assert statuses == ["Reconnecting 1/1"]
 
 
 def test_ollama_response_reports_loading_model_status(tmp_path, monkeypatch):
@@ -7205,7 +7183,7 @@ def test_work_summary_keeps_turn_local_agent_messages_visible(tmp_path):
 
     assert app._read_message_lines(session.path) == [
         MessageLine("agent", "I am checking the repository.", "turn-1"),
-        MessageLine("work_summary", "Worked for 00:01 min", "turn-1"),
+        MessageLine("work_summary", "Worked for 00:01 min", "work:turn-1"),
         MessageLine("agent", "Final response"),
     ]
 
@@ -7294,19 +7272,16 @@ def test_work_summary_keeps_requeued_user_messages_in_order(tmp_path):
 
     assert app._read_message_lines(session.path) == [
         MessageLine("user", "What is this repo?"),
-        MessageLine(
-            "agent_intermediate", "Let me explore the repository structure.", "turn-1",
-        ),
-        MessageLine("work_summary", "List root directory", "turn-1"),
-        MessageLine("user", "Lets go deep!", "turn-1"),
-        MessageLine("work_summary", "Inspect package internals", "turn-1:1"),
+        MessageLine("work_summary", "Interrupted after 00:05", "work:turn-1"),
         MessageLine("agent", MANUAL_INTERRUPT_MESSAGE),
     ]
 
+    app._toggle_work_turn("work:turn-1")
     app._toggle_work_turn("turn-1")
 
     assert app._read_message_lines(session.path) == [
         MessageLine("user", "What is this repo?"),
+        MessageLine("work_summary", "Interrupted after 00:05 · collapse", "work:turn-1"),
         MessageLine(
             "agent_intermediate",
             "Let me explore the repository structure.",
@@ -7359,16 +7334,16 @@ def test_work_summary_keeps_late_turn_local_messages_in_order(tmp_path):
 
     assert app._read_message_lines(session.path) == [
         MessageLine("user", "Inspect this repo"),
-        MessageLine("work_summary", "Reading README", "turn-1"),
-        MessageLine("agent_intermediate", "I found the main mismatch.", "turn-1"),
-        MessageLine("work_summary", "Reading route file", "turn-1:1"),
+        MessageLine("work_summary", "Worked for 00:02 min", "work:turn-1"),
         MessageLine("agent", "Final response"),
     ]
 
+    app._toggle_work_turn("work:turn-1")
     app._toggle_work_turn("turn-1")
 
     assert app._read_message_lines(session.path) == [
         MessageLine("user", "Inspect this repo"),
+        MessageLine("work_summary", "Worked for 00:02 min · collapse", "work:turn-1"),
         MessageLine("tool", "Reading README", "turn-1"),
         MessageLine("work_summary", "Reading README · collapse", "turn-1"),
         MessageLine("agent_intermediate", "I found the main mismatch.", "turn-1"),
@@ -7803,7 +7778,7 @@ def test_runtime_tool_schemas_are_role_specific(tmp_path):
             "get_anomx_data_channel_history",
             "get_anomx_object_details",
             "get_subagent_info",
-            "output_response",
+            "produce_output",
             "search_anomx_data_channels",
             "search_anomx_objects",
             "update_plan",
@@ -8218,17 +8193,19 @@ def test_runtime_enriches_command_approval_request(tmp_path, monkeypatch):
     def fake_evaluate(*, command, statement, user_message, model):
         assert command == "rm -rf build"
         assert statement == "Remove generated build output"
-        assert user_message == "Clean generated assets"
+        assert "Clean generated assets" in user_message
+        assert "Leave source files alone" in user_message
         assert model == "gpt-5.5"
         return CommandRiskEvaluation("high", "Deletes generated assets recursively.")
 
     class FakeBackend:
         evaluate_command_request = staticmethod(fake_evaluate)
 
+    home.append_session_event(
+        session.path, "user_message", {"message": "Leave source files alone"}
+    )
     monkeypatch.setattr(
-        runtime_module,
-        "backend_for_provider",
-        lambda _provider, _runtime: FakeBackend(),
+        runtime, "background_backend_resolver", lambda _key, _runtime: (FakeBackend(), "gpt-5.5")
     )
     evaluation = runtime.evaluate_command_request(session.path, request)
 
@@ -8267,7 +8244,7 @@ def test_openai_command_evaluation_uses_structured_output(tmp_path, monkeypatch)
 
     def fake_urlopen(request, timeout):
         captured_payload.update(json.loads(request.data.decode("utf-8")))
-        assert timeout == 8
+        assert timeout == 30
         return FakeResponse()
 
     monkeypatch.setattr(openai_module.urllib.request, "urlopen", fake_urlopen)
@@ -8280,6 +8257,8 @@ def test_openai_command_evaluation_uses_structured_output(tmp_path, monkeypatch)
     )
 
     assert evaluation == CommandRiskEvaluation("medium", "Runs a package build script.")
+    assert captured_payload["max_output_tokens"] == 4096
+    assert "Check whether the project builds" in captured_payload["input"][0]["content"]
     assert captured_payload["text"] == {
         "format": {
             "type": "json_schema",
@@ -8738,7 +8717,7 @@ def test_plan_validation_work_is_turn_scoped_and_collapsible(tmp_path, monkeypat
     home.append_session_event(session.path, "agent_message", {"message": "Final answer"})
 
     assert app._read_message_lines(session.path) == [
-        MessageLine("work_summary", "Worked for 00:04 min", "turn-1"),
+        MessageLine("work_summary", "Worked for 00:04 min", "work:turn-1"),
         MessageLine("agent", "Final answer"),
     ]
 
@@ -8953,7 +8932,7 @@ def test_subagent_tool_schemas_are_role_specific(tmp_path):
         "finish_anyways",
         "get_subagent_info",
         "memorize",
-        "output_response",
+        "produce_output",
         "prompt_subagent",
         "remove_plan",
         "remove_subagent",
@@ -8963,19 +8942,10 @@ def test_subagent_tool_schemas_are_role_specific(tmp_path):
     }.isdisjoint(subagent_tools)
 
 
-def test_plan_mode_denies_write_commands(tmp_path):
-    runtime = AgentRuntime(AnomxHome(tmp_path / "home"), tmp_path, mode=AgentMode.PLAN)
-
-    output = runtime._execute_tool(
-        "run_command",
-        {"statement": "Trying write", "command": "touch should-not-exist"},
-        RuntimeCallbacks(),
-    )
-
-    payload = json.loads(output)
-    assert payload["approved"] is False
-    assert payload["safety"] == "forbidden"
-    assert "read-only" in payload["output"]
+def test_legacy_plan_mode_migrates_to_automatic(tmp_path):
+    runtime = AgentRuntime(AnomxHome(tmp_path / "home"), tmp_path, mode=AgentMode.parse("plan"))
+    assert runtime.tool_manager.mode is AgentMode.AUTOMATIC
+    assert "ask_question" in {tool["name"] for tool in runtime._tool_definitions()}
 
 
 def test_build_runtime_starts_subagent_and_persists_events(tmp_path, monkeypatch):
@@ -10347,7 +10317,7 @@ def test_streaming_delta_waits_to_collapse_until_turn_completion(tmp_path, monke
     assert turn.work_summary_appended is True
     assert captured_final_render == {"anchor_line": 7, "scroll": 3}
     assert app._read_message_lines(session.path) == [
-        MessageLine("work_summary", "Worked for 00:03", "turn-1"),
+        MessageLine("work_summary", "Worked for 00:03", "work:turn-1"),
         MessageLine("agent", "Final answer"),
     ]
 
@@ -11233,8 +11203,8 @@ def test_command_manager_classifies_allow_approve_forbidden(tmp_path):
     assert manager.classify("› sed -n 1,5p pyproject.toml").canonical_command == (
         "sed -n 1,5p pyproject.toml"
     )
-    assert manager.classify("sed -n 1,5p /etc/passwd").safety == CommandSafety.APPROVE
-    assert manager.classify("cat /etc/passwd").safety == CommandSafety.APPROVE
+    assert manager.classify("sed -n 1,5p /etc/passwd").safety == CommandSafety.FORBIDDEN
+    assert manager.classify("cat /etc/passwd").safety == CommandSafety.FORBIDDEN
     assert manager.classify("reboot").safety == CommandSafety.APPROVE
     assert manager.classify("echo sudo").safety == CommandSafety.ALLOW
     assert manager.classify(r'grep -rn "@\|mention\|file_picker" src').safety == CommandSafety.ALLOW
@@ -11419,23 +11389,10 @@ def test_command_manager_modes_control_approval(tmp_path):
         None,
     )
 
-    assert standard_read.approved is False
-    assert standard_read.safety == CommandSafety.APPROVE
+    assert standard_read.approved is True
+    assert standard_read.safety == CommandSafety.ALLOW
     assert standard_execute.approved is False
     assert standard_execute.safety == CommandSafety.APPROVE
-
-    plan = CliToolManager(repo, mode=AgentMode.PLAN)
-    plan_read = plan.run_command("cat README.md", "Reading README", None)
-    plan_write = plan.run_command(
-        "touch generated.txt",
-        "Writing a file",
-        lambda _request: ApprovalChoice.ALLOW,
-    )
-
-    assert plan_read.approved is True
-    assert plan_read.output == "hello"
-    assert plan_write.approved is False
-    assert plan_write.blocked_by_mode is True
 
     auto = CliToolManager(repo, mode=AgentMode.AUTOMATIC)
     auto_python = auto.run_command("python3 -V", "Checking Python", None)

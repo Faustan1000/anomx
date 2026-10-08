@@ -10,7 +10,7 @@ from typing import Any
 
 from anomx.agent.base.tools import BaseTool, ToolExecutionContext, object_schema, statement_property
 
-WEB_FETCH_MAX_CHARS = 20_000
+WEB_FETCH_MAX_CHARS = 2_000_000
 
 
 class WebFetchTool(BaseTool):

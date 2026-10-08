@@ -2,18 +2,25 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass
-from importlib.resources import files
+from importlib.resources import files as resource_files
 from importlib.resources.abc import Traversable
 from pathlib import Path
-from typing import Any, Literal
+from typing import Literal
+
+from anomx.agent.skills.files import normalize_skill_files, skill_file_bytes
+
+logger = logging.getLogger(__name__)
 
 SkillSource = Literal["builtin", "platform", "user"]
 
 BUILTIN_SKILL_PACKAGE = "anomx.agent.skills"
-SKILL_README_NAMES = ("README.md", "readme.md")
+SKILL_README_NAMES = ("SKILL.md", "README.md", "readme.md")
 BUILTIN_MARKER_NAME = ".anomx_builtin"
 PLATFORM_MARKER_NAME = ".anomx_platform"
 DEFAULT_PLATFORM_SKILL_COMMANDS = (
@@ -67,7 +74,7 @@ def is_valid_skill_command(command: str) -> bool:
 def load_builtin_skills(*, include_system: bool = False) -> tuple[Skill, ...]:
     """Load bundled skills from package resources."""
 
-    skill_root = files(BUILTIN_SKILL_PACKAGE)
+    skill_root = resource_files(BUILTIN_SKILL_PACKAGE)
     loaded: list[Skill] = []
     for resource in sorted(skill_root.iterdir(), key=lambda item: item.name):
         skill: Skill | None = None
@@ -116,7 +123,13 @@ def load_user_skills(skills_dir: Path) -> tuple[Skill, ...]:
         skill = parse_skill_markdown(
             readme.read_text(encoding="utf-8"),
             default_command=path.name,
-            source="user",
+            source=(
+                "platform"
+                if (path / PLATFORM_MARKER_NAME).is_file()
+                else "builtin"
+                if (path / BUILTIN_MARKER_NAME).is_file()
+                else "user"
+            ),
             path=path,
         )
         loaded.append(skill)
@@ -138,14 +151,24 @@ def load_user_skills(skills_dir: Path) -> tuple[Skill, ...]:
 
 
 def write_user_skill(skills_dir: Path, skill: Skill) -> Path:
-    """Persist a user-created folder skill with README.md instructions."""
+    """Persist the entry point while preserving supporting files."""
 
+    if not is_valid_skill_command(skill.command):
+        raise ValueError("Invalid skill command.")
     skills_dir.mkdir(parents=True, exist_ok=True)
     path = skills_dir / skill.command
+    if path.is_symlink():
+        raise ValueError("A skill directory must not be a symbolic link.")
     path.mkdir(parents=True, exist_ok=True)
-    tmp_path = path / "README.md.tmp"
-    tmp_path.write_text(skill_to_markdown(skill), encoding="utf-8")
-    tmp_path.replace(path / "README.md")
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path, delete=False) as stream:
+        tmp_path = Path(stream.name)
+        stream.write(skill_to_markdown(skill))
+    tmp_path.replace(path / "SKILL.md")
+    # Keep the old entry point usable for existing CLI integrations.
+    legacy = path / "README.md"
+    if legacy.is_symlink():
+        legacy.unlink()
+    legacy.write_text(skill_to_markdown(skill), encoding="utf-8")
     return path
 
 
@@ -153,7 +176,7 @@ def sync_builtin_skills(skills_dir: Path, *, include_system: bool = False) -> No
     """Materialize bundled folder skills under the Anomx home skills directory."""
 
     skills_dir.mkdir(parents=True, exist_ok=True)
-    skill_root = files(BUILTIN_SKILL_PACKAGE)
+    skill_root = resource_files(BUILTIN_SKILL_PACKAGE)
     desired_commands: set[str] = set()
     for resource in sorted(skill_root.iterdir(), key=lambda item: item.name):
         source_readme = _resource_readme(resource) if resource.is_dir() else None
@@ -173,7 +196,7 @@ def sync_builtin_skills(skills_dir: Path, *, include_system: bool = False) -> No
 
         target_dir = skills_dir / skill.command
         marker_path = target_dir / BUILTIN_MARKER_NAME
-        if target_dir.exists() and not marker_path.exists():
+        if target_dir.is_symlink() or (target_dir.exists() and not marker_path.exists()):
             continue
         if target_dir.exists():
             shutil.rmtree(target_dir)
@@ -185,10 +208,20 @@ def sync_builtin_skills(skills_dir: Path, *, include_system: bool = False) -> No
                 resource.read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
+        entrypoint = _path_readme(target_dir)
+        if entrypoint is not None:
+            for name in ("SKILL.md", "README.md"):
+                (target_dir / name).write_text(
+                    entrypoint.read_text(encoding="utf-8"), encoding="utf-8"
+                )
         marker_path.write_text("synced bundled Anomx skill\n", encoding="utf-8")
 
     for target_dir in skills_dir.iterdir():
-        if not target_dir.is_dir() or not (target_dir / BUILTIN_MARKER_NAME).exists():
+        if (
+            target_dir.is_symlink()
+            or not target_dir.is_dir()
+            or not (target_dir / BUILTIN_MARKER_NAME).exists()
+        ):
             continue
         if target_dir.name not in desired_commands:
             shutil.rmtree(target_dir)
@@ -212,11 +245,15 @@ def sync_platform_skills(skills_dir: Path, payload: object) -> None:
         target_dir = skills_dir / command
         platform_marker = target_dir / PLATFORM_MARKER_NAME
         builtin_marker = target_dir / BUILTIN_MARKER_NAME
-        if target_dir.exists() and not platform_marker.exists() and not builtin_marker.exists():
+        if target_dir.is_symlink() or (
+            target_dir.exists() and not platform_marker.exists() and not builtin_marker.exists()
+        ):
             continue
-        if target_dir.exists():
-            shutil.rmtree(target_dir)
-        target_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            resources = normalize_skill_files(record.get("files", {}))
+        except ValueError as error:
+            logger.warning("Skipping invalid platform skill %s: %s", command, error)
+            continue
         skill = Skill(
             command=command,
             title=str(record.get("name") or command).strip() or command,
@@ -227,11 +264,48 @@ def sync_platform_skills(skills_dir: Path, payload: object) -> None:
             keywords=_string_tuple(record.get("keywords")),
             model_references=_string_tuple(record.get("model_references")),
         )
-        (target_dir / "README.md").write_text(skill_to_markdown(skill), encoding="utf-8")
-        platform_marker.write_text("synced Anomx Platform skill\n", encoding="utf-8")
+        markdown = skill_to_markdown(skill).encode("utf-8")
+        desired_files = {
+            "SKILL.md": markdown,
+            "README.md": markdown,
+            PLATFORM_MARKER_NAME: b"synced Anomx Platform skill\n",
+            **{relative: skill_file_bytes(entry) for relative, entry in resources.items()},
+        }
+        if target_dir.is_dir():
+            existing_paths = tuple(target_dir.rglob("*"))
+            if not any(path.is_symlink() for path in existing_paths):
+                existing_files = {path.relative_to(target_dir).as_posix(): path for path in existing_paths if path.is_file()}
+                try:
+                    if existing_files.keys() == desired_files.keys() and all(
+                        existing_files[name].read_bytes() == content for name, content in desired_files.items()
+                    ):
+                        continue
+                except OSError:
+                    pass
+        # Build the complete tree before replacing a previous valid synchronization.
+        with tempfile.TemporaryDirectory(prefix=".skill-sync-", dir=skills_dir) as temporary:
+            staging = Path(temporary) / "new"
+            staging.mkdir()
+            for relative, content in desired_files.items():
+                destination = staging / relative
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+            previous = Path(temporary) / "previous"
+            if target_dir.exists():
+                target_dir.rename(previous)
+            try:
+                staging.rename(target_dir)
+            except OSError:
+                if previous.exists():
+                    previous.rename(target_dir)
+                raise
 
     for target_dir in skills_dir.iterdir():
-        if not target_dir.is_dir() or not (target_dir / PLATFORM_MARKER_NAME).exists():
+        if (
+            target_dir.is_symlink()
+            or not target_dir.is_dir()
+            or not (target_dir / PLATFORM_MARKER_NAME).exists()
+        ):
             continue
         if target_dir.name not in desired_commands:
             shutil.rmtree(target_dir)
@@ -250,7 +324,9 @@ def parse_skill_markdown(
     command = normalize_skill_command(str(metadata.get("command", default_command)))
     if not is_valid_skill_command(command):
         command = normalize_skill_command(default_command)
-    title = _metadata_text(metadata.get("title") or metadata.get("name"))
+    title = _metadata_text(metadata.get("title"))
+    if not title and source != "builtin":
+        title = _metadata_text(metadata.get("name"))
     if not title:
         title = _title_from_command(command) if source == "builtin" else command
     description = _metadata_text(metadata.get("description")) or _first_body_paragraph(body)
@@ -267,7 +343,7 @@ def parse_skill_markdown(
         path=path,
         keywords=_comma_separated_tuple(metadata.get("keywords")),
         model_references=_comma_separated_tuple(
-            metadata.get("object_models") or metadata.get("models")
+            metadata.get("object_models") or metadata.get("models") or metadata.get("anomx_models")
         ),
     )
 
@@ -277,19 +353,24 @@ def skill_to_markdown(skill: Skill) -> str:
 
     frontmatter = [
         "---",
-        f"command: {skill.command}",
-        f"description: {_single_line(skill.description)}",
+        f"name: {skill.command}",
+        f"description: {json.dumps(_single_line(skill.description), ensure_ascii=False)}",
     ]
+    metadata = []
     if skill.source == "platform":
-        frontmatter.append(f"name: {_single_line(skill.title)}")
+        metadata.append(f"    title: {json.dumps(_single_line(skill.title), ensure_ascii=False)}")
     if skill.keywords:
-        frontmatter.append(f"keywords: {', '.join(skill.keywords)}")
+        metadata.append(
+            f"    keywords: {json.dumps(', '.join(skill.keywords), ensure_ascii=False)}"
+        )
     if skill.model_references:
-        frontmatter.append(f"object_models: {', '.join(skill.model_references)}")
+        metadata.append(f"    anomx_models: {', '.join(skill.model_references)}")
     if skill.hidden:
-        frontmatter.append("hidden: true")
+        metadata.append("    hidden: true")
     if skill.system:
-        frontmatter.append("system: true")
+        metadata.append("    system: true")
+    if metadata:
+        frontmatter.extend(["metadata:", *metadata])
     frontmatter.append("---")
     return "\n".join([*frontmatter, "", skill.body.strip(), ""])
 
@@ -305,6 +386,12 @@ def skill_invocation_prompt(skill: Skill, arguments: str = "") -> str:
             if skill.model_references
             else "Applicable Anomx object types: all"
         ),
+        (
+            f"Skill directory: {skill.path}. Resolve supporting file paths relative to it."
+            if skill.path
+            else ""
+        ),
+        "Read linked references only when needed; scripts are resources, not automatic actions.",
         "Skill instructions:",
         skill.body.strip(),
     ]
@@ -332,7 +419,14 @@ def _split_frontmatter(content: str) -> tuple[dict[str, str], str]:
             continue
         normalized_key = key.strip().lower()
         if normalized_key:
-            metadata[normalized_key] = value.strip().strip("\"'")
+            raw_value = value.strip()
+            try:
+                decoded = (
+                    json.loads(raw_value) if raw_value.startswith('"') else raw_value.strip("'")
+                )
+            except ValueError:
+                decoded = raw_value.strip("\"'")
+            metadata[normalized_key] = decoded if isinstance(decoded, str) else str(decoded)
     return {}, content
 
 
@@ -376,13 +470,11 @@ def _metadata_bool(value: object) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _string_tuple(value: Any) -> tuple[str, ...]:
+def _string_tuple(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(
-        dict.fromkeys(
-            str(item or "").strip() for item in value if str(item or "").strip()
-        )
+        dict.fromkeys(str(item or "").strip() for item in value if str(item or "").strip())
     )
 
 

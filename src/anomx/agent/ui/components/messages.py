@@ -55,7 +55,7 @@ class MessagesComponentMixin:
             return self._attr("user")
         if role == "user_box":
             return self._attr("bold")
-        if role == "meta_accent":
+        if role in {"meta_accent", "context"}:
             return self._attr("accent")
         if role in {"meta", "thought", "tool", "work_summary", "work_active", "approved", "notice"}:
             return self._attr("light")
@@ -147,9 +147,13 @@ class MessagesComponentMixin:
         """Choose one visible tool label, stopping at the current request boundary."""
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
-            if message.role == "agent" or (message.role == "user" and not message.meta):
+            if message.role in {"agent", "agent_intermediate", "user"}:
                 return None
-            if message.role in {"work_active", "work_summary"} and message.meta:
+            if message.role == "context":
+                return index if message.activity_wave else None
+            if message.role == "work_summary":
+                return None
+            if message.role == "work_active" and message.meta:
                 if (
                     message.text.endswith(" · collapse")
                     and index > 0
@@ -170,9 +174,12 @@ class MessagesComponentMixin:
         del active_turn_elapsed
         if not streaming_text:
             return messages
-        rendered = list(messages)
-        if streaming_text:
-            rendered.append(MessageLine("agent", streaming_text))
+        rendered = [
+            replace(message, role="work_summary", text=message.summary_text, activity_wave=False)
+            if message.role == "work_active" and message.summary_text else message
+            for message in messages
+        ]
+        rendered.append(MessageLine("agent", streaming_text))
         return rendered
 
     def _draw_working_line(
@@ -486,10 +493,10 @@ class MessagesComponentMixin:
         lines: list[MessageLine] = []
         turn_segments: dict[str, list[list[MessageLine]]] = {}
         turn_segment_by_key: dict[str, list[MessageLine]] = {}
-        turn_segment_keys: dict[str, list[str]] = {}
         turn_summaries: dict[str, str] = {}
         current_turn_id = ""
         current_segment_key = ""
+        seen_context_ids: set[str] = set()
 
         def append_turn_line(turn_id: str, line: MessageLine) -> None:
             nonlocal current_segment_key, current_turn_id
@@ -506,7 +513,6 @@ class MessagesComponentMixin:
                 current_turn_id = turn_id
                 segments.append([])
                 turn_segment_by_key[current_segment_key] = segments[-1]
-                turn_segment_keys.setdefault(turn_id, []).append(current_segment_key)
                 lines.append(MessageLine("__turn_placeholder__", turn_id, current_segment_key))
             turn_segment_by_key[current_segment_key].append(line)
 
@@ -514,11 +520,22 @@ class MessagesComponentMixin:
             if not turn_id:
                 lines.append(MessageLine("work_summary", message))
                 return
-            if turn_id not in turn_segments:
-                return
             turn_summaries[turn_id] = message
 
-        for event_index, event in enumerate(self._session_events(session_path)):
+        events = self._session_events(session_path)
+        displayed_context_ids = {
+            str(payload.get("id"))
+            for event in events
+            if isinstance(payload := event.get("payload"), dict)
+            and payload.get("type", event.get("type")) == "context_activity_display"
+        }
+        context_activity_states = {
+            str(payload.get("id")): payload
+            for event in events
+            if isinstance(payload := event.get("payload"), dict)
+            and payload.get("type", event.get("type")) == "context_activity"
+        }
+        for event_index, event in enumerate(events):
             payload = event.get("payload")
             if not isinstance(payload, dict):
                 continue
@@ -554,6 +571,48 @@ class MessagesComponentMixin:
                 visible_message = strip_thinking_tags(message)
                 if visible_message:
                     append_turn_line(turn_id, MessageLine(role, visible_message, turn_id))
+            elif event_type in {"context_activity", "context_activity_display"}:
+                activity_id = str(payload.get("id") or event_index)
+                # UI events preserve callback order even when the isolated runtime
+                # wrote its durable activity before the UI drained earlier tools.
+                if event_type == "context_activity" and activity_id in displayed_context_ids:
+                    continue
+                if activity_id in seen_context_ids:
+                    continue
+                seen_context_ids.add(activity_id)
+                payload = {**payload, **context_activity_states.get(activity_id, {})}
+                if payload.get("kind") == "check" or payload.get("model_requests") == 0 or (
+                    payload.get("status") == "completed" and payload.get("changed") is False
+                ):
+                    if payload.get("status") == "running":
+                        append_turn_line(
+                            "", MessageLine(
+                                "context", "Checking context …", str(payload.get("turn_id", "")),
+                                activity_wave=True,
+                            ),
+                        )
+                    continue
+                label = (
+                    "Context compression"
+                    if payload.get("kind") == "compression"
+                    else "Context optimization"
+                )
+                status = str(payload.get("status") or "completed")
+                if status == "running":
+                    label += " …"
+                elif status == "failed":
+                    label += " · could not reduce context"
+                elif payload.get("changed"):
+                    before = int(payload.get("tokens_before") or 0)
+                    after = int(payload.get("tokens_after") or 0)
+                    label += f" · {before:,} → {after:,} tokens"
+                else:
+                    label += " · context retained"
+                line = MessageLine(
+                    "context", label, str(payload.get("turn_id", "")),
+                    activity_wave=status == "running",
+                )
+                append_turn_line("", line)
             elif event_type == "system_message" and message:
                 role = str(payload.get("role", "system"))
                 if role == "question":
@@ -616,7 +675,24 @@ class MessagesComponentMixin:
                 turn_id = str(payload.get("turn_id", ""))
                 append_turn_summary(turn_id, message)
         rendered_lines: list[MessageLine] = []
+        displayed_work_turns: set[str] = set()
         for line_index, line in enumerate(lines):
+            work_turn_id = (
+                line.text if line.role == "__turn_placeholder__"
+                else line.meta if line.role in {"agent_intermediate", "user", "context"} else ""
+            )
+            if self.work_visualization == "default" and work_turn_id in turn_summaries:
+                work_key = f"work:{work_turn_id}"
+                work_expanded = work_key in self._expanded_work_turns
+                if work_turn_id not in displayed_work_turns:
+                    displayed_work_turns.add(work_turn_id)
+                    rendered_lines.append(MessageLine(
+                        "work_summary",
+                        turn_summaries[work_turn_id] + (" · collapse" if work_expanded else ""),
+                        work_key,
+                    ))
+                if not work_expanded:
+                    continue
             if line.role != "__turn_placeholder__":
                 rendered_lines.append(line)
                 continue
@@ -629,14 +705,9 @@ class MessagesComponentMixin:
                     (entry.text for entry in reversed(segment_lines) if entry.text.strip()),
                     "Thinking",
                 )
-                # A whole-turn duration only describes a group when there is
-                # one group. Separate groups retain their own action labels.
-                label = (
-                    summary
-                    if summary and len(turn_segment_keys[turn_id]) == 1
-                    else latest_statement
-                )
                 active = not summary and line_index == len(lines) - 1
+                group_summary = self._tool_section_summary(segment_lines)
+                label = latest_statement if active else group_summary
                 expanded = segment_key in self._expanded_work_turns
                 if expanded:
                     rendered_lines.extend(segment_lines)
@@ -644,6 +715,7 @@ class MessagesComponentMixin:
                     "work_active" if active else "work_summary",
                     self._single_line_work_text(label) + (" · collapse" if expanded else ""),
                     segment_key,
+                    summary_text=group_summary + (" · collapse" if expanded else ""),
                 ))
             else:
                 rendered_lines.extend(turn_segment_by_key.get(segment_key, []))
@@ -655,6 +727,22 @@ class MessagesComponentMixin:
                 rendered_lines,
             )
         return rendered_lines
+
+    def _tool_section_summary(self, lines: list[MessageLine]) -> str:
+        """Describe a finished tool block without reusing its last activity."""
+        counts: dict[str, int] = {}
+        for line in lines:
+            if line.role == "thought":
+                label = "Thought"
+            elif match := re.match(r"^Tool:\s*(\S+)", line.detail_body):
+                label = match[1].replace("_", " ").capitalize()
+            else:
+                label = self._single_line_work_text(line.text)
+            if label:
+                counts[label] = counts.get(label, 0) + 1
+        return ", ".join(
+            f"{count}× {label}" if count > 1 else label for label, count in counts.items()
+        ) or "Activity"
 
     def _session_events(self, session_path: Path) -> list[dict[str, Any]]:
         cache_key = self._session_cache_key(session_path)
@@ -926,6 +1014,8 @@ class MessagesComponentMixin:
         return f"user:{message.meta}:{digest}"
 
     def _message_kind(self, role: str) -> str:
+        if role == "context":
+            return "context"
         if role == "user":
             return "user"
         if role == "agent":

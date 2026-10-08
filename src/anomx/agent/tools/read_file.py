@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from anomx.agent.base.tools import BaseTool, ToolExecutionContext, object_schema, statement_property
@@ -23,6 +24,13 @@ class ReadFileTool(BaseTool):
                     "max_lines": {
                         "type": "integer",
                         "description": "Maximum lines to return.",
+                    },
+                    "start_character": {
+                        "type": "integer",
+                        "description": (
+                            "Zero-based character offset within the selected line range, "
+                            "for long lines."
+                        ),
                     },
                 },
                 ["statement", "path", "start_line", "max_lines"],
@@ -47,12 +55,25 @@ class ReadFileTool(BaseTool):
 
         start_index = max(0, start_line - 1)
         selected = lines[start_index : start_index + max_lines]
+        text = "\n".join(selected)
+        offset = max(0, context.positive_int(arguments.get("start_character"), 0))
+        content = text[offset : offset + 8_000]
+        # Escaping control characters can expand a short string sixfold in JSON.
+        while len(json.dumps(content, ensure_ascii=False)) > 12_000:
+            content = content[: len(content) // 2]
+        truncated = offset + len(content) < len(text)
         return context.json_result(
             {
                 "path": str(path),
                 "start_line": start_line,
                 "line_count": len(selected),
                 "total_lines": len(lines),
-                "content": "\n".join(selected),
+                "content": content,
+                "start_character": offset,
+                "truncated": truncated,
+                "next_character": offset + len(content) if truncated else None,
+                "next_line": start_line + len(selected)
+                if not truncated and start_index + len(selected) < len(lines)
+                else None,
             }
         )

@@ -97,10 +97,13 @@ def test_completed_summary_keeps_final_response_in_both_modes(chat):
     home.append_session_event(session.path, "agent_message", {"message": "19 channels"})
     assert app._read_message_lines(session.path) == [
         MessageLine("user", "Inspect channels"),
-        MessageLine("work_summary", "Reading channels", "turn-1"),
-        MessageLine("agent_intermediate", "I found the channel list.", "turn-1"),
-        MessageLine("work_summary", "Counting channels", "turn-1:1"),
+        MessageLine("work_summary", "Worked for 00:03", "work:turn-1"),
         MessageLine("agent", "19 channels"),
+    ]
+    app._toggle_work_turn("work:turn-1")
+    assert [line.text for line in app._read_message_lines(session.path)] == [
+        "Inspect channels", "Worked for 00:03 · collapse", "Reading channels",
+        "I found the channel list.", "Counting channels", "19 channels",
     ]
     app.work_visualization = "extended"
     messages = app._read_message_lines(session.path)
@@ -144,18 +147,27 @@ def test_intermediate_user_message_splits_tool_groups_and_survives_reload(chat, 
         "Counting active channels",
         *(["12 active channels"] if completed else []),
     ]
+    if completed:
+        expected = ["Inspect channels", "Worked for 00:03", "12 active channels"]
     assert [line.text for line in app._read_message_lines(session.path)] == expected
     reloaded = AnomxCliApp(home=home, cwd=session.path.parent, use_color=False)
     assert [line.text for line in reloaded._read_message_lines(session.path)] == expected
+    if completed:
+        app._toggle_work_turn("work:turn-1")
     app._toggle_work_turn("turn-1:2")
     expanded = app._read_message_lines(session.path)
-    assert [line.text for line in expanded][4:8] == [
+    offset = 5 if completed else 4
+    label = (
+        "Reading active flags, Counting active channels"
+        if completed else "Counting active channels"
+    )
+    assert [line.text for line in expanded][offset:offset + 4] == [
         "Only count active channels", "Reading active flags", "Counting active channels",
-        "Counting active channels · collapse",
+        label + " · collapse",
     ]
 
 
-def test_completion_does_not_hide_errors_or_message_only_turns(chat):
+def test_completion_keeps_errors_visible_and_message_only_work_expandable(chat):
     home, session, app = chat
     for role, message in (("system", "Connection failed"), ("warning", "Retry unavailable")):
         home.append_session_event(session.path, "system_message", {
@@ -171,11 +183,13 @@ def test_completion_does_not_hide_errors_or_message_only_turns(chat):
         "message": "Worked for 00:01", "turn_id": "turn-2",
     })
     assert [line.text for line in app._read_message_lines(session.path)][-3:] == [
-        "Connection failed", "Retry unavailable", "I can explain this without tools.",
+        "Connection failed", "Retry unavailable", "Worked for 00:01",
     ]
+    app._toggle_work_turn("work:turn-2")
+    assert app._read_message_lines(session.path)[-1].text == "I can explain this without tools."
 
 
-def test_expanded_group_stays_open_when_the_turn_finishes(chat):
+def test_completion_collapses_work_and_remembers_nested_expansion(chat):
     home, session, app = chat
     app._toggle_work_turn("turn-1:1")
     before = app._read_message_lines(session.path)
@@ -184,9 +198,11 @@ def test_expanded_group_stays_open_when_the_turn_finishes(chat):
     })
     home.append_session_event(session.path, "agent_message", {"message": "19 channels"})
     after = app._read_message_lines(session.path)
-    assert [line.text for line in after[:-1]] == [line.text for line in before]
-    assert after[-2].role == "work_summary"
-    assert after[-2].meta == before[-1].meta
+    assert [line.text for line in after] == ["Inspect channels", "Worked for 00:03", "19 channels"]
+    app._toggle_work_turn("work:turn-1")
+    reopened = app._read_message_lines(session.path)
+    assert [line.text for line in reopened[2:-1]] == [line.text for line in before[1:]]
+    assert reopened[-2].meta == before[-1].meta
     assert after[-1] == MessageLine("agent", "19 channels")
 
 
@@ -225,3 +241,98 @@ def test_statement_schema_requests_short_action_labels():
     description = statement_property("Describe this tool call.")["description"]
     assert "3–7 words" in description
     assert "60 characters" in description
+
+
+def test_finished_tool_block_summarizes_calls_and_thoughts_before_turn_completion(chat):
+    home, session, app = chat
+    for role, message, command in (
+        ('tool', 'Read the first file', 'Tool: read_file\nParameters: {"path":"a"}'),
+        ('tool', 'Read the second file', 'Tool: read_file\nParameters: {"path":"b"}'),
+        ('thought', 'Created a thought', 'The two files are consistent.'),
+    ):
+        home.append_session_event(session.path, 'work_message', {
+            'role': role, 'message': message, 'command': command, 'turn_id': 'turn-1',
+        })
+    assert app._read_message_lines(session.path)[-1].text == 'Created a thought'
+    home.append_session_event(session.path, 'agent_message', {
+        'message': 'Both files agree.', 'intermediate': True, 'turn_id': 'turn-1',
+    })
+    lines = app._read_message_lines(session.path)
+    assert lines[-2] == MessageLine(
+        'work_summary', 'Counting channels, 2× Read file, Thought', 'turn-1:1',
+    )
+    assert lines[-1].text == 'Both files agree.'
+    home.append_session_event(session.path, 'work_message', {
+        'role': 'tool', 'message': 'Checking the result', 'turn_id': 'turn-1',
+    })
+    lines = app._read_message_lines(session.path)
+    assert lines[-1].role == 'work_active'
+    assert lines[-3].text == 'Counting channels, 2× Read file, Thought'
+
+
+def test_streaming_text_immediately_finishes_the_current_tool_label(chat):
+    home, session, app = chat
+    home.append_session_event(session.path, 'work_message', {
+        'role': 'thought', 'message': 'Created a thought', 'turn_id': 'turn-1',
+    })
+    messages = app._read_message_lines(session.path)
+    streaming = app._messages_with_transient_state(messages, 3, 'I found')
+    assert streaming[-2] == MessageLine('work_summary', 'Counting channels, Thought', 'turn-1:1')
+    assert streaming[-1] == MessageLine('agent', 'I found')
+    assert messages[-1].role == 'work_active'  # The persisted cache is untouched.
+
+
+def test_completed_turns_fold_independently_and_include_context_activity(chat):
+    home, session, app = chat
+    home.append_session_event(session.path, 'context_activity_display', {
+        'id': 'context-1', 'turn_id': 'turn-1', 'kind': 'optimization',
+        'status': 'completed', 'changed': True, 'model_requests': 1,
+        'tokens_before': 4000, 'tokens_after': 1000,
+    })
+    home.append_session_event(session.path, 'work_summary', {
+        'message': 'Worked for 00:03', 'turn_id': 'turn-1',
+    })
+    home.append_session_event(session.path, 'agent_message', {'message': '19 channels'})
+    home.append_session_event(session.path, 'user_message', {'message': 'Inspect something else'})
+    home.append_session_event(session.path, 'work_message', {
+        'role': 'thought', 'message': 'Created a thought', 'turn_id': 'turn-2',
+    })
+    home.append_session_event(session.path, 'work_summary', {
+        'message': 'Worked for 00:01', 'turn_id': 'turn-2',
+    })
+    home.append_session_event(session.path, 'agent_message', {'message': 'Second answer'})
+    assert [line.text for line in app._read_message_lines(session.path)] == [
+        'Inspect channels', 'Worked for 00:03', '19 channels',
+        'Inspect something else', 'Worked for 00:01', 'Second answer',
+    ]
+    app._toggle_work_turn('work:turn-1')
+    messages = app._read_message_lines(session.path)
+    assert any(line.role == 'context' for line in messages)
+    assert messages[-2] == MessageLine('work_summary', 'Worked for 00:01', 'work:turn-2')
+    reloaded = AnomxCliApp(home=home, cwd=session.path.parent, use_color=False)
+    assert len(reloaded._read_message_lines(session.path)) == 6
+
+
+def test_completed_work_header_can_be_clicked_to_reopen_its_contents(chat):
+    home, session, app = chat
+    home.append_session_event(session.path, 'work_summary', {
+        'message': 'Worked for 00:03', 'turn_id': 'turn-1',
+    })
+    home.append_session_event(session.path, 'agent_message', {'message': '19 channels'})
+
+    class Window:
+        def erase(self):
+            pass
+
+        def getmaxyx(self):
+            return 40, 100
+
+        def addnstr(self, *_args):
+            pass
+
+        def refresh(self):
+            pass
+
+    app._draw_session(Window(), session, app._read_message_lines(session.path), '', 0, 0)
+    actions = [action for actions in app._click_targets.values() for action in actions]
+    assert any(action.kind == 'toggle_work' and action.text == 'work:turn-1' for action in actions)

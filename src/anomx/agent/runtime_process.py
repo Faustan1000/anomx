@@ -73,7 +73,7 @@ class RuntimeProcessClient:
         cwd: Path,
         session_allowed_commands: MutableSet[str] | None = None,
         session_rejected_commands: MutableSet[str] | None = None,
-        mode: AgentMode = AgentMode.STANDARD,
+        mode: AgentMode = AgentMode.AUTOMATIC,
         agent_kind: AgentKind | str = AgentKind.MAIN,
         workspace_root: Path | None = None,
         process_owner_id: str = "",
@@ -473,6 +473,7 @@ class RuntimeProcessClient:
             "process",
             "finish",
             "usage",
+            "context_activity",
         )
         return {
             name: callback
@@ -574,6 +575,7 @@ def _runtime_process_main(connection: Connection, config: RuntimeProcessConfig) 
                 process=callback("process"),
                 finish=callback("finish"),
                 usage=callback("usage"),
+                context_activity=callback("context_activity"),
             )
 
         def execute(request: dict[str, Any]) -> None:

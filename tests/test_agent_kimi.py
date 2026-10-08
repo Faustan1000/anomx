@@ -100,7 +100,7 @@ def test_kimi_stream_preserves_reasoning_across_tool_calls(tmp_path, monkeypatch
     monkeypatch.setattr(
         runtime,
         "_execute_tool",
-        lambda name, arguments, callbacks, session_path: json.dumps(
+        lambda name, arguments, callbacks, session_path, **kwargs: json.dumps(
             {"name": name, "arguments": arguments}
         ),
     )

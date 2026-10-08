@@ -38,7 +38,6 @@ from anomx.agent.skills import (
 from anomx.agent.store import (
     AI_PROVIDERS,
     BACKGROUND_WORK_MODEL_SETTINGS,
-    CONTEXT_COMPRESSION_TARGET_OPTIONS,
     CONTEXT_LENGTH_OPTIONS,
     CURRENT_MODEL_SELECTION,
     MODEL_MENU_OPTIONS,
@@ -408,8 +407,18 @@ class ConfigViewMixin:
             body=draft.body.strip(),
             source="user",
         )
-        path = write_user_skill(self.home.skills_dir, skill)
         old_path = existing_skill.path if existing_skill is not None else draft.path
+        target_path = self.home.skills_dir / command
+        if old_path is not None and old_path.is_dir() and old_path != target_path:
+            # Preserve references, scripts and assets when renaming a local skill.
+            old_path.rename(target_path)
+            try:
+                path = write_user_skill(self.home.skills_dir, skill)
+            except OSError:
+                target_path.rename(old_path)
+                raise
+        else:
+            path = write_user_skill(self.home.skills_dir, skill)
         if old_path is not None and old_path != path:
             with suppress(FileNotFoundError):
                 if old_path.is_dir():
@@ -491,10 +500,10 @@ class ConfigViewMixin:
     def _skill_editor_path(self, draft: SkillFormDraft) -> str:
         command = normalize_skill_command(draft.command)
         if command:
-            return str(self.home.skills_dir / command / "README.md")
+            return str(self.home.skills_dir / command / "SKILL.md")
         if draft.path is not None:
             return str(draft.path)
-        return str(self.home.skills_dir / "<command>" / "README.md")
+        return str(self.home.skills_dir / "<command>" / "SKILL.md")
 
     def _skill_form_display_value(self, active_label: str, active_value: str) -> str:
         if active_label == "Command":
@@ -650,9 +659,7 @@ class ConfigViewMixin:
         if not value or value == CURRENT_MODEL_SELECTION:
             return "Selection"
         for option in MODEL_MENU_OPTIONS:
-            option_value = (
-                f"{option.provider_key}{BACKEND_MODEL_CHOICE_SEPARATOR}{option.model}"
-            )
+            option_value = f"{option.provider_key}{BACKEND_MODEL_CHOICE_SEPARATOR}{option.model}"
             if option_value == value:
                 return option.label
         _, separator, model = value.partition(BACKEND_MODEL_CHOICE_SEPARATOR)
@@ -670,7 +677,6 @@ class ConfigViewMixin:
             for setting in BACKGROUND_WORK_MODEL_SETTINGS
         )
         maximum_context_tokens = int(config["maximum_context_tokens"])
-        compression_target = int(config["context_compression_target_percent"])
         context_label = next(
             (
                 option.label.removesuffix(" Tokens")
@@ -686,19 +692,14 @@ class ConfigViewMixin:
                 "Show the latest activity or every intermediate update",
             ),
             MenuChoice("", "", selectable=False),
-            MenuChoice("Background Work", "", selectable=False),
+            MenuChoice("Standard Models", "", selectable=False),
             *background_choices,
             MenuChoice("", "", selectable=False),
             MenuChoice("Context Management", "", selectable=False),
             MenuChoice(
                 f"Maximum Context: {context_label}",
                 "maximum_context_tokens",
-                "Compress conversations after this estimated context length",
-            ),
-            MenuChoice(
-                f"Compression Target: {compression_target}%",
-                "context_compression_target_percent",
-                "Reduce backend context to this share of the maximum length",
+                "Maximum input context; optimized automatically before it fills",
             ),
         )
 
@@ -754,7 +755,7 @@ class ConfigViewMixin:
                     selected_value = self._menu(
                         stdscr,
                         "Maximum Context",
-                        "Choose when automatic context compression begins",
+                        "Choose the maximum input context available to the agent",
                         tuple(
                             MenuChoice(
                                 option.label,
@@ -762,20 +763,6 @@ class ConfigViewMixin:
                                 option.description,
                             )
                             for option in CONTEXT_LENGTH_OPTIONS
-                        ),
-                    )
-                elif selected_setting == "context_compression_target_percent":
-                    selected_value = self._menu(
-                        stdscr,
-                        "Compression Target",
-                        "Choose the target after automatic compression",
-                        tuple(
-                            MenuChoice(
-                                option.label,
-                                str(option.value),
-                                option.description,
-                            )
-                            for option in CONTEXT_COMPRESSION_TARGET_OPTIONS
                         ),
                     )
                 else:
@@ -789,7 +776,7 @@ class ConfigViewMixin:
             selected_model = self._menu(
                 stdscr,
                 setting.label,
-                "Choose a model for this background work",
+                "Choose a standard model for this task difficulty",
                 (
                     MenuChoice(
                         "Current Model",
@@ -801,8 +788,30 @@ class ConfigViewMixin:
             )
             if selected_model is None:
                 continue
+            effort = ""
+            if selected_model != CURRENT_MODEL_SELECTION:
+                provider, _, model = selected_model.partition(BACKEND_MODEL_CHOICE_SEPARATOR)
+                efforts = tuple(
+                    option
+                    for option in thinking_intensity_options(provider, model)
+                    if option.value != "auto"
+                )
+                if efforts:
+                    effort = self._menu(
+                        stdscr,
+                        "Reasoning effort",
+                        "Choose the effort for this task difficulty",
+                        tuple(
+                            MenuChoice(option.label, option.value, option.detail)
+                            for option in efforts
+                        ),
+                        initial_value=efforts[len(efforts) // 2].value,
+                    )
+                    if effort is None:
+                        continue
             config = self.home.load_config()
             config[setting.config_key] = selected_model
+            config[setting.effort_key] = effort
             self.home.save_config(config)
 
     def _resolve_model_choice(

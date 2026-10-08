@@ -9,6 +9,6 @@ class BlabladorBackend(OpenAICompatibleChatBackend):
     """JSC Blablador's OpenAI-compatible Chat Completions backend."""
 
     provider_key = "blablador"
-    provider_label = "JSC Blablador"
+    provider_label = "JSC Jülich"
     env_var = "BLABLADOR_API_KEY"
     chat_completions_endpoint = "https://api.blablador.fz-juelich.de/v1/chat/completions"

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from anomx.agent.backends.anthropic import AnthropicCompatibleBackend
+from anomx.agent.backends.openai_chat import OpenAICompatibleChatBackend
 from anomx.agent.base.backends import (
     AnthropicStreamResponse,
     BackendCallbacks,
@@ -21,11 +22,38 @@ from anomx.agent.memories import MemoryKind, MemoryMetadata
 DESY_MESSAGES_ENDPOINT = "https://assistant.desy.de/api/v1/messages"
 
 
-class DesyAssistantBackend(AnthropicCompatibleBackend):
-    """DESY Assistant Messages API backend."""
+class _DesyReasoningBackend(OpenAICompatibleChatBackend):
+    """Use DESY's native API to enable and retain structured reasoning.
+
+    The Messages compatibility endpoint ignores ``chat_template_kwargs`` and
+    ``thinking`` for coding. Without explicit thinking, that model can put its
+    deliberation in ordinary text with no reliable boundary to parse.
+    """
 
     provider_key = "desy"
-    provider_label = "DESY Assistant"
+    provider_label = "DESY"
+    env_var = "DESY_ASSISTANT_API_KEY"
+    chat_completions_endpoint = "https://assistant.desy.de/api/chat/completions"
+    preserve_reasoning_content = True
+
+    def _chat_payload(
+        self,
+        model: str,
+        messages: list[dict[str, Any]],
+        *,
+        stream: bool,
+    ) -> dict[str, Any]:
+        payload = super()._chat_payload(model, messages, stream=stream)
+        payload["max_tokens"] = self._max_output_tokens(model, 4_096)
+        payload["chat_template_kwargs"] = {"enable_thinking": True}
+        return payload
+
+
+class DesyAssistantBackend(AnthropicCompatibleBackend):
+    """DESY backend using the native reasoning API for its reasoning models."""
+
+    provider_key = "desy"
+    provider_label = "DESY"
     env_var = "DESY_ASSISTANT_API_KEY"
 
     def generate(
@@ -36,6 +64,10 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
         *,
         thinking_intensity: str | None = None,
     ) -> str:
+        if model in {"coding", "reasoning"}:
+            return _DesyReasoningBackend(self.runtime).generate(
+                session_path, model, callbacks, thinking_intensity=thinking_intensity,
+            )
         del thinking_intensity
         return self._messages_api_response(
             session_path,
@@ -50,6 +82,7 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
         payload: dict[str, Any],
         delta_callback: BackendTextCallback | None,
         status_callback: BackendTextCallback | None,
+        thought_callback: BackendTextCallback | None = None,
     ) -> AnthropicStreamResponse | str:
         return self._stream_anthropic_compatible_response(
             DESY_MESSAGES_ENDPOINT,
@@ -61,6 +94,7 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
             payload,
             delta_callback,
             status_callback,
+            thought_callback,
         )
 
     def suggest_session_title(
@@ -127,7 +161,7 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
                             ),
                         }
                     ],
-                    "max_tokens": 180,
+                    "max_tokens": 512,
                     "stream": False,
                 }
             ).encode("utf-8"),
@@ -138,7 +172,7 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
         except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
             return None
@@ -256,6 +290,8 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
         messages: list[dict[str, Any]],
         previous_summary: str,
         model: str,
+        *,
+        system_prompt: str | None = None,
     ) -> str | None:
         api_key = self._api_key(self.provider_key, self.env_var)
         if api_key is None:
@@ -265,7 +301,7 @@ class DesyAssistantBackend(AnthropicCompatibleBackend):
             data=json.dumps(
                 {
                     "model": model,
-                    "system": self._context_summary_system_prompt(),
+                    "system": system_prompt or self._context_summary_system_prompt(),
                     "messages": [
                         {
                             "role": "user",

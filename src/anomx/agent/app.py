@@ -168,12 +168,7 @@ class AnomxCliApp(
         config = self.home.load_config()
         self.work_visualization = str(config["work_visualization"])
         self.active_agent = agent_spec(AgentKind.MAIN)
-        configured_mode = AgentMode.parse(config.get("agent_mode"))
-        self.agent_mode = (
-            AgentMode.STANDARD
-            if configured_mode == AgentMode.BACKGROUND
-            else configured_mode
-        )
+        self.agent_mode = AgentMode.AUTOMATIC
         self.runtime = self._create_runtime(self.agent_mode)
         self._runtime_processes: list[RuntimeProcessClient] = []
         if isinstance(self.runtime, RuntimeProcessClient):
@@ -589,6 +584,7 @@ class AnomxCliApp(
         return "\n".join(lines[:160])
 
     def _run_project(self, stdscr: CursesWindow, project: ProjectRecord) -> int:
+        self._activate_agent_mode(AgentMode.AUTOMATIC)
         input_text = ""
         cursor = 0
         selected = 0
@@ -1041,7 +1037,10 @@ class AnomxCliApp(
     ) -> int | None:
         opened = self._prepare_session_for_opening(session)
         result = self._run_session(stdscr, opened)
-        return None if result == "project" else int(result)
+        if result == "project":
+            self._activate_agent_mode(AgentMode.AUTOMATIC)
+            return None
+        return int(result)
 
     def _start_project_prompt_session(
         self,
@@ -2654,7 +2653,11 @@ class AnomxCliApp(
             approval_request = (
                 replace(request, evaluation=evaluation) if evaluation is not None else request
             )
-            if evaluation is not None and turn_mode.policy.auto_approves_risk(evaluation.risk):
+            if (
+                not request.requires_user_approval
+                and evaluation is not None
+                and turn_mode.policy.auto_approves_risk(evaluation.risk)
+            ):
                 return ApprovalChoice.ALLOW
             events.put(
                 RuntimeUiEvent(
@@ -2692,6 +2695,15 @@ class AnomxCliApp(
         def usage_callback(snapshot: UsageSnapshot) -> None:
             self._session_usage_snapshots[session.path] = snapshot
 
+        def context_activity_callback(payload: dict[str, Any]) -> None:
+            events.put(RuntimeUiEvent("context_activity", json.dumps(payload)))
+            if payload.get("changed") and payload.get("context_tokens_after") is not None:
+                previous = self._session_usage_snapshots.get(session.path)
+                if previous is not None:
+                    self._session_usage_snapshots[session.path] = replace(
+                        previous, context_tokens=int(payload["context_tokens_after"]), latest=None,
+                    )
+
         def run_backend() -> None:
             try:
                 turn_runtime.set_agent(turn_agent_kind)
@@ -2711,6 +2723,7 @@ class AnomxCliApp(
                         question=question_callback,
                         finish=finish_callback,
                         usage=usage_callback,
+                        context_activity=context_activity_callback,
                     ),
                 )
             except Exception as error:  # pragma: no cover - defensive thread boundary
@@ -4434,8 +4447,9 @@ class AnomxCliApp(
                     current_deadline = (
                         time.monotonic() + status_seconds if status_seconds is not None else None
                     )
-                elif status_text in {
-                    "Automatic Context Compression",
+                elif status_text.startswith("Reconnecting ") or status_text in {
+                    "Context compression",
+                    "Context optimization",
                     "Starting Sandbox",
                     "Pulling sandbox image",
                     "Starting sandbox container",
@@ -4571,6 +4585,11 @@ class AnomxCliApp(
                     )
                     question_response.put(answer)
                     self._append_question_context(session, question_request, answer)
+            elif event.kind == "context_activity" and event.text:
+                self.home.append_session_event(
+                    session.path, "context_activity_display",
+                    {**json.loads(event.text), "turn_id": turn_id},
+                )
             elif event.kind == "system_message" and event.text:
                 self.home.append_session_event(
                     session.path,
@@ -4587,10 +4606,12 @@ class AnomxCliApp(
 
     def _should_persist_status_statement(self, status_text: str) -> bool:
         normalized = status_text.strip()
-        if not normalized:
+        if not normalized or normalized.startswith("Reconnecting "):
             return False
         return normalized not in {
             "Thinking",
+            "Context compression",
+            "Context optimization",
             "Waiting",
             "Loading model",
             "Starting Sandbox",
@@ -4923,7 +4944,7 @@ class AnomxCliApp(
 
         agent_mode = AgentMode.parse(mode, self.agent_mode)
         if agent_mode == AgentMode.BACKGROUND:
-            agent_mode = AgentMode.STANDARD
+            agent_mode = AgentMode.AUTOMATIC
         self.agent_mode = agent_mode
         if not isinstance(self.runtime, RuntimeProcessClient):
             self.runtime.set_mode(agent_mode)

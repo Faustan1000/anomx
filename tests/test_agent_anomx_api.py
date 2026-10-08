@@ -10,7 +10,6 @@ from anomx.agent.helpers.anomx_api import (
     _response_preview,
 )
 from anomx.agent.helpers.mode import AgentMode
-from anomx.agent.helpers.tool_manager import ApprovalChoice
 from anomx.agent.runtime import AgentRuntime, RuntimeCallbacks
 from anomx.agent.store import AnomxHome
 
@@ -96,27 +95,30 @@ def test_recommend_mode_allows_only_recommendation_creation(tmp_path, monkeypatc
     assert blocked_outside_api["blocked_by_mode"] is True
 
 
-def test_standard_api_write_uses_command_approval_pipeline(tmp_path, monkeypatch):
-    runtime = connected_runtime(tmp_path, AgentMode.STANDARD)
-    approvals = []
+@pytest.mark.parametrize("mode", [AgentMode.STANDARD, AgentMode.AUTOMATIC, AgentMode.AUTONOMOUS])
+@pytest.mark.parametrize("method", ["POST", "PATCH", "DELETE"])
+def test_structured_api_writes_do_not_request_command_approval(tmp_path, monkeypatch, mode, method):
+    runtime = connected_runtime(tmp_path, mode)
+    calls = []
 
     monkeypatch.setattr(
         "anomx.agent.tools.use_anomx_api.call_anomx_api",
-        lambda _connection, **_kwargs: {"ok": True, "response": {}},
+        lambda _connection, **kwargs: calls.append(kwargs) or {"ok": True, "response": {}},
     )
 
     result = execute_api(
         runtime,
-        method="POST",
+        method=method,
         path="/folders",
+        body={"name": "Requested folder"} if method != "DELETE" else None,
         callbacks=RuntimeCallbacks(
-            approval=lambda request: approvals.append(request) or ApprovalChoice.ALLOW,
+            approval=lambda request: pytest.fail("Only shell commands use command review"),
         ),
     )
 
     assert result["ok"] is True
-    assert len(approvals) == 1
-    assert approvals[0].canonical_command == "anomx-api POST /folders"
+    assert len(calls) == 1
+    assert calls[0]["method"] == method
 
 
 def test_api_response_preview_is_bounded_and_structured():

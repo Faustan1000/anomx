@@ -12,6 +12,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
+from anomx.agent.context_management import effective_context_limit
 from anomx.agent.helpers.state import (
     PlanStep,
     SubagentSnapshot,
@@ -26,6 +27,7 @@ from anomx.agent.skills import (
     Skill,
 )
 from anomx.agent.store import (
+    DEFAULT_MAXIMUM_CONTEXT_TOKENS,
     SessionRecord,
     normalize_thinking_intensity,
     thinking_intensity_options,
@@ -839,6 +841,14 @@ class SessionViewMixin:
         }.get(intensity, "")
 
     def _context_status(self, session: SessionRecord, model: str) -> str:
+        maximum = effective_context_limit(
+            int(
+                self.home.load_config().get("maximum_context_tokens")
+                or DEFAULT_MAXIMUM_CONTEXT_TOKENS
+            ),
+            model,
+        )
+        model_cache_key = f"{model}:{maximum}"
         usage_snapshot = self._session_usage_snapshots.get(session.path)
         usage_tokens = usage_snapshot.context_tokens if usage_snapshot is not None else 0
         cache_key = self._session_cache_key(session.path)
@@ -848,7 +858,7 @@ class SessionViewMixin:
                 cached is not None
                 and cached[0] == cache_key[0]
                 and cached[1] == cache_key[1]
-                and cached[2] == model
+                and cached[2] == model_cache_key
                 and cached[4] == usage_tokens
             ):
                 return cached[3]
@@ -857,13 +867,16 @@ class SessionViewMixin:
             status = ""
         else:
             used_tokens = usage_tokens or self.runtime.estimate_session_context_tokens(session.path)
-            status = format_token_count(used_tokens) if used_tokens > 0 else ""
+            status = (
+                f"{format_token_count(used_tokens)}/{format_token_count(maximum)} "
+                f"· {used_tokens / maximum:.0%} Context"
+            ) if used_tokens > 0 else ""
 
         if cache_key is not None:
             self._context_status_cache[session.path] = (
                 cache_key[0],
                 cache_key[1],
-                model,
+                model_cache_key,
                 status,
                 usage_tokens,
             )

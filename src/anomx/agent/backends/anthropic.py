@@ -24,6 +24,8 @@ from anomx.agent.context_management import (
     CONTINUE_AFTER_COMPRESSION_PROMPT,
     ContextMessage,
     projected_context_tokens,
+    tool_call_payload,
+    tool_exchange_entries,
     transient_context_message,
 )
 from anomx.agent.exceptions import BackendFailure
@@ -91,6 +93,7 @@ class AnthropicCompatibleBackend(BaseBackend):
                 payload,
                 callbacks.delta,
                 callbacks.status,
+                callbacks.thought,
             )
             if isinstance(response, str):
                 recovered_entries = self._recover_context_window(
@@ -116,6 +119,9 @@ class AnthropicCompatibleBackend(BaseBackend):
                 callbacks,
                 session_path,
             )
+            if getattr(self.runtime, "produced_output", None) is not None:
+                return self.runtime.produced_output
+
             if not tool_outputs:
                 text = response.text or self._extract_anthropic_text(response.content)
                 if (
@@ -254,27 +260,16 @@ class AnthropicCompatibleBackend(BaseBackend):
         response: AnthropicStreamResponse,
         tool_outputs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     ) -> list[ContextMessage]:
-        assistant_parts = [response.text.strip()] if response.text.strip() else []
-        assistant_parts.extend(
-            (
-                f"[Tool call: {tool_call.name}]\n"
-                f"{json.dumps(tool_call.input, ensure_ascii=False, sort_keys=True)}"
-            )
-            for tool_call in response.tool_calls
+        return tool_exchange_entries(
+            response.text,
+            [
+                tool_call_payload(call.name, call.tool_use_id, call.input)
+                for call in response.tool_calls
+            ],
+            tool_outputs,
+            content_key="content",
+            native={"anthropic_content": list(response.content)},
         )
-        entries = [
-            transient_context_message("assistant", "\n\n".join(assistant_parts))
-        ]
-        if tool_outputs:
-            results = "\n\n".join(
-                (
-                    f"[Tool result: {output.get('tool_use_id', '')}]\n"
-                    f"{output.get('content', '')}"
-                )
-                for output in tool_outputs
-            )
-            entries.append(transient_context_message("user", results))
-        return entries
 
     def _payload(
         self,
@@ -292,7 +287,9 @@ class AnthropicCompatibleBackend(BaseBackend):
             fallback = 8_192
         payload: dict[str, Any] = {
             "model": model,
-            "system": self._cached_system_blocks(self.runtime._instructions(session_path)),
+            "system": self._cached_system_blocks(
+                [item["content"] for item in self.runtime.context_system_messages(session_path)]
+            ),
             "messages": messages,
             "tools": self._cached_tools(self._anthropic_tools()),
             "max_tokens": self._max_output_tokens(model, fallback),
@@ -306,23 +303,13 @@ class AnthropicCompatibleBackend(BaseBackend):
         return payload
 
     @staticmethod
-    def _cached_system_blocks(instructions: str) -> list[dict[str, Any]]:
-        """Wrap the system prompt as a cacheable content block.
+    def _cached_system_blocks(texts: list[str]) -> list[dict[str, Any]]:
+        """Wrap system messages as text blocks, caching up to the last one."""
 
-        The system prompt (identity, workflow, tool descriptions, skills, memories) is
-        rebuilt fresh every turn but is almost entirely static within a session. Without
-        a cache breakpoint, every turn pays full input-token processing for it instead of
-        a cheap cache read, which is the single largest source of avoidable per-turn
-        latency in this loop.
-        """
-
-        return [
-            {
-                "type": "text",
-                "text": instructions,
-                "cache_control": {"type": "ephemeral"},
-            }
-        ]
+        blocks: list[dict[str, Any]] = [{"type": "text", "text": text} for text in texts]
+        if blocks:
+            blocks[-1]["cache_control"] = {"type": "ephemeral"}
+        return blocks
 
     @staticmethod
     def _cached_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -339,6 +326,7 @@ class AnthropicCompatibleBackend(BaseBackend):
         payload: dict[str, Any],
         delta_callback: BackendTextCallback | None,
         status_callback: BackendTextCallback | None,
+        thought_callback: BackendTextCallback | None = None,
     ) -> AnthropicStreamResponse | str:
         raise NotImplementedError
 
@@ -350,6 +338,7 @@ class AnthropicCompatibleBackend(BaseBackend):
         payload: dict[str, Any],
         delta_callback: BackendTextCallback | None,
         status_callback: BackendTextCallback | None,
+        thought_callback: BackendTextCallback | None = None,
     ) -> AnthropicStreamResponse | str:
         del api_key
 
@@ -362,6 +351,7 @@ class AnthropicCompatibleBackend(BaseBackend):
             tool_json_parts: dict[int, list[str]] = {}
             stop_reason: str | None = None
             usage_payload: dict[str, Any] = {}
+            emitted_thought_indices: set[int] = set()
             with pooled_https_post(
                 endpoint,
                 data=request_body,
@@ -402,6 +392,7 @@ class AnthropicCompatibleBackend(BaseBackend):
                                 text,
                                 delta_callback,
                                 status_callback,
+                                thought_callback,
                             )
                             content_by_index[index] = {"type": "text", "text": visible}
                             if visible:
@@ -420,6 +411,8 @@ class AnthropicCompatibleBackend(BaseBackend):
                                 "thinking": str(block.get("thinking", "")),
                                 "signature": str(block.get("signature", "")),
                             }
+                        elif block_type == "redacted_thinking":
+                            content_by_index[index] = dict(block)
                     elif event_type == "content_block_delta":
                         index = event.get("index")
                         delta = event.get("delta")
@@ -435,6 +428,7 @@ class AnthropicCompatibleBackend(BaseBackend):
                                 text,
                                 delta_callback,
                                 status_callback,
+                                thought_callback,
                             )
                             block = content_by_index.get(index)
                             if isinstance(block, dict) and block.get("type") == "text":
@@ -464,11 +458,17 @@ class AnthropicCompatibleBackend(BaseBackend):
                                 and isinstance(block, dict)
                                 and block.get("type") == "thinking"
                             ):
-                                block["signature"] = signature
+                                block["signature"] = f"{block.get('signature', '')}{signature}"
                     elif event_type == "content_block_stop":
                         index = event.get("index")
                         if not isinstance(index, int):
                             continue
+                        block = content_by_index.get(index, {})
+                        if block.get("type") == "thinking" and index not in emitted_thought_indices:
+                            self._emit_thought(
+                                str(block.get("thinking", "")), thought_callback, status_callback,
+                            )
+                            emitted_thought_indices.add(index)
                         self._finalize_anthropic_tool_input(
                             content_by_index,
                             tool_json_parts,
@@ -492,7 +492,15 @@ class AnthropicCompatibleBackend(BaseBackend):
             for index in tuple(tool_json_parts):
                 self._finalize_anthropic_tool_input(content_by_index, tool_json_parts, index)
 
-            trailing_text = self._finish_visible_stream_text(text_filter, delta_callback)
+            for index, block in sorted(content_by_index.items()):
+                if block.get("type") == "thinking" and index not in emitted_thought_indices:
+                    self._emit_thought(
+                        str(block.get("thinking", "")), thought_callback, status_callback,
+                    )
+
+            trailing_text = self._finish_visible_stream_text(
+                text_filter, delta_callback, status_callback, thought_callback,
+            )
             if trailing_text:
                 text_parts.append(trailing_text)
 
@@ -543,6 +551,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
         payload: dict[str, Any],
         delta_callback: BackendTextCallback | None,
         status_callback: BackendTextCallback | None,
+        thought_callback: BackendTextCallback | None = None,
     ) -> AnthropicStreamResponse | str:
         return self._stream_anthropic_compatible_response(
             "https://api.anthropic.com/v1/messages",
@@ -555,6 +564,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
             payload,
             delta_callback,
             status_callback,
+            thought_callback,
         )
 
     def suggest_session_title(
@@ -578,6 +588,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
                     "messages": [{"role": "user", "content": self._title_prompt(messages)}],
                     "max_tokens": 24,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -622,8 +633,9 @@ class AnthropicBackend(AnthropicCompatibleBackend):
                             ),
                         }
                     ],
-                    "max_tokens": 180,
+                    "max_tokens": 512,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -634,7 +646,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
         except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
             return None
@@ -670,6 +682,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
                     ],
                     "max_tokens": 120,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -700,6 +713,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": 16,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -734,6 +748,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
                     "messages": [{"role": "user", "content": self._title_prompt(messages)}],
                     "max_tokens": 48,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -755,6 +770,8 @@ class AnthropicBackend(AnthropicCompatibleBackend):
         messages: list[dict[str, Any]],
         previous_summary: str,
         model: str,
+        *,
+        system_prompt: str | None = None,
     ) -> str | None:
         api_key = self._api_key(self.provider_key, self.env_var)
         if api_key is None:
@@ -764,7 +781,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
             data=json.dumps(
                 {
                     "model": model,
-                    "system": self._context_summary_system_prompt(),
+                    "system": system_prompt or self._context_summary_system_prompt(),
                     "messages": [
                         {
                             "role": "user",
@@ -776,6 +793,7 @@ class AnthropicBackend(AnthropicCompatibleBackend):
                     ],
                     "max_tokens": 4096,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={

@@ -2,28 +2,28 @@ import io
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from urllib.error import HTTPError
 
 import pytest
 
 from anomx.agent import AnomxHome
 from anomx.agent.backends.blablador import BlabladorBackend
-from anomx.agent.backends.desy_assistant import DesyAssistantBackend
+from anomx.agent.backends.desy_assistant import _DesyReasoningBackend
 from anomx.agent.backends.ollama import OllamaBackend
 from anomx.agent.backends.openai import OpenAIBackend
 from anomx.agent.base.backends import (
     MAX_TOOL_ITERATIONS,
     OPENAI_MAX_TOOL_CALLS,
-    AnthropicStreamResponse,
-    AnthropicToolCall,
+    OpenAIChatCompletionStreamResponse,
+    OpenAIToolCall,
     TokenUsage,
 )
-from anomx.agent.context_management import transient_context_message
 from anomx.agent.exceptions import AgentBackendError, BackendFailure
 from anomx.agent.runtime import AgentRuntime, RuntimeCallbacks
 
 
-def desy_runtime(tmp_path, summarizer):
+def desy_runtime(tmp_path, summarizer, history_count=48):
     home = AnomxHome(tmp_path / "home")
     home.save_config(
         {
@@ -40,15 +40,27 @@ def desy_runtime(tmp_path, summarizer):
         "user_message",
         {"message": "Inspect this data. " * 500, "message_id": "user-1"},
     )
+    for i in range(history_count):
+        home.append_session_event(
+            session.path,
+            "agent_message",
+            {
+                "message": f"Earlier finding {i}. " * 100,
+                "message_id": f"history-{i}",
+            },
+        )
     runtime = AgentRuntime(home, tmp_path, context_summarizer=summarizer)
-    return runtime, session, DesyAssistantBackend(runtime)
+    return runtime, session, _DesyReasoningBackend(runtime)
 
 
 def tool_response(input_tokens=100):
-    return AnthropicStreamResponse(
+    return OpenAIChatCompletionStreamResponse(
         text="",
-        content=({"type": "tool_use", "id": "call-1", "name": "read", "input": {}},),
-        tool_calls=(AnthropicToolCall("read", "call-1", {}),),
+        assistant_message={"role": "assistant", "tool_calls": [{
+            "type": "function", "id": "call-1",
+            "function": {"name": "read", "arguments": "{}"},
+        }]},
+        tool_calls=(OpenAIToolCall("read", "call-1", "{}"),),
         usage=TokenUsage(input_tokens=input_tokens, output_tokens=100),
     )
 
@@ -57,7 +69,7 @@ def tool_output(response=None, *_args):
     if response is not None and not response.tool_calls:
         return []
     return [
-        {"type": "tool_result", "tool_use_id": "call-1", "content": "Important measurement result"}
+        {"role": "tool", "tool_call_id": "call-1", "content": "Important measurement result"}
     ]
 
 
@@ -66,23 +78,27 @@ def test_desy_compresses_before_output_reservation_overflows_context(tmp_path, m
     runtime, session, backend = desy_runtime(
         tmp_path, lambda system, user: summaries.append(user) or "Keep the measurement result."
     )
-    responses = iter([tool_response(990_000), AnthropicStreamResponse("Done.", (), ())])
+    responses = iter([
+        tool_response(990_000),
+        OpenAIChatCompletionStreamResponse("Done.", (), {"role": "assistant", "content": "Done."}),
+    ])
     payloads = []
     monkeypatch.setattr(
         backend,
-        "_stream_response",
-        lambda key, payload, *_: payloads.append(payload) or next(responses),
+        "_stream_chat_completion",
+        lambda key, payload, *_: payloads.append(deepcopy(payload)) or next(responses),
     )
-    monkeypatch.setattr(backend, "_execute_anthropic_requested_tools", tool_output)
+    monkeypatch.setattr(backend, "_execute_chat_completion_tools", tool_output)
 
     assert backend.generate(session.path, "coding", RuntimeCallbacks()) == "Done."
     assert len(summaries) == 1
-    assert "Important measurement result" in summaries[0]
-    assert "Keep the measurement result." in payloads[1]["system"]
-    assert payloads[1]["messages"][-1]["content"][0]["text"].startswith("Continue the current task")
+    assert "Earlier finding" in summaries[0]
+    assert "Important measurement result" not in summaries[0]
+    assert "Keep the measurement result." in payloads[1]["messages"][1]["content"]
+    assert payloads[1]["messages"][-1]["content"].startswith("Continue the current task")
     assert payloads[0]["max_tokens"] == 32_768
-    assert runtime.context_compression_state(session.path).last_message_id == "user-1"
-    assert len(runtime.conversation_messages(session.path)) == 1
+    assert runtime.context_compression_state(session.path).last_message_id == "history-25"
+    assert len(runtime.conversation_messages(session.path)) == 49
 
 
 @pytest.mark.parametrize(
@@ -92,9 +108,10 @@ def test_failed_compression_does_not_send_another_oversized_request(tmp_path, mo
     runtime, session, backend = desy_runtime(tmp_path, lambda *_: summary)
     requests = []
     monkeypatch.setattr(
-        backend, "_stream_response", lambda *_: requests.append(True) or tool_response(990_000)
+        backend, "_stream_chat_completion",
+        lambda *_: requests.append(True) or tool_response(990_000),
     )
-    monkeypatch.setattr(backend, "_execute_anthropic_requested_tools", tool_output)
+    monkeypatch.setattr(backend, "_execute_chat_completion_tools", tool_output)
 
     with pytest.raises(AgentBackendError) as error:
         backend.generate(session.path, "coding", RuntimeCallbacks())
@@ -130,8 +147,11 @@ def test_desy_context_rejection_compresses_once_and_retries_without_repeating_to
 ):
     summaries = []
     runtime, session, backend = desy_runtime(
-        tmp_path, lambda *args: summaries.append(args) or "Retain the completed measurement."
+        tmp_path,
+        lambda *args: summaries.append(args) or "Retain the completed measurement.",
+        history_count=0,
     )
+    runtime.context_optimizer = lambda *_: "Important measurement result"
     failure = backend._api_error(
         "desy",
         "DESY Assistant",
@@ -141,33 +161,53 @@ def test_desy_context_rejection_compresses_once_and_retries_without_repeating_to
             {"error": {"message": "This model's maximum context length is 1048576 tokens."}}
         ),
     )
-    responses = iter([tool_response(), failure, AnthropicStreamResponse("Done.", (), ())])
+    responses = iter([
+        tool_response(), failure,
+        OpenAIChatCompletionStreamResponse("Done.", (), {"role": "assistant", "content": "Done."}),
+    ])
     payloads, tool_calls = [], []
     monkeypatch.setattr(
         backend,
-        "_stream_response",
-        lambda key, payload, *_: payloads.append(payload) or next(responses),
+        "_stream_chat_completion",
+        lambda key, payload, *_: payloads.append(deepcopy(payload)) or next(responses),
     )
     monkeypatch.setattr(
         backend,
-        "_execute_anthropic_requested_tools",
+        "_execute_chat_completion_tools",
         lambda response, *args: (
-            (tool_calls.append(True) or tool_output(response)) if response.tool_calls else []
+            (
+                tool_calls.append(True)
+                or [
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "Important measurement result\n" * 500,
+                    }
+                ]
+            )
+            if response.tool_calls
+            else []
         ),
     )
 
     assert backend.generate(session.path, "coding", RuntimeCallbacks()) == "Done."
     assert len(tool_calls) == 1
-    assert len(summaries) == 1
-    assert "Retain the completed measurement." in payloads[2]["system"]
-    assert runtime.context_compression_state(session.path) is not None
+    assert summaries == []
+    assert payloads[2]["messages"][-2] == {
+        "role": "tool",
+        "tool_call_id": "call-1",
+        "content": "Important measurement result",
+    }
+    assert runtime.context_compression_state(session.path) is None
 
 
 def test_repeated_context_rejection_is_a_terminal_failure(tmp_path, monkeypatch):
     _, session, backend = desy_runtime(tmp_path, lambda *_: "Retained history.")
     failure = BackendFailure("Context window exceeded", code="context_window_exceeded")
     requests = []
-    monkeypatch.setattr(backend, "_stream_response", lambda *_: requests.append(True) or failure)
+    monkeypatch.setattr(
+        backend, "_stream_chat_completion", lambda *_: requests.append(True) or failure,
+    )
     assert backend.generate(session.path, "coding", RuntimeCallbacks()) is failure
     assert len(requests) == 2
 
@@ -176,9 +216,9 @@ def test_tool_limit_allows_256_batches_and_returns_typed_failure(tmp_path, monke
     _, session, backend = desy_runtime(tmp_path, lambda *_: "Retained history.")
     requests = []
     monkeypatch.setattr(
-        backend, "_stream_response", lambda *_: requests.append(True) or tool_response()
+        backend, "_stream_chat_completion", lambda *_: requests.append(True) or tool_response()
     )
-    monkeypatch.setattr(backend, "_execute_anthropic_requested_tools", tool_output)
+    monkeypatch.setattr(backend, "_execute_chat_completion_tools", tool_output)
     result = backend.generate(session.path, "coding", RuntimeCallbacks())
     assert len(requests) == MAX_TOOL_ITERATIONS == OPENAI_MAX_TOOL_CALLS == 256
     assert isinstance(result, BackendFailure)
@@ -206,34 +246,45 @@ def test_http_failure_survives_runtime_as_structured_error(tmp_path, monkeypatch
     assert "Invalid model" in result
 
 
-def test_long_tool_loop_compresses_repeatedly_and_preserves_rolling_summary(tmp_path, monkeypatch):
+def test_long_history_updates_memory_and_preserves_recent_tool_pairs(tmp_path):
     summaries = []
-    runtime, session, backend = desy_runtime(
+    runtime, session, _ = desy_runtime(
         tmp_path, lambda system, user: summaries.append(user) or f"Summary {len(summaries)}."
     )
-    responses = iter(
-        [
-            tool_response(990_000),
-            tool_response(990_000),
-            AnthropicStreamResponse("Done.", (), ()),
-        ]
-    )
-    monkeypatch.setattr(backend, "_stream_response", lambda *_: next(responses))
-    monkeypatch.setattr(backend, "_execute_anthropic_requested_tools", tool_output)
-
-    assert backend.generate(session.path, "coding", RuntimeCallbacks()) == "Done."
+    runtime._prepare_context_compression(session.path, RuntimeCallbacks())
+    first = runtime.context_compression_state(session.path)
+    for i in range(20):
+        runtime.home.append_session_event(
+            session.path,
+            "tool_execution",
+            {
+                "message_id": f"tool-{i}",
+                "tool": "read",
+                "arguments": {"path": f"file-{i}"},
+                "result": "Verified measurement. " * 20,
+            },
+        )
+    runtime._prepare_context_compression(session.path, RuntimeCallbacks())
+    state = runtime.context_compression_state(session.path)
     assert len(summaries) == 2
     assert "Previous summary:\nSummary 1." in summaries[1]
-    assert runtime.context_compression_state(session.path).summary == "Summary 2."
-    assert len(runtime.conversation_messages(session.path)) == 1
+    assert state.summary == "Summary 2."
+    assert state.compressed_message_count > first.compressed_message_count
+    restored = AgentRuntime(runtime.home, tmp_path).backend_conversation_entries(session.path)
+    assert restored[0].payload["role"] == "assistant"
+    assert restored[-1].message_id == "tool-19"
+    assert len(restored) == 24
+    assert restored[0].payload["tool_calls"][0]["id"] == restored[1].payload["tool_call_id"]
 
 
 def test_runtime_surfaces_empty_summary_as_failure(tmp_path, monkeypatch):
     runtime, session, _ = desy_runtime(tmp_path, lambda *_: None)
-    monkeypatch.setattr(DesyAssistantBackend, "_stream_response", lambda *_: tool_response(990_000))
     monkeypatch.setattr(
-        DesyAssistantBackend,
-        "_execute_anthropic_requested_tools",
+        _DesyReasoningBackend, "_stream_chat_completion", lambda *_: tool_response(990_000),
+    )
+    monkeypatch.setattr(
+        _DesyReasoningBackend,
+        "_execute_chat_completion_tools",
         lambda self, *args: tool_output(*args),
     )
 
@@ -289,29 +340,30 @@ def test_backend_errors_can_be_imported_before_runtime():
     assert result.returncode == 0, result.stderr
 
 
-def test_resuming_compressed_tool_loop_does_not_reinsert_saved_tool_results(tmp_path):
-    runtime, session, _ = desy_runtime(tmp_path, lambda *_: "The measurement is complete.")
-    entries = runtime.backend_conversation_entries(session.path)
-    runtime.home.append_session_event(
-        session.path,
-        "tool_execution",
-        {
-            "message_id": "tool-1",
-            "tool": "read",
-            "result": "Measurement data",
-        },
-    )
-    entries.append(transient_context_message("user", "Measurement data"))
+def test_resuming_compressed_history_does_not_reinsert_summarized_tools(tmp_path):
+    runtime, session, _ = desy_runtime(tmp_path, lambda *_: "Earlier work is complete.")
+    for i in range(30):
+        runtime.home.append_session_event(
+            session.path,
+            "tool_execution",
+            {
+                "message_id": f"tool-{i}",
+                "tool": "read",
+                "arguments": {},
+                "result": "Measurement data",
+            },
+        )
     compacted, compressed = runtime.compress_in_turn_context(
         session.path,
-        entries,
+        runtime.backend_conversation_entries(session.path),
         current_context_tokens=990_000,
         status_callback=None,
     )
-
-    assert compressed and compacted == []
-    assert runtime.context_compression_state(session.path).last_message_id == "tool-1"
+    assert compressed and len(compacted) == 24
+    assert runtime.context_compression_state(session.path).last_message_id == "tool-17"
     resumed = AgentRuntime(runtime.home, tmp_path)
-    assert resumed.backend_conversation_entries(session.path) == []
-    assert len(resumed.conversation_messages(session.path)) == 2
-    assert "The measurement is complete." in resumed._instructions(session.path)
+    assert resumed.backend_conversation_entries(session.path) == compacted
+    assert len(resumed.conversation_messages(session.path)) == 109
+    assert (
+        "Earlier work is complete." in resumed.context_system_messages(session.path)[1]["content"]
+    )

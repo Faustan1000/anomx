@@ -1,9 +1,10 @@
 ---
-command: manage-recommendations
-title: Manage Recommendations
+name: manage-recommendations
 description: Inspect existing recommendations and create evidence-backed proposals without changing target objects.
-hidden: true
-system: true
+metadata:
+    title: Manage Recommendations
+    hidden: true
+    system: true
 ---
 
 # Manage Anomx Recommendations

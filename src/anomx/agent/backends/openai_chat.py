@@ -21,11 +21,14 @@ from anomx.agent.base.backends import (
     backend_supports_image_input,
     chat_completion_token_usage,
     normalized_image_attachments,
+    strip_thinking_tags,
 )
 from anomx.agent.context_management import (
     CONTINUE_AFTER_COMPRESSION_PROMPT,
     ContextMessage,
     projected_context_tokens,
+    tool_call_payload,
+    tool_exchange_entries,
     transient_context_message,
 )
 from anomx.agent.exceptions import BackendFailure
@@ -60,11 +63,21 @@ class OpenAICompatibleChatBackend(BaseBackend):
             model,
             context_entries,
         )
+        instruction_mode = self.runtime.tool_manager.mode
         plan_finish_attempts = 0
         thought_only_followups = 0
         for _ in range(MAX_TOOL_ITERATIONS):
             if self.runtime._turn_aborted():
                 return ""
+            self.runtime.refresh_mode()
+            if instruction_mode != self.runtime.tool_manager.mode:
+                messages[0] = {
+                    "role": "system",
+                    "content": self.runtime._instructions(
+                        session_path, include_previous_conversation=False
+                    ),
+                }
+                instruction_mode = self.runtime.tool_manager.mode
             self.runtime._status(callbacks.status)
             response = self._stream_chat_completion(
                 api_key,
@@ -180,6 +193,9 @@ class OpenAICompatibleChatBackend(BaseBackend):
                 callbacks,
                 session_path,
             )
+            if getattr(self.runtime, "produced_output", None) is not None:
+                return self.runtime.produced_output
+
             messages.extend(tool_messages)
             pending_entries = self._chat_context_entries(response, tool_messages)
             context_entries.extend(pending_entries)
@@ -224,13 +240,29 @@ class OpenAICompatibleChatBackend(BaseBackend):
         model: str,
         entries: list[ContextMessage],
     ) -> list[dict[str, Any]]:
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.runtime._instructions(session_path)}
-        ]
+        messages: list[dict[str, Any]] = list(self.runtime.context_system_messages(session_path))
         for entry in entries:
             item = entry.payload
             role = str(item.get("role") or "user").strip()
             content = str(item.get("content") or "").strip()
+            if role == "tool":
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": item["tool_call_id"],
+                        "content": item["content"],
+                    }
+                )
+                continue
+            if role == "assistant" and (item.get("tool_calls") or item.get("chat_message")):
+                native = item.get("chat_message") or {"role": role, "content": content}
+                assistant = {**native}
+                if item.get("tool_calls"):
+                    assistant["tool_calls"] = item["tool_calls"]
+                if self.preserve_reasoning_content:
+                    assistant.setdefault("reasoning_content", "")
+                messages.append(assistant)
+                continue
             if role not in {"assistant", "system", "user"}:
                 continue
             images = normalized_image_attachments(item.get("images")) if role == "user" else ()
@@ -259,26 +291,18 @@ class OpenAICompatibleChatBackend(BaseBackend):
     def _chat_context_entries(
         self,
         response: OpenAIChatCompletionStreamResponse,
-        tool_outputs: tuple[dict[str, str], ...] | list[dict[str, str]],
+        tool_outputs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     ) -> list[ContextMessage]:
-        assistant_parts = [response.text.strip()] if response.text.strip() else []
-        assistant_parts.extend(
-            f"[Tool call: {tool_call.name}]\n{tool_call.arguments}"
-            for tool_call in response.tool_calls
+        return tool_exchange_entries(
+            response.text,
+            [
+                tool_call_payload(call.name, call.call_id, call.arguments)
+                for call in response.tool_calls
+            ],
+            tool_outputs,
+            content_key="content",
+            native={"chat_message": response.assistant_message},
         )
-        entries = [
-            transient_context_message("assistant", "\n\n".join(assistant_parts))
-        ]
-        if tool_outputs:
-            results = "\n\n".join(
-                (
-                    f"[Tool result: {output.get('tool_call_id', '')}]\n"
-                    f"{output.get('content', '')}"
-                )
-                for output in tool_outputs
-            )
-            entries.append(transient_context_message("user", results))
-        return entries
 
     def _chat_image_block(self, image: ImageAttachment) -> dict[str, Any] | None:
         encoded = self._image_base64(image)
@@ -332,6 +356,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
             text_filter = ThinkingTagStreamFilter()
             tagged_thoughts: list[str] = []
             reasoning_parts: list[str] = []
+            pending_reasoning: list[str] = []
             tool_calls_by_index: dict[int, dict[str, Any]] = {}
             usage_payload: dict[str, Any] | None = None
 
@@ -344,6 +369,11 @@ class OpenAICompatibleChatBackend(BaseBackend):
                     thought_callback(normalized)
                 else:
                     self.runtime._status(status_callback, "Created a thought")
+
+            def flush_reasoning() -> None:
+                if pending_reasoning:
+                    record_thought("".join(pending_reasoning))
+                    pending_reasoning.clear()
 
             with urllib.request.urlopen(request, timeout=120) as response:
                 for raw_line in response:
@@ -376,8 +406,13 @@ class OpenAICompatibleChatBackend(BaseBackend):
                     reasoning = self._reasoning_delta_text(delta)
                     if reasoning:
                         reasoning_parts.append(reasoning)
-                    content = delta.get("content")
-                    if isinstance(content, str) and content:
+                        pending_reasoning.append(reasoning)
+                    for kind, content in self._chat_content_parts(delta.get("content")):
+                        if kind == "thought":
+                            reasoning_parts.append(content)
+                            pending_reasoning.append(content)
+                            continue
+                        flush_reasoning()
                         visible = self._visible_stream_text(
                             text_filter,
                             content,
@@ -390,6 +425,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
                     raw_tool_calls = delta.get("tool_calls")
                     if not isinstance(raw_tool_calls, list):
                         continue
+                    flush_reasoning()
                     for raw_call in raw_tool_calls:
                         if not isinstance(raw_call, dict):
                             continue
@@ -413,6 +449,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
                         if isinstance(arguments, str) and arguments:
                             tool_call["arguments"] = f"{tool_call['arguments']}{arguments}"
 
+            flush_reasoning()
             trailing_text = self._finish_visible_stream_text(
                 text_filter,
                 delta_callback,
@@ -421,17 +458,6 @@ class OpenAICompatibleChatBackend(BaseBackend):
             )
             if trailing_text:
                 text_parts.append(trailing_text)
-            structured_thought = self._normalized_thought("".join(reasoning_parts))
-            if structured_thought:
-                thought, recovered_final = ThinkingTagStreamFilter.split_unclosed_thought(
-                    structured_thought
-                )
-                record_thought(thought)
-                if recovered_final and not text_parts:
-                    text_parts.append(recovered_final)
-                    if delta_callback is not None:
-                        delta_callback(recovered_final)
-
             tool_calls = tuple(
                 OpenAIToolCall(
                     name=str(tool_call["name"]),
@@ -482,27 +508,53 @@ class OpenAICompatibleChatBackend(BaseBackend):
             return ""
         return cast(OpenAIChatCompletionStreamResponse | str, response)
 
-    @staticmethod
-    def _reasoning_delta_text(delta: Mapping[str, Any]) -> str:
-        """Read common OpenAI-compatible private-reasoning fields."""
-        for field in ("reasoning_content", "reasoning", "thinking"):
-            value = delta.get(field)
-            if isinstance(value, str) and value:
-                return value
-            if isinstance(value, Mapping):
-                for key in ("text", "content", "reasoning"):
-                    candidate = value.get(key)
-                    if isinstance(candidate, str) and candidate:
-                        return candidate
-            if isinstance(value, list):
-                parts = [
-                    item
-                    for item in value
-                    if isinstance(item, str) and item
-                ]
-                if parts:
-                    return "".join(parts)
+    @classmethod
+    def _reasoning_delta_text(cls, delta: Mapping[str, Any]) -> str:
+        """Read one reasoning representation; gateways can send several aliases."""
+        for field in ("reasoning_content", "reasoning", "thinking", "reasoning_details"):
+            text = cls._reasoning_text(delta.get(field))
+            if text:
+                return text
         return ""
+
+    @classmethod
+    def _reasoning_text(cls, value: object) -> str:
+        """Extract disclosed text, never signatures or encrypted reasoning data."""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "".join(cls._reasoning_text(item) for item in value)
+        if isinstance(value, Mapping):
+            if value.get("type") in {"redacted_thinking", "reasoning.encrypted"}:
+                return ""
+            for key in ("text", "content", "thinking", "reasoning", "summary"):
+                text = cls._reasoning_text(value.get(key))
+                if text:
+                    return text
+        return ""
+
+    @classmethod
+    def _chat_content_parts(cls, value: object) -> tuple[tuple[str, str], ...]:
+        """Separate typed reasoning and answer blocks without inspecting prose."""
+        if isinstance(value, str):
+            return (("text", value),) if value else ()
+        if not isinstance(value, list):
+            return ()
+        parts: list[tuple[str, str]] = []
+        for item in value:
+            if not isinstance(item, Mapping):
+                continue
+            block_type = item.get("type", "text")
+            if block_type in {"thinking", "reasoning", "reasoning.text", "reasoning.summary"}:
+                kind = "thought"
+            elif block_type in {"text", "output_text"}:
+                kind = "text"
+            else:
+                continue
+            text = cls._reasoning_text(item)
+            if text:
+                parts.append((kind, text))
+        return tuple(parts)
 
     @staticmethod
     def _normalized_thought(value: str) -> str:
@@ -522,6 +574,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
                 self._parse_tool_arguments(tool_call.arguments),
                 callbacks,
                 session_path,
+                tool_call_id=tool_call.call_id,
             )
             outputs.append(
                 {
@@ -567,17 +620,11 @@ class OpenAICompatibleChatBackend(BaseBackend):
             return None
         return self._extract_chat_content(message.get("content"))
 
-    @staticmethod
-    def _extract_chat_content(value: object) -> str:
-        if isinstance(value, str):
-            return value.strip()
-        if isinstance(value, list):
-            return "\n".join(
-                str(item.get("text") or "").strip()
-                for item in value
-                if isinstance(item, dict) and item.get("text")
-            ).strip()
-        return ""
+    @classmethod
+    def _extract_chat_content(cls, value: object) -> str:
+        return strip_thinking_tags("\n".join(
+            text.strip() for kind, text in cls._chat_content_parts(value) if kind == "text"
+        ))
 
     def _simple_completion(
         self,
@@ -639,7 +686,7 @@ class OpenAICompatibleChatBackend(BaseBackend):
                 user_message=user_message,
             ),
             model,
-            timeout=8,
+            timeout=30,
         )
         return self._sanitize_command_evaluation(value) if value else None
 
@@ -686,9 +733,11 @@ class OpenAICompatibleChatBackend(BaseBackend):
         messages: list[dict[str, Any]],
         previous_summary: str,
         model: str,
+        *,
+        system_prompt: str | None = None,
     ) -> str | None:
         value = self._simple_completion(
-            self._context_summary_system_prompt(),
+            system_prompt or self._context_summary_system_prompt(),
             self._context_summary_user_prompt(messages, previous_summary),
             model,
             timeout=120,

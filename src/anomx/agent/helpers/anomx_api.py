@@ -143,6 +143,17 @@ def call_anomx_api(
     length = len(raw)
     result_count = _result_count(payload)
     response_preview, response_truncated = _response_preview(payload)
+    if status_code == 404 and not parsed_as_json:
+        response_preview = {
+            "detail": (
+                "No API route matched this URL. Use an unversioned path relative to "
+                f"{connection.base_url}, such as /channels or /jobs. "
+                "Read /openapi.json for supported paths. If documented paths also return "
+                "404, report the API routing/configuration error instead of guessing "
+                "version or module prefixes. The raw response is saved in response_path."
+            )
+        }
+        response_truncated = True
     meta = {
         "ok": 200 <= status_code < 300,
         "status_code": status_code,

@@ -24,6 +24,8 @@ from anomx.agent.context_management import (
     CONTINUE_AFTER_COMPRESSION_PROMPT,
     ContextMessage,
     projected_context_tokens,
+    tool_call_payload,
+    tool_exchange_entries,
     transient_context_message,
 )
 from anomx.agent.exceptions import BackendFailure
@@ -57,9 +59,11 @@ class OpenAIBackend(BaseBackend):
         context_entries = self.runtime.backend_conversation_entries(session_path)
         payload: dict[str, Any] = {
             "model": model,
-            "instructions": self.runtime._instructions(session_path),
+            "instructions": self.runtime._instructions(
+                session_path, include_previous_conversation=False
+            ),
             "input": self._openai_messages(
-                [entry.payload for entry in context_entries], model
+                [entry.payload for entry in context_entries], model, session_path=session_path
             ),
             "reasoning": reasoning,
             "tools": self._openai_tools(),
@@ -78,6 +82,7 @@ class OpenAIBackend(BaseBackend):
                 payload,
                 callbacks.delta,
                 callbacks.status,
+                callbacks.thought,
             )
             if isinstance(response, str):
                 recovered_entries = self._recover_context_window(
@@ -88,9 +93,13 @@ class OpenAIBackend(BaseBackend):
                 context_entries = recovered_entries
                 payload = {
                     **payload,
-                    "instructions": self.runtime._instructions(session_path),
+                    "instructions": self.runtime._instructions(
+                        session_path, include_previous_conversation=False
+                    ),
                     "input": self._openai_messages(
-                        [entry.payload for entry in context_entries], model,
+                        [entry.payload for entry in context_entries],
+                        model,
+                        session_path=session_path,
                     ),
                 }
                 payload.pop("previous_response_id", None)
@@ -104,6 +113,9 @@ class OpenAIBackend(BaseBackend):
                 callbacks,
                 session_path,
             )
+            if getattr(self.runtime, "produced_output", None) is not None:
+                return self.runtime.produced_output
+
             if not tool_outputs:
                 continuation_prompt, used_plan_guard = (
                     self.runtime._continuation_prompt_after_text(
@@ -144,10 +156,14 @@ class OpenAIBackend(BaseBackend):
                         )
                     payload = {
                         "model": model,
-                        "instructions": self.runtime._instructions(session_path),
+                        "instructions": self.runtime._instructions(
+                            session_path, include_previous_conversation=False
+                        ),
                         "input": (
                             self._openai_messages(
-                                [entry.payload for entry in context_entries], model
+                                [entry.payload for entry in context_entries],
+                                model,
+                                session_path=session_path,
                             )
                             if compressed
                             else [{"role": "user", "content": continuation_prompt}]
@@ -191,10 +207,14 @@ class OpenAIBackend(BaseBackend):
 
             payload = {
                 "model": model,
-                "instructions": self.runtime._instructions(session_path),
+                "instructions": self.runtime._instructions(
+                    session_path, include_previous_conversation=False
+                ),
                 "input": (
                     self._openai_messages(
-                        [entry.payload for entry in context_entries], model
+                        [entry.payload for entry in context_entries],
+                        model,
+                        session_path=session_path,
                     )
                     if compressed
                     else tool_outputs
@@ -216,23 +236,18 @@ class OpenAIBackend(BaseBackend):
     def _openai_context_entries(
         self,
         response: OpenAIStreamResponse,
-        tool_outputs: tuple[dict[str, str], ...] | list[dict[str, str]],
+        tool_outputs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     ) -> list[ContextMessage]:
-        assistant_parts = [response.text.strip()] if response.text.strip() else []
-        assistant_parts.extend(
-            f"[Tool call: {tool_call.name}]\n{tool_call.arguments}"
-            for tool_call in response.tool_calls
+        return tool_exchange_entries(
+            response.text,
+            [
+                tool_call_payload(call.name, call.call_id, call.arguments)
+                for call in response.tool_calls
+            ],
+            tool_outputs,
+            content_key="output",
+            native={"responses_reasoning": list(response.reasoning)},
         )
-        entries = [
-            transient_context_message("assistant", "\n\n".join(assistant_parts))
-        ]
-        if tool_outputs:
-            results = "\n\n".join(
-                f"[Tool result: {output.get('call_id', '')}]\n{output.get('output', '')}"
-                for output in tool_outputs
-            )
-            entries.append(transient_context_message("user", results))
-        return entries
 
     def _stream_openai_response(
         self,
@@ -240,6 +255,7 @@ class OpenAIBackend(BaseBackend):
         payload: dict[str, Any],
         delta_callback: BackendTextCallback | None,
         status_callback: BackendTextCallback | None,
+        thought_callback: BackendTextCallback | None = None,
     ) -> OpenAIStreamResponse | str:
         def stream_once() -> OpenAIStreamResponse | str:
             self.runtime._debug_log_step(self.provider_key, payload)
@@ -255,7 +271,9 @@ class OpenAIBackend(BaseBackend):
             response_id: str | None = None
             text_parts: list[str] = []
             text_filter = ThinkingTagStreamFilter()
-            reasoning_parts: list[str] = []
+            reasoning_parts: dict[str, dict[int, str]] = {}
+            reasoning_items: list[dict[str, Any]] = []
+            emitted_reasoning: set[str] = set()
             tool_calls: list[OpenAIToolCall] = []
             usage_payload: dict[str, Any] | None = None
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -284,19 +302,41 @@ class OpenAIBackend(BaseBackend):
                                 delta,
                                 delta_callback,
                                 status_callback,
+                                thought_callback,
                             )
                             if visible:
                                 text_parts.append(visible)
-                    elif event_type == "response.reasoning_summary_text.delta":
-                        delta = str(event.get("delta", ""))
-                        if delta:
-                            reasoning_parts.append(delta)
-                            self.runtime._reasoning_status(
-                                status_callback,
-                                "".join(reasoning_parts),
+                    elif event_type in {
+                        "response.reasoning_summary_text.delta",
+                        "response.reasoning_summary_text.done",
+                    }:
+                        item_id = str(event.get("item_id") or event.get("output_index", ""))
+                        summary_index = int(event.get("summary_index", 0))
+                        parts = reasoning_parts.setdefault(item_id, {})
+                        if event_type.endswith(".done"):
+                            parts[summary_index] = str(
+                                event.get("text", parts.get(summary_index, ""))
+                            )
+                        else:
+                            parts[summary_index] = parts.get(summary_index, "") + str(
+                                event.get("delta", "")
                             )
                     elif event_type == "response.output_item.done":
-                        tool_call = self._tool_call_from_stream_item(event.get("item"))
+                        item = event.get("item")
+                        if isinstance(item, dict) and item.get("type") == "reasoning":
+                            reasoning_items.append(item)
+                            item_id = str(item.get("id") or event.get("output_index", ""))
+                            parts = reasoning_parts.setdefault(item_id, {})
+                            for index, part in enumerate(item.get("summary") or []):
+                                if isinstance(part, dict) and part.get("type") == "summary_text":
+                                    parts[index] = str(part.get("text", ""))
+                            if item_id not in emitted_reasoning:
+                                self._emit_thought(
+                                    "\n\n".join(parts[index] for index in sorted(parts)),
+                                    thought_callback, status_callback,
+                                )
+                                emitted_reasoning.add(item_id)
+                        tool_call = self._tool_call_from_stream_item(item)
                         if tool_call is not None:
                             tool_calls.append(tool_call)
                     elif event_type == "response.completed":
@@ -308,7 +348,15 @@ class OpenAIBackend(BaseBackend):
                             maybe_usage = response_payload.get("usage")
                             if isinstance(maybe_usage, dict):
                                 usage_payload = maybe_usage
-            trailing_text = self._finish_visible_stream_text(text_filter, delta_callback)
+            for item_id, parts in reasoning_parts.items():
+                if item_id not in emitted_reasoning:
+                    self._emit_thought(
+                        "\n\n".join(parts[index] for index in sorted(parts)),
+                        thought_callback, status_callback,
+                    )
+            trailing_text = self._finish_visible_stream_text(
+                text_filter, delta_callback, status_callback, thought_callback,
+            )
             if trailing_text:
                 text_parts.append(trailing_text)
             return OpenAIStreamResponse(
@@ -316,6 +364,7 @@ class OpenAIBackend(BaseBackend):
                 "".join(text_parts).strip(),
                 tuple(tool_calls),
                 usage=openai_token_usage(usage_payload),
+                reasoning=tuple(reasoning_items),
             )
 
         if self.runtime._turn_aborted():
@@ -362,6 +411,7 @@ class OpenAIBackend(BaseBackend):
                     "input": [{"role": "user", "content": self._title_prompt(messages)}],
                     "max_output_tokens": 24,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -405,8 +455,9 @@ class OpenAIBackend(BaseBackend):
                             ),
                         }
                     ],
-                    "max_output_tokens": 180,
+                    "max_output_tokens": 4096,
                     "stream": False,
+                    **self._background_effort_payload(model),
                     "text": {
                         "format": {
                             "type": "json_schema",
@@ -424,7 +475,7 @@ class OpenAIBackend(BaseBackend):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
         except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
             return None
@@ -460,6 +511,7 @@ class OpenAIBackend(BaseBackend):
                     ],
                     "max_output_tokens": 120,
                     "stream": False,
+                    **self._background_effort_payload(model),
                     "text": {
                         "format": {
                             "type": "json_schema",
@@ -497,6 +549,7 @@ class OpenAIBackend(BaseBackend):
                     "input": [{"role": "user", "content": prompt}],
                     "max_output_tokens": 16,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -530,6 +583,7 @@ class OpenAIBackend(BaseBackend):
                     "input": [{"role": "user", "content": self._title_prompt(messages)}],
                     "max_output_tokens": 48,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={
@@ -550,6 +604,8 @@ class OpenAIBackend(BaseBackend):
         messages: list[dict[str, Any]],
         previous_summary: str,
         model: str,
+        *,
+        system_prompt: str | None = None,
     ) -> str | None:
         api_key = self._api_key(self.provider_key, self.env_var)
         if api_key is None:
@@ -559,7 +615,7 @@ class OpenAIBackend(BaseBackend):
             data=json.dumps(
                 {
                     "model": model,
-                    "instructions": self._context_summary_system_prompt(),
+                    "instructions": system_prompt or self._context_summary_system_prompt(),
                     "input": [
                         {
                             "role": "user",
@@ -571,6 +627,7 @@ class OpenAIBackend(BaseBackend):
                     ],
                     "max_output_tokens": 4096,
                     "stream": False,
+                    **self._background_effort_payload(model),
                 }
             ).encode("utf-8"),
             headers={

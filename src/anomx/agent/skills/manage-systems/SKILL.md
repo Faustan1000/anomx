@@ -1,9 +1,10 @@
 ---
-command: manage-systems
-title: Manage Systems
+name: manage-systems
 description: Discover physical systems, build verified hierarchies, and connect data channels to systems.
-hidden: true
-system: true
+metadata:
+    title: Manage Systems
+    hidden: true
+    system: true
 ---
 
 # Manage Anomx Systems
@@ -53,18 +54,25 @@ list operation; verify hierarchy and attached channels through `/systems/explore
 
 After each write, verify the returned fields and inspect the affected branch. Keep
 connection IDs for any specifically authorized correction. Read existing JSON
-properties before PATCHing: replacing that field replaces the JSON object. Complete
-one evidenced channel-to-system chain per discovery run, then report the channel,
-reused/created systems, verified connections, uncertainties, and any blocked writes.
+properties before PATCHing: replacing that field replaces the JSON object. Complete the requested, evidenced branch in bounded steps and retain a continuation
+checkpoint for larger catalogs. Report the covered channels, reused/created systems,
+verified connections, uncertainties, and any blocked writes.
 Do not claim completion when only a recommendation was created. Background tasks
 must obey their configured create/update/delete permissions for both systems and
 connections; use recommendations for writes the server denies.
 
-For infrastructure diagnostics, use `/system/health`, `/system/nodes`,
-`/system/services`, and `/system/jobs`. Correlate identity, health, heartbeat,
-timestamps, and error details before making operational recommendations.
+Use the platform's `use-icons` skill when available to select and validate the top-level
+`icon` for a new system or an icon change. Choose consistent icons for sibling roles;
+never invent names. Preserve an existing valid user choice. A physical hierarchy should
+reflect facilities, machines, subsystems and measured components with meaningful names,
+not one artificial System for every identifier segment. Search and reuse each evidenced
+ancestor; keep provenance in descriptions/properties without making it a hierarchy edge.
 
-System actions have broad impact. Do not cancel `/system/jobs/<id>/cancel`, change
-service configuration, or issue an operational write unless it is explicitly requested
-and permitted by the active mode. In Recommend mode, describe such an action in a
-`POST /recommendations` proposal instead of applying it.
+A channel's catalog identity, live value, historical availability and recording state
+are distinct. An `observes` edge classifies the signal's meaning; it does not start
+recording or configure its DAQ service. Verify current value/history via `retrieve-data`
+and use `manage-jobs` for acquisition changes.
+
+Platform nodes and services are separate from the domain hierarchy. Use `inspect-platform`
+when available for a multi-host overview and supported health/info probes. A system
+organization request does not authorize restarting workers or changing compute capacity.

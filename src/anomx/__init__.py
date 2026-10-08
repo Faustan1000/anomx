@@ -10,7 +10,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-__version__ = "0.2.40"
+__version__ = "0.2.66"
 
 _COMPONENT_EXPORTS = {
     "AbsoluteErrorScorer",
@@ -96,6 +96,13 @@ _LAZY_EXPORTS = {
     **{name: "anomx.components.base" for name in _BASE_COMPONENT_EXPORTS},
     **{name: "anomx.data" for name in _DATA_EXPORTS},
     **{name: "anomx.runner" for name in _RUNNER_EXPORTS},
+    "Dataset": "anomx.datasets",
+    "Model": "anomx.models",
+    "PyTorchModel": "anomx.models",
+    "ONNXModel": "anomx.models",
+    "WorkContext": "anomx.work",
+    "get_work_context": "anomx.work",
+    "PlatformClient": "anomx.integrations.platform",
 }
 
 __all__ = sorted(_LAZY_EXPORTS)

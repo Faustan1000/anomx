@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "anomx"
-version = "0.2.40"
+version = "0.2.66"
 description = "Installable time-series anomaly library with forecasting, reconstruction, and representation base approaches."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,11 +41,21 @@ dependencies = [
 
 [project.optional-dependencies]
 darts = [
-  "u8darts[all]>=0.30"
+  "darts>=0.41,<0.42"
 ]
 torch = [
   "torch>=2.2",
   "lightning>=2.2"
+]
+onnx = [
+  "onnx>=1.16",
+  "onnxruntime>=1.18"
+]
+ml = [
+  "darts[torch]>=0.41,<0.42",
+  "torch>=2.5",
+  "onnx>=1.16",
+  "onnxruntime>=1.18"
 ]
 dev = [
   "mypy>=1.10",
@@ -82,13 +92,6 @@ packages = ["src/anomx"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/anomx/py.typed" = "anomx/py.typed"
-"src/anomx/agent/skills/manage-data/README.md" = "anomx/agent/skills/manage-data/README.md"
-"src/anomx/agent/skills/manage-jobs/README.md" = "anomx/agent/skills/manage-jobs/README.md"
-"src/anomx/agent/skills/manage-recommendations/README.md" = "anomx/agent/skills/manage-recommendations/README.md"
-"src/anomx/agent/skills/manage-systems/README.md" = "anomx/agent/skills/manage-systems/README.md"
-"src/anomx/agent/skills/retrieve-data/README.md" = "anomx/agent/skills/retrieve-data/README.md"
-"src/anomx/agent/skills/use-anomx-api/README.md" = "anomx/agent/skills/use-anomx-api/README.md"
-"src/anomx/agent/skills/use-anomx-api/api.py" = "anomx/agent/skills/use-anomx-api/api.py"
 
 [tool.pytest.ini_options]
 addopts = "-ra"

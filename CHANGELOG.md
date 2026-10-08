@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.43
+
+- Forward provider reasoning and OpenAI reasoning summaries as separate thought events.
+- Preserve thoughts in subagent work history and retain signed/redacted Anthropic blocks for tool continuation.
+- Keep structured reasoning and unfinished thinking blocks out of normal assistant text.
+- Start agent turns with a brief text response and provide occasional progress updates during longer work.
+
 ## 0.2.8
 
 - **Major codebase restructuring**: Tools and backends moved into dedicated classes for better object-oriented design.

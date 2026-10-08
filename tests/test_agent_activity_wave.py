@@ -88,7 +88,8 @@ def test_messages_do_not_move_the_wave_to_an_older_request(chat):
         "message": "The count is nearly ready.", "intermediate": True, "turn_id": "turn-1",
     })
     messages = app._messages_with_working_status(app._read_message_lines(session.path), "Thinking")
-    assert [line.text for line in messages if line.activity_wave] == ["Counting channels"]
+    assert not any(line.activity_wave for line in messages)
+    assert messages[-2].text == "Thinking"
     home.append_session_event(session.path, "user_message", {"message": "Inspect another source"})
     messages = app._messages_with_working_status(app._read_message_lines(session.path), "Thinking")
     assert not any(line.activity_wave for line in messages)

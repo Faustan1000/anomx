@@ -21,7 +21,10 @@ from anomx.agent.base.backends import (
 from anomx.agent.context_management import (
     CONTINUE_AFTER_COMPRESSION_PROMPT,
     ContextMessage,
+    local_tool_call_id,
     projected_context_tokens,
+    tool_call_payload,
+    tool_exchange_entries,
     transient_context_message,
 )
 from anomx.agent.exceptions import BackendFailure
@@ -49,7 +52,7 @@ class OllamaBackend(BaseBackend):
         del thinking_intensity
         context_entries = self.runtime.backend_conversation_entries(session_path)
         messages = [
-            {"role": "system", "content": self.runtime._instructions(session_path)},
+            *self.runtime.context_system_messages(session_path),
             *self._ollama_messages(
                 [entry.payload for entry in context_entries],
                 model,
@@ -61,7 +64,9 @@ class OllamaBackend(BaseBackend):
                 return ""
             messages[0] = {
                 "role": "system",
-                "content": self.runtime._instructions(session_path),
+                "content": self.runtime._instructions(
+                    session_path, include_previous_conversation=False
+                ),
             }
             response = self._stream_ollama_response(model, messages, callbacks)
             if isinstance(response, str):
@@ -72,7 +77,7 @@ class OllamaBackend(BaseBackend):
                     return response
                 context_entries = recovered_entries
                 messages = [
-                    {"role": "system", "content": self.runtime._instructions(session_path)},
+                    *self.runtime.context_system_messages(session_path),
                     *self._ollama_messages([entry.payload for entry in context_entries], model),
                 ]
                 continue
@@ -118,10 +123,7 @@ class OllamaBackend(BaseBackend):
                             )
                         )
                         messages = [
-                            {
-                                "role": "system",
-                                "content": self.runtime._instructions(session_path),
-                            },
+                            *self.runtime.context_system_messages(session_path),
                             *self._ollama_messages(
                                 [entry.payload for entry in context_entries],
                                 model,
@@ -142,6 +144,9 @@ class OllamaBackend(BaseBackend):
                 callbacks,
                 session_path,
             )
+            if getattr(self.runtime, "produced_output", None) is not None:
+                return self.runtime.produced_output
+
             messages.extend(tool_messages)
             pending_entries = self._ollama_context_entries(response, tool_messages)
             context_entries.extend(pending_entries)
@@ -163,10 +168,7 @@ class OllamaBackend(BaseBackend):
                     )
                 )
                 messages = [
-                    {
-                        "role": "system",
-                        "content": self.runtime._instructions(session_path),
-                    },
+                    *self.runtime.context_system_messages(session_path),
                     *self._ollama_messages(
                         [entry.payload for entry in context_entries],
                         model,
@@ -183,27 +185,16 @@ class OllamaBackend(BaseBackend):
         response: OllamaStreamResponse,
         tool_outputs: tuple[dict[str, Any], ...] | list[dict[str, Any]],
     ) -> list[ContextMessage]:
-        assistant_parts = [response.text.strip()] if response.text.strip() else []
-        assistant_parts.extend(
-            (
-                f"[Tool call: {tool_call.name}]\n"
-                f"{json.dumps(tool_call.arguments, ensure_ascii=False, sort_keys=True)}"
-            )
-            for tool_call in response.tool_calls
+        return tool_exchange_entries(
+            response.text,
+            [
+                tool_call_payload(call.name, local_tool_call_id(output["content"]), call.arguments)
+                for call, output in zip(response.tool_calls, tool_outputs, strict=True)
+            ],
+            tool_outputs,
+            content_key="content",
+            native={"ollama_message": response.message},
         )
-        entries = [
-            transient_context_message("assistant", "\n\n".join(assistant_parts))
-        ]
-        if tool_outputs:
-            results = "\n\n".join(
-                (
-                    f"[Tool result: {output.get('tool_name', '')}]\n"
-                    f"{output.get('content', '')}"
-                )
-                for output in tool_outputs
-            )
-            entries.append(transient_context_message("user", results))
-        return entries
 
     def _stream_ollama_response(
         self,
@@ -229,6 +220,11 @@ class OllamaBackend(BaseBackend):
         def stream_once() -> OllamaStreamResponse | str:
             self.runtime._debug_log_step(self.provider_key, payload)
             thinking_parts: list[str] = []
+            pending_thinking: list[str] = []
+
+            def flush_thinking() -> None:
+                self._emit_thought("".join(pending_thinking), callbacks.thought, callbacks.status)
+                pending_thinking.clear()
             text_parts: list[str] = []
             text_filter = ThinkingTagStreamFilter()
             tool_calls: list[OllamaToolCall] = []
@@ -255,12 +251,14 @@ class OllamaBackend(BaseBackend):
                     thinking = stream_message.get("thinking")
                     if isinstance(thinking, str) and thinking:
                         thinking_parts.append(thinking)
+                        pending_thinking.append(thinking)
                         self.runtime._reasoning_status(
                             callbacks.status,
                             "".join(thinking_parts),
                         )
                     content = stream_message.get("content")
                     if isinstance(content, str) and content:
+                        flush_thinking()
                         visible = self._visible_stream_text(
                             text_filter,
                             content,
@@ -272,11 +270,13 @@ class OllamaBackend(BaseBackend):
                             text_parts.append(visible)
                     raw_tool_calls = stream_message.get("tool_calls")
                     if isinstance(raw_tool_calls, list):
+                        flush_thinking()
                         for item in raw_tool_calls:
                             tool_call = self._ollama_tool_call(item)
                             if tool_call is not None:
                                 tool_calls.append(tool_call)
 
+            flush_thinking()
             trailing_text = self._finish_visible_stream_text(
                 text_filter,
                 callbacks.delta,
@@ -287,12 +287,6 @@ class OllamaBackend(BaseBackend):
                 text_parts.append(trailing_text)
 
             thought = "".join(thinking_parts).strip()
-            if thought:
-                if callbacks.thought is not None:
-                    callbacks.thought(thought)
-                else:
-                    self.runtime._status(callbacks.status, "Created a thought")
-
             assistant_message: dict[str, Any] = {"role": "assistant"}
             if thinking_parts:
                 assistant_message["thinking"] = "".join(thinking_parts)
@@ -414,7 +408,7 @@ class OllamaBackend(BaseBackend):
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
+            with urllib.request.urlopen(request, timeout=30) as response:
                 data = cast(dict[str, Any], json.loads(response.read().decode("utf-8")))
         except (OSError, TimeoutError, urllib.error.URLError, urllib.error.HTTPError):
             return None
@@ -521,11 +515,16 @@ class OllamaBackend(BaseBackend):
         messages: list[dict[str, Any]],
         previous_summary: str,
         model: str,
+        *,
+        system_prompt: str | None = None,
     ) -> str | None:
         payload = {
             "model": model,
             "messages": [
-                {"role": "system", "content": self._context_summary_system_prompt()},
+                {
+                    "role": "system",
+                    "content": system_prompt or self._context_summary_system_prompt(),
+                },
                 {
                     "role": "user",
                     "content": self._context_summary_user_prompt(

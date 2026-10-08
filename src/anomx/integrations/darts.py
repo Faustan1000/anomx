@@ -15,7 +15,7 @@ from anomx.data import TimeSeriesDataset
 
 
 class _DartsPrediction(Protocol):
-    def pd_dataframe(self) -> pd.DataFrame:
+    def to_dataframe(self) -> pd.DataFrame:
         """Return a pandas forecast frame."""
 
 
@@ -73,7 +73,11 @@ class DartsForecastingModel:
     def predict(self, horizon: int) -> Forecast:
         """Predict with the wrapped Darts model and return an Anomx forecast."""
         prediction = self.model.predict(horizon)
-        frame = prediction.pd_dataframe()
+        # Darts >=0.39 uses to_dataframe; retain older wrapped-model support.
+        dataframe_factory = getattr(prediction, "to_dataframe", None)
+        if dataframe_factory is None:
+            dataframe_factory = getattr(prediction, "pd_dataframe")  # noqa: B009 - legacy protocol
+        frame = dataframe_factory()
         return Forecast(
             values=frame,
             metadata={

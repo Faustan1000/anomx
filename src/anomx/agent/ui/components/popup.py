@@ -84,8 +84,10 @@ class PopupComponentMixin:
         title: str,
         subtitle: str,
         choices: tuple[MenuChoice, ...],
+        *,
+        initial_value: str | None = None,
     ) -> str | None:
-        return self._run_overlay_menu(stdscr, title, subtitle, choices)
+        return self._run_overlay_menu(stdscr, title, subtitle, choices, initial_value=initial_value)
 
     def _bottom_menu(
         self,
@@ -270,6 +272,7 @@ class PopupComponentMixin:
         subtitle: str = "",
         choices: tuple[MenuChoice, ...] = (),
         footer: str = "Esc Back · ↑↓ Navigate · Enter Select",
+        initial_value: str | None = None,
     ) -> str | None:
         """Run an overlay menu loop."""
         if not choices:
@@ -279,7 +282,10 @@ class PopupComponentMixin:
         )
         if not selectable_indices:
             return None
-        selected = selectable_indices[0]
+        selected = next(
+            (index for index in selectable_indices if choices[index].value == initial_value),
+            selectable_indices[0],
+        )
         while True:
             self._draw_overlay(
                 stdscr,

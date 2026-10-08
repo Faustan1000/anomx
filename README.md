@@ -108,6 +108,10 @@ anomx --ollama --model qwen3-coder:30b
 Current CLI capabilities include:
 
 - A full-screen terminal UI with persisted transcripts and session history.
+- Tool blocks show the latest activity while running and a count-based summary
+  when the agent moves on to text. Completed work folds into an expandable
+  "Worked for ..." line, leaving the final answer visible. The Extended work
+  visualization setting keeps the full transcript open.
 - Multiple model backends: OpenAI, Anthropic, Kimi, DESY Assistant, JSC
   Blablador, and local Ollama.
 - Five execution modes: Plan, Recommend (with a connected platform), Standard,
@@ -156,6 +160,16 @@ src/anomx/
 ```
 
 ## Darts Integration
+
+For new flexible jobs, use the Darts-native `Dataset`, `PyTorchModel`, scorer and
+detector APIs and the host-provided `WorkContext`. See
+[flexible jobs and ONNX training](docs/flexible-jobs.md) for a complete starter,
+backend channel loading, custom networks, and portable model publication.
+
+```bash
+pip install "anomx[ml]"
+python examples/flexible_job_training.py
+```
 
 The default install stays lightweight. To use Darts models, install the optional
 extra and wrap any compatible Darts forecasting model:

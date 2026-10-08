@@ -98,6 +98,12 @@ class StartSubagentTool(BaseTool):
                 else False
             ),
             additional_instructions=context.runtime.additional_instructions,
+            mode_provider=context.runtime.mode_provider,
+            before_model_request=context.runtime.before_model_request,
+            context_summarizer=context.runtime.context_summarizer,
+            context_summary_context_window=context.runtime.context_summary_context_window,
+            context_optimizer=context.runtime.context_optimizer,
+            context_optimizer_context_window=context.runtime.context_optimizer_context_window,
         )
         state.runtime = child_runtime
         child_runtime._parent_session_id = session_id_from_path(context.session_path)

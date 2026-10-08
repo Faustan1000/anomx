@@ -17,13 +17,14 @@ from anomx.agent.tools.cli_command import CliCommandTool
 from anomx.agent.tools.create_plan import CreatePlanTool
 from anomx.agent.tools.end_process import EndProcessTool
 from anomx.agent.tools.finish_anyways import FinishAnywaysTool
+from anomx.agent.tools.focus_object import FocusObjectTool
 from anomx.agent.tools.get_subagent_info import GetSubagentInfoTool
 from anomx.agent.tools.glob import GlobTool
 from anomx.agent.tools.grep import GrepTool
 from anomx.agent.tools.kill_command import KillCommandTool
 from anomx.agent.tools.list_directory import ListDirectoryTool
 from anomx.agent.tools.memorize import MemorizeTool
-from anomx.agent.tools.output_response import OutputResponseTool
+from anomx.agent.tools.produce_output import ProduceOutputTool
 from anomx.agent.tools.prompt_subagent import PromptSubagentTool
 from anomx.agent.tools.read_file import ReadFileTool
 from anomx.agent.tools.remove_plan import RemovePlanTool
@@ -67,7 +68,8 @@ def main_agent_tools() -> tuple[BaseTool, ...]:
         StartProcessTool(statement_description=statement, main_agent=True),
         EndProcessTool(statement_description=statement),
         AskQuestionTool(statement_description=statement),
-        OutputResponseTool(),
+        ProduceOutputTool(),
+        FocusObjectTool(statement_description=statement),
         SendFeedbackTool(statement_description=statement),
         MemorizeTool(statement_description=statement),
         CreatePlanTool(),
@@ -106,32 +108,6 @@ def subagent_tools() -> tuple[BaseTool, ...]:
     )
 
 
-def read_only_mode_tools() -> tuple[BaseTool, ...]:
-    """Return tools exposed to either agent while Plan mode is active."""
-
-    statement = MAIN_AGENT_STATEMENT_DESCRIPTION
-    return (
-        CliCommandTool(
-            statement_description=statement,
-            description="Run a read-only CLI command for planning and inspection.",
-            access="read",
-            aliases=("run_cli_command",),
-            main_agent=True,
-        ),
-        ReadFileTool(statement_description=statement),
-        ListDirectoryTool(statement_description=statement),
-        GlobTool(statement_description=statement),
-        GrepTool(statement_description=statement),
-        WebSearchTool(statement_description=statement),
-        WebFetchTool(statement_description=statement),
-        GetAnomxObjectDetailsTool(),
-        SearchAnomxObjectsTool(),
-        SearchAnomxDataChannelsTool(),
-        GetAnomxDataChannelHistoryTool(),
-        ManageDataAdaptersTool(),
-    )
-
-
 def recommendation_mode_tools(*, main_agent: bool) -> tuple[BaseTool, ...]:
     """Return read tools plus recommendation creation for a connected platform."""
 
@@ -159,7 +135,7 @@ def recommendation_mode_tools(*, main_agent: bool) -> tuple[BaseTool, ...]:
     ]
     tools.append(GetBackgroundRunsTool())
     if main_agent:
-        tools.append(OutputResponseTool())
+        tools.append(ProduceOutputTool())
     return tuple(tools)
 
 
@@ -192,7 +168,7 @@ __all__ = [
     "KillCommandTool",
     "ListDirectoryTool",
     "MemorizeTool",
-    "OutputResponseTool",
+    "ProduceOutputTool",
     "PromptSubagentTool",
     "ReadFileTool",
     "RemovePlanTool",
@@ -209,7 +185,6 @@ __all__ = [
     "WebSearchTool",
     "command_control_tools",
     "main_agent_tools",
-    "read_only_mode_tools",
     "recommendation_mode_tools",
     "subagent_tools",
     "wait_tool",
