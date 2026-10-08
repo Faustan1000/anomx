@@ -237,6 +237,19 @@ class SessionViewState:
     running_notice_role: str = "light"
     running_abort_key: str = ""
     running_abort_deadline: float = 0.0
+    notice: str = ""
+    notice_deadline: float = 0.0
+
+    def show_notice(self, text: str, *, now: float, seconds: float = 6.0) -> None:
+        """Show a transient hint in the prompt bar (separate from the exit confirmation)."""
+
+        self.notice = text
+        self.notice_deadline = now + seconds
+
+    def expire_notice(self, now: float) -> None:
+        if self.notice and now > self.notice_deadline:
+            self.notice = ""
+            self.notice_deadline = 0.0
 
     def jump_to_bottom(self) -> None:
         """Follow the newest output: leave any scroll offset and unpin the user message."""

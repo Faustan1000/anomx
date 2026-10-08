@@ -233,7 +233,8 @@ const read = () => JSON.parse(fs.readFileSync(outPath, 'utf8'));
 
   // The input box of a comment thread becomes the active "text editor" (scheme comment).
   const commentEditor = {
-    document: { uri: { scheme: 'comment', fsPath: '/comment/1' }, languageId: 'markdown', isDirty: false,
+    document: { uri: { scheme: 'comment', fsPath: '/comment/1' }, languageId: 'markdown',
+      isDirty: false,
       lineCount: 1, lineAt: () => ({ text: 'draft' }) },
     selection: { active: { line: 0, character: 5 }, start: { line: 0, character: 5 },
       end: { line: 0, character: 5 }, isEmpty: true },

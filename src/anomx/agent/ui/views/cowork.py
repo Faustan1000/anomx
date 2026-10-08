@@ -12,11 +12,18 @@ import shutil
 import subprocess
 from contextlib import suppress
 
-from anomx.agent.cowork import CoworkAction, CoworkRow, CoworkWorkspace
+from anomx.agent.cowork import (
+    CoworkAction,
+    CoworkFollower,
+    CoworkRow,
+    CoworkWorkspace,
+    context_path,
+)
 from anomx.agent.store import SessionRecord
 from anomx.agent.ui.models import CursesWindow, MenuChoice
 
 BACK_VALUE = "__back__"
+FOLLOW_VALUE = "__follow__"
 STATUS_TAGS = {
     "new": "[new]",
     "queued": "[queued]",
@@ -27,6 +34,11 @@ STATUS_TAGS = {
     "orphan": "[note gone]",
     "no-repo": "[no repo]",
 }
+NO_EXTENSION_TEXT = (
+    "Following needs the Anomx Editor Context extension, which has not written "
+    "{path} yet. Install it with the command printed by anomx's cowork setup "
+    "(code --install-extension on the .vsix) and reload VS Code."
+)
 NO_MARGO_TEXT = (
     "No Margo notes found. Add a note in VS Code (Margo extension); anomx looks for "
     ".margo/local.notes.json or .notes.json in this folder and above it."
@@ -73,6 +85,14 @@ class CoworkViewMixin:
                     )
                 )
             choices.extend(row_choice(row) for row in rows)
+            # Last, so the first note stays preselected and Enter never flips the mode by accident.
+            choices.append(
+                MenuChoice(
+                    f"Follow my notes in the editor: {'on' if self._cowork_follower else 'off'}",
+                    FOLLOW_VALUE,
+                    "Click a note in Margo's sidebar: this chat and your working tree switch to it",
+                )
+            )
             running = sum(1 for row in rows if row.running)
             subtitle = f"{len(rows)} notes" + (f" · {running} agent(s) working" if running else "")
             return subtitle, tuple(choices)
@@ -94,6 +114,9 @@ class CoworkViewMixin:
                 return None
             if selected == BACK_VALUE:
                 self._cowork_back(stdscr, panel)
+                continue
+            if selected == FOLLOW_VALUE:
+                self._cowork_toggle_follow(stdscr, panel)
                 continue
             row = next((item for item in panel.rows() if item.note_id == selected), None)
             if row is not None:
@@ -176,6 +199,16 @@ class CoworkViewMixin:
         if result.conflicts:
             detail += "\nConflicting files: " + ", ".join(result.conflicts)
         self._message(stdscr, "Cannot merge", detail)
+
+    def _cowork_toggle_follow(self, stdscr: CursesWindow, panel: CoworkWorkspace) -> None:
+        if self._cowork_follower is not None:
+            self._cowork_follower = None
+            return
+        target = context_path(self.home.root)
+        if not target.exists():
+            self._message(stdscr, "Cowork", NO_EXTENSION_TEXT.format(path=target))
+            return
+        self._cowork_follower = CoworkFollower(panel, target)
 
     def _cowork_back(self, stdscr: CursesWindow, panel: CoworkWorkspace) -> None:
         following = panel.following()

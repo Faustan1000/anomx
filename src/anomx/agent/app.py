@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from anomx.agent.base.agents import AgentKind, BaseAgent
-from anomx.agent.cowork import CoworkWorkspace
+from anomx.agent.cowork import CoworkFollower, CoworkWorkspace
 from anomx.agent.file_reference_search import FileReferenceSearchClient
 from anomx.agent.helpers.anomx_api import call_anomx_api, connection_from_home
 from anomx.agent.helpers.mode import AgentMode, next_agent_mode
@@ -128,6 +128,8 @@ from anomx.agent.ui.views.subagent import SubagentViewMixin
 IDLE_POLL_MILLISECONDS = 500
 # How long a requeue waits for the aborted worker before it keeps the new message.
 REQUEUE_STOP_GRACE_SECONDS = 1.5
+# How often the cowork follower looks at the editor context while a session is open.
+COWORK_POLL_SECONDS = 0.5
 REQUEUE_BUSY_NOTICE = "Still stopping the previous run · press Enter again in a moment"
 
 
@@ -253,6 +255,8 @@ class AnomxCliApp(
         self._startup_tasks: CliStartupProcess | None = None
         self._approval_memory_reason = ""
         self._cowork_panels: dict[Path, CoworkWorkspace] = {}
+        self._cowork_follower: CoworkFollower | None = None
+        self._next_cowork_poll = 0.0
 
     def prepare_background_startup(self, *, wait_for_runtime: bool = False) -> None:
         """Warm external startup work without blocking terminal rendering."""
@@ -1378,6 +1382,8 @@ class AnomxCliApp(
                 view.exit_confirm_deadline = 0.0
                 view.exit_notice = ""
             current_session = self._process_title_events(stdscr, current_session)
+            view.expire_notice(time.monotonic())
+            current_session = self._cowork_follow_step(stdscr, current_session, view)
             self._reap_idle_runtimes()
             active_turn = self._active_turn_for_session(current_session)
             active_turn_running = (
@@ -1468,7 +1474,9 @@ class AnomxCliApp(
                 file_references=prompt.file_references,
                 image_attachments=prompt.image_attachments,
                 anchor_line=view.pinned_anchor,
-                prompt_notice=view.running_notice if active_turn_running else view.exit_notice,
+                prompt_notice=(
+                    view.running_notice if active_turn_running else view.exit_notice or view.notice
+                ),
                 prompt_notice_role=view.running_notice_role if active_turn_running else "light",
                 working_text=(
                     active_turn.working_text if active_turn_running and active_turn else None
@@ -2549,6 +2557,65 @@ class AnomxCliApp(
             "Feedback failed",
             f"The platform returned status {result.get('status_code', 0)}.",
         )
+
+    def _cowork_follow_step(
+        self,
+        stdscr: CursesWindow,
+        session: SessionRecord,
+        view: SessionViewState,
+    ) -> SessionRecord:
+        """Switch chat and working tree to the note the user clicked in the editor.
+
+        Runs every pass of the session loop but only polls twice a second. Returns the
+        session to show (the current one when nothing changed).
+        """
+
+        follower = self._cowork_follower
+        if follower is None:
+            return session
+        now = time.monotonic()
+        # Chats of other notes keep working in the background; finish their bookkeeping.
+        self._drain_background_session_turns(stdscr, session)
+        if now < self._next_cowork_poll:
+            return session
+        self._next_cowork_poll = now + COWORK_POLL_SECONDS
+        activation = follower.poll()
+        if activation is None:
+            return session
+        panel = follower.panel
+        row = next((item for item in panel.rows() if item.note_id == activation.note.id), None)
+        if row is None:
+            return session
+        notices = [f"Cowork · {row.title}"]
+        record, problem = (None, None) if panel.is_running(row.note_id) else panel.open_chat(
+            row, discuss=True
+        )
+        if problem:
+            notices.append(problem)
+        fresh = next((item for item in panel.rows() if item.note_id == row.note_id), row)
+        tree_notice = panel.sync_tree(fresh, editor_dirty=activation.editor_dirty)
+        if tree_notice:
+            notices.append(tree_notice)
+        view.show_notice(" · ".join(notices), now=now)
+        if record is None or record.path == session.path:
+            return session
+        self._activate_agent(record.agent_kind)
+        view.jump_to_bottom()
+        return record
+
+    def _drain_background_session_turns(
+        self, stdscr: CursesWindow, current: SessionRecord
+    ) -> None:
+        """Process events and completion of running turns of sessions that are not on screen."""
+
+        current_key = self._session_turn_key(current)
+        for key, turn in list(self._active_session_turns.items()):
+            if key == current_key:
+                continue
+            self._drain_session_turn_events(stdscr, turn, render_events=False)
+            if turn.worker is not None and not turn.worker.is_alive():
+                if self._complete_session_turn(stdscr, turn, render_final=False):
+                    self.home.set_session_unread(turn.session.path, True)
 
     def _cowork_runtime_for(self, session: SessionRecord) -> AgentRuntime | None:
         """Runtime of a cowork chat (a session living in a task worktree), else ``None``."""

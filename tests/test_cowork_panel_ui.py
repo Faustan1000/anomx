@@ -136,7 +136,8 @@ def test_panel_lists_notes_with_their_status(app):
 
     app._run_cowork_panel(Keys([ESC]))
 
-    assert screen.last_choices() == [("proj/src/data.py:1  make dataclass", "[new]")]
+    assert screen.last_choices()[0] == ("proj/src/data.py:1  make dataclass", "[new]")
+    assert screen.last_choices()[-1][0] == "Follow my notes in the editor: off"
     assert screen.overlays[0]["subtitle"] == "1 notes"
 
 
@@ -293,3 +294,151 @@ def test_open_chat_resumes_the_same_session_and_is_refused_while_the_agent_runs(
 
     assert problem is None and again is not None and again.path == first.path
     assert [a.value for a in panel.actions(row)][:2] == ["start", "chat"]
+
+
+# -- following the clicked note -------------------------------------------------------
+
+
+def _put_cursor(app, workspace: Path, line: int, *, dirty: bool = False) -> None:
+    from datetime import UTC, datetime
+
+    target = app.home.root / "editor-context.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "updatedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "workspaceFolders": [str(workspace)],
+                "activeFile": str(workspace / "proj" / "src" / "data.py"),
+                "isDirty": dirty,
+                "isActiveEditor": True,
+                "cursor": {"line": line, "character": 1},
+                "selection": {"startLine": line, "endLine": line},
+                "visibleRange": {"startLine": 1, "endLine": 50},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+def _enable_follow(app, workspace: Path, monkeypatch):
+    from anomx.agent import app as app_module
+    from anomx.agent.ui.models import SessionViewState
+
+    monkeypatch.setattr(app_module, "COWORK_POLL_SECONDS", 0.0)
+    screen = Screen(app)
+    _put_cursor(app, workspace, 1)
+    app._run_cowork_panel(Keys([*[DOWN] * 1, ENTER, ESC]))  # toggle is the last entry
+    assert app._cowork_follower is not None
+    return screen, SessionViewState()
+
+
+def _step(app, session, view):
+    app._next_cowork_poll = 0.0
+    return app._cowork_follow_step(Keys([]), session, view)
+
+
+def test_toggle_needs_the_extension_and_can_be_turned_off_again(app, workspace):
+    screen = Screen(app)
+
+    app._run_cowork_panel(Keys([DOWN, ENTER, ESC]))  # no editor-context file yet
+    assert app._cowork_follower is None
+    assert "Editor Context extension" in screen.messages[-1][1]
+
+    _put_cursor(app, workspace, 1)
+    app._run_cowork_panel(Keys([DOWN, ENTER, ESC]))
+    assert app._cowork_follower is not None
+    assert screen.last_choices()[-1][0] == "Follow my notes in the editor: on"
+
+    app._run_cowork_panel(Keys([DOWN, ENTER, ESC]))
+    assert app._cowork_follower is None
+
+
+def test_clicking_a_note_switches_to_its_chat_after_two_polls(app, workspace, monkeypatch):
+    _screen, view = _enable_follow(app, workspace, monkeypatch)
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+
+    assert _step(app, ordinary, view) is ordinary  # first sighting only
+    chat = _step(app, ordinary, view)
+
+    assert chat.path != ordinary.path and chat.title == "make dataclass"
+    assert Path(chat.cwd).name.startswith("n-1")
+    assert view.notice.startswith("Cowork · make dataclass")
+    assert _step(app, chat, view) is chat  # same note: nothing to do
+
+
+def test_a_problem_is_shown_and_the_current_chat_stays(app, workspace, monkeypatch):
+    _screen, view = _enable_follow(app, workspace, monkeypatch)
+    (workspace / "proj" / "src" / "data.py").write_text(SOURCE + "# wip\n", encoding="utf-8")
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+
+    _step(app, ordinary, view)
+    result = _step(app, ordinary, view)
+
+    assert result is ordinary
+    assert "uncommitted" in view.notice
+
+
+def test_without_a_follower_nothing_happens(app, workspace):
+    from anomx.agent.ui.models import SessionViewState
+
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+    view = SessionViewState()
+
+    assert _step(app, ordinary, view) is ordinary and view.notice == ""
+
+
+def test_the_session_loop_switches_chat_when_a_note_is_clicked(app, workspace, monkeypatch):
+    class Stop(Exception):
+        pass
+
+    _screen, _view = _enable_follow(app, workspace, monkeypatch)
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+    shown: list[str] = []
+
+    def fake_draw(_stdscr, session, *_args, **_kwargs):
+        shown.append(session.title)
+        if session.title == "make dataclass":
+            raise Stop
+
+        class Viewport:
+            scroll = 0
+
+        return Viewport()
+
+    monkeypatch.setattr(app, "_draw_session", fake_draw)
+
+    with pytest.raises(Stop):
+        app._run_session(Keys(["a", "b", "c"]), ordinary)  # keys only wake the loop up
+
+    assert shown[0] != "make dataclass" and shown[-1] == "make dataclass"
+
+
+def test_finished_turns_of_other_chats_are_wrapped_up_in_the_background(
+    app, workspace, monkeypatch
+):
+    Screen(app)
+    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+    monkeypatch.setattr(AgentRuntime, "backend_response", lambda self, *a, **k: "Done.")
+    turn = app._start_session_turn(chat)
+    turn.worker.join(10)
+    elsewhere = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+
+    app._drain_background_session_turns(Keys([]), chat)  # the chat is on screen: untouched
+    assert turn.completed is False
+    app._drain_background_session_turns(Keys([]), elsewhere)
+
+    assert turn.completed is True and not app._active_session_turns
+
+
+def test_notices_expire_on_their_own():
+    from anomx.agent.ui.models import SessionViewState
+
+    view = SessionViewState()
+    view.show_notice("hello", now=100.0, seconds=6.0)
+
+    view.expire_notice(105.0)
+    assert view.notice == "hello"
+    view.expire_notice(107.0)
+    assert view.notice == ""
