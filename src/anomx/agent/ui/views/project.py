@@ -292,9 +292,11 @@ class ProjectViewMixin:
             return ""
         with suppress(ValueError):
             updated_at = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=UTC)
             elapsed = max(0.0, (datetime.now(tz=UTC) - updated_at).total_seconds())
             if elapsed < 60:
-                return "now ago"
+                return "just now"
             if elapsed < 3600:
                 return f"{max(1, int(elapsed // 60))}min ago"
             if elapsed < 86400:

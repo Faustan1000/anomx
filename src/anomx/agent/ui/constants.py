@@ -30,16 +30,12 @@ RUNNING_SESSION_COMMANDS = frozenset({"/config", "/model", "/effort"})
 RUNNING_NOTICE = (
     "Agent is working · messages blocked · Esc back · Ctrl+C/Ctrl+X interrupt"
 )
-RUNNING_MESSAGE_BLOCKED_NOTICE = (
-    "Agent is working · sending messages is blocked until the response finishes"
-)
 RUNNING_COMMAND_BLOCKED_NOTICE = (
     "Agent is working · this slash command is unavailable until the response finishes"
 )
 ABORT_AGENT_CONFIRM_NOTICE = (
     "Do you really want to abort the agent? Press {key_label} again to confirm."
 )
-INTERRUPTED_AGENT_NOTICE = "You have interrupted anomx."
 MANUAL_INTERRUPT_MESSAGE = "You interrupted anomx manually"
 EXIT_ANOMX_CONFIRM_NOTICE = "Do you really want to exit anomx? Press Ctrl+C again to confirm."
 TABLE_BORDER_CHARS = frozenset("│┌┬┐├┼┤└┴┘─")

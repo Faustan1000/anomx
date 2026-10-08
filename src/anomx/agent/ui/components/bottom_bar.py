@@ -314,15 +314,6 @@ class BottomBarComponentMixin:
     def _add_click_target(self, y: int, action: SessionMouseAction) -> None:
         self._click_targets.setdefault(y, []).append(action)
 
-    def _worker_left_text(self, worker: object, frame: int) -> str:
-        return ""
-
-    def _worker_right_text(self, worker: object) -> str:
-        return ""
-
-    def _worker_context_text(self, worker: object) -> str:
-        return ""
-
     def _command_bottom_panel(
         self,
         suggestions: list[CommandSpec],
@@ -395,6 +386,10 @@ class BottomBarComponentMixin:
         panel_width = max(1, width - 4)
         for y in range(start_y, layout.top_line + 1):
             self._clear_row(stdscr, y)
+            # The panel covers transcript rows; they must neither stay clickable nor
+            # selectable underneath it. The panel registers its own targets below.
+            self._click_targets.pop(y, None)
+            self._session_text_rows.pop(y, None)
         self._add(stdscr, start_y, 2, "─" * panel_width, panel_width, self._attr(panel.frame_attr))
         title_x = 4
         title_width = panel_width - 4

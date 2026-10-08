@@ -124,26 +124,6 @@ class SessionViewMixin:
         )
         stdscr.refresh()
 
-    def _draw_info_panel(self, stdscr: CursesWindow, session: SessionRecord) -> None:
-        config = self.home.load_config()
-        model = str(config.get("model", session.model))
-        header_lines = self._session_header_lines(session, model)
-        body_lines: list[str] = []
-        body_lines.append("Current location")
-        for row in self._session_location_rows(session):
-            body_lines.append(f"  {row.label}: {row.value}")
-        body_lines.append("")
-        body_lines.append("Approved commands")
-        for row in self._approved_command_rows(session):
-            body_lines.append(f"  {row.label}: {row.value}")
-        self._draw_overlay(
-            stdscr,
-            title="Info",
-            subtitle=" ".join(header_lines) if header_lines else "",
-            body_lines=tuple(body_lines),
-            footer="Esc Back · Enter Back",
-        )
-
     def _draw_back_to_project_link(
         self,
         stdscr: CursesWindow,
