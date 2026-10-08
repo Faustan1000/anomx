@@ -74,7 +74,6 @@ from anomx.agent.ui.components.prompt_bar import PromptBarComponentMixin
 from anomx.agent.ui.constants import (
     ABORT_AGENT_CONFIRM_NOTICE,
     ACTIVITY_FRAME_SECONDS,
-    COMMANDS,
     EXIT_ANOMX_CONFIRM_NOTICE,
     FILE_REFERENCE_CACHE_SECONDS,
     FILE_REFERENCE_FIRST_LEVEL_LIMIT,
@@ -84,7 +83,6 @@ from anomx.agent.ui.constants import (
     IMAGE_DROP_CANDIDATE_PATTERN,
     MANUAL_INTERRUPT_MESSAGE,
     PLAN_STEP_REVEAL_SECONDS,
-    PROJECT_COMMANDS,
     PROMPT_PASTE_COLLAPSE_THRESHOLD,
     PROMPT_PLACEHOLDERS,
     RAW_MOUSE_RE,
@@ -92,6 +90,7 @@ from anomx.agent.ui.constants import (
     RUNNING_COMMAND_BLOCKED_NOTICE,
     RUNNING_NOTICE,
     RUNNING_SESSION_COMMANDS,
+    SLASH_COMMANDS,
     START_HINT_WIPE_SECONDS,
     STARTUP_FRAME_SECONDS,
 )
@@ -4887,30 +4886,27 @@ class AnomxCliApp(
             for spec in self._command_specs()
         )
 
-    def _command_specs(self) -> tuple[CommandSpec, ...]:
-        skill_specs = tuple(
+    def _available_builtin_specs(self, *, project: bool = False) -> tuple[CommandSpec, ...]:
+        """Built-in commands offered now (hiding platform-only ones without a connection)."""
+
+        platform_connected = self.home.has_platform_connection()
+        return tuple(
+            CommandSpec(item.command, item.description)
+            for item in SLASH_COMMANDS
+            if (item.in_project or not project) and (platform_connected or not item.needs_platform)
+        )
+
+    def _skill_command_specs(self) -> tuple[CommandSpec, ...]:
+        return tuple(
             CommandSpec(skill.slash_command, f"{skill.title} · {skill.description}")
             for skill in self._all_skills()
         )
-        commands = tuple(
-            spec
-            for spec in COMMANDS
-            if spec.command != "/feedback" or self.home.has_platform_connection()
-        )
-        return (*commands, *skill_specs)
+
+    def _command_specs(self) -> tuple[CommandSpec, ...]:
+        return (*self._available_builtin_specs(), *self._skill_command_specs())
 
     def _project_command_specs(self) -> tuple[CommandSpec, ...]:
-        skill_specs = tuple(
-            CommandSpec(skill.slash_command, f"{skill.title} · {skill.description}")
-            for skill in self._all_skills()
-        )
-        project_specs = tuple(
-            spec
-            for spec in COMMANDS
-            if spec.command in PROJECT_COMMANDS
-            and (spec.command != "/feedback" or self.home.has_platform_connection())
-        )
-        return (*project_specs, *skill_specs)
+        return (*self._available_builtin_specs(project=True), *self._skill_command_specs())
 
     def _invoke_skill(
         self,
@@ -6008,7 +6004,9 @@ class AnomxCliApp(
 
     def _running_command_specs(self) -> tuple[CommandSpec, ...]:
         return tuple(
-            command for command in COMMANDS if self._is_running_session_command(command.command)
+            command
+            for command in self._available_builtin_specs()
+            if self._is_running_session_command(command.command)
         )
 
     def _is_running_session_command(self, command: str) -> bool:

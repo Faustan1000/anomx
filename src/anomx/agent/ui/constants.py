@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 
 from anomx.agent.runtime import IMAGE_FILE_EXTENSIONS
 from anomx.agent.ui.models import CommandSpec
@@ -15,17 +16,43 @@ PROMPT_PLACEHOLDERS = (
     "Summarize the datasets and suggest detection jobs",
 )
 
-COMMANDS = (
-    CommandSpec("/new", "Start a new session"),
-    CommandSpec("/rename", "Rename the current session"),
-    CommandSpec("/config", "Edit configuration"),
-    CommandSpec("/model", "Change model"),
-    CommandSpec("/effort", "Change reasoning effort (e.g. /effort none)"),
-    CommandSpec("/feedback", "Send feedback to the connected Anomx Platform"),
-    CommandSpec("/exit", "Exit Anomx"),
+
+
+@dataclass(frozen=True)
+class SlashCommand:
+    """One built-in slash command and where it may be used.
+
+    This table is the single place that declares a command; ``COMMANDS``,
+    ``PROJECT_COMMANDS`` and ``RUNNING_SESSION_COMMANDS`` below are derived from it.
+    """
+
+    command: str
+    description: str
+    in_project: bool = True
+    """Available on the project screen, not only inside a session."""
+    while_running: bool = False
+    """Allowed while an agent turn is running."""
+    needs_platform: bool = False
+    """Only offered when an Anomx Platform connection exists."""
+
+
+SLASH_COMMANDS = (
+    SlashCommand("/new", "Start a new session"),
+    SlashCommand("/rename", "Rename the current session", in_project=False),
+    SlashCommand("/config", "Edit configuration", while_running=True),
+    SlashCommand("/model", "Change model", while_running=True),
+    SlashCommand(
+        "/effort", "Change reasoning effort (e.g. /effort none)", while_running=True
+    ),
+    SlashCommand(
+        "/feedback", "Send feedback to the connected Anomx Platform", needs_platform=True
+    ),
+    SlashCommand("/exit", "Exit Anomx"),
 )
-PROJECT_COMMANDS = frozenset({"/new", "/config", "/model", "/effort", "/feedback", "/exit"})
-RUNNING_SESSION_COMMANDS = frozenset({"/config", "/model", "/effort"})
+COMMANDS = tuple(CommandSpec(item.command, item.description) for item in SLASH_COMMANDS)
+PROJECT_COMMANDS = frozenset(item.command for item in SLASH_COMMANDS if item.in_project)
+RUNNING_SESSION_COMMANDS = frozenset(item.command for item in SLASH_COMMANDS if item.while_running)
+PLATFORM_COMMANDS = frozenset(item.command for item in SLASH_COMMANDS if item.needs_platform)
 
 RUNNING_NOTICE = (
     "Agent is working · messages blocked · Esc back · Ctrl+C/Ctrl+X interrupt"
