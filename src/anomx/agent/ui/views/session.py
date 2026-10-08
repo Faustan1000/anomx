@@ -61,14 +61,19 @@ class SessionViewMixin:
 
         ``_session_events`` returns the same list object until the transcript file
         changes, so the O(events) replay runs once per change instead of every frame.
+        Entries are kept per events list so the project view (many sessions per frame)
+        and the session view do not evict each other.
         """
 
-        cached = getattr(self, "_activity_snapshot_cache", None)
+        cache = self._activity_snapshot_cache
+        cached = cache.get(id(events))
         if cached is not None and cached[0] is events and cached[1] == len(events):
             return cached[2], cached[3]
         processes = running_process_snapshots(events)
         subagents = active_subagent_snapshots(events)
-        self._activity_snapshot_cache = (events, len(events), processes, subagents)
+        if len(cache) >= 64:
+            cache.clear()
+        cache[id(events)] = (events, len(events), processes, subagents)
         return processes, subagents
 
     def _draw_continue_session_prompt(

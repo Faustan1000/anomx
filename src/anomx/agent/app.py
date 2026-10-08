@@ -209,6 +209,7 @@ class AnomxCliApp(
                 dict[str, list[MessageLine]],
             ],
         ] = {}
+        self._activity_snapshot_cache: dict[int, tuple[Any, int, tuple, tuple]] = {}
         self._streaming_base_cache: dict[
             Path,
             tuple[Any, tuple[Any, ...], list[MessageLine], str | None],

@@ -8,10 +8,6 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 
-from anomx.agent.helpers.state import (
-    running_process_snapshots,
-    running_subagent_snapshots,
-)
 from anomx.agent.helpers.terminal import cell_width
 from anomx.agent.store import (
     ProjectRecord,
@@ -276,12 +272,9 @@ class ProjectViewMixin:
         turn = self._active_turn_for_session(session)
         if turn is not None:
             return "running " + self._format_duration(time.monotonic() - turn.started_at)
-        events = self._session_events(session.path)
-
-        processes = running_process_snapshots(events)
+        processes, subagents = self._activity_snapshots(self._session_events(session.path))
         if processes:
             return "running " + self._process_runtime_duration(processes[0].started_at)
-        subagents = running_subagent_snapshots(events)
         if subagents:
             return "running " + self._process_runtime_duration(subagents[0].started_at)
         return ""
@@ -367,8 +360,8 @@ class ProjectViewMixin:
     def _session_is_running(self, session: SessionRecord) -> bool:
         if self._active_turn_for_session(session) is not None:
             return True
-        events = self._session_events(session.path)
-        return bool(running_process_snapshots(events) or running_subagent_snapshots(events))
+        processes, subagents = self._activity_snapshots(self._session_events(session.path))
+        return bool(processes or subagents)
 
     def _session_mode_symbol(self, session: SessionRecord) -> str:
         turn = self._active_turn_for_session(session)
