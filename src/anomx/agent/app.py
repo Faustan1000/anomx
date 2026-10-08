@@ -121,6 +121,8 @@ from anomx.agent.ui.views.project import ProjectViewMixin
 from anomx.agent.ui.views.session import SessionViewMixin
 from anomx.agent.ui.views.subagent import SubagentViewMixin
 
+# Idle screens wake up this often so background work becomes visible without a key press.
+IDLE_POLL_MILLISECONDS = 500
 
 class AnomxCliApp(
     MatrixLoadingViewMixin,
@@ -671,7 +673,9 @@ class AnomxCliApp(
             else:
                 with suppress(curses.error, AttributeError):
                     stdscr.nodelay(False)
-                key = self._read_prompt_key(stdscr)
+                key = self._read_prompt_key_idle(stdscr)
+                if key is None:
+                    continue
             frame += 1
 
             if self._is_shift_tab(key):
@@ -1513,7 +1517,9 @@ class AnomxCliApp(
             else:
                 with suppress(curses.error, AttributeError):
                     stdscr.nodelay(False)
-                key = self._read_prompt_key(stdscr)
+                key = self._read_prompt_key_idle(stdscr)
+                if key is None:
+                    continue
             frame += 1
 
             if active_turn_running and active_turn is not None:
@@ -3157,6 +3163,25 @@ class AnomxCliApp(
         if completed == "\x1b[200~":
             return self._read_bracketed_paste(stdscr, restore_blocking=True)
         return completed
+
+    def _read_prompt_key_idle(self, stdscr: CursesWindow) -> str | int | PromptPasteEvent | None:
+        """Read a key, but wake up periodically so background results are shown.
+
+        A fully blocking read would only process finished titles, unread flags and
+        background turns after the next key press. Returns ``None`` on timeout.
+        """
+
+        if not hasattr(stdscr, "timeout"):
+            return self._read_prompt_key(stdscr)
+        with suppress(curses.error):
+            stdscr.timeout(IDLE_POLL_MILLISECONDS)
+        try:
+            return self._read_prompt_key(stdscr)
+        except curses.error:
+            return None
+        finally:
+            with suppress(curses.error):
+                stdscr.timeout(-1)
 
     def _read_bracketed_paste(
         self,
