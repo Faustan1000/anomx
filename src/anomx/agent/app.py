@@ -205,10 +205,10 @@ class AnomxCliApp(
                 tuple[str, ...],
                 tuple[str, ...],
                 int,
-                str,
-                list[MessageLine],
+                dict[str, list[MessageLine]],
             ],
         ] = {}
+        self._streaming_base_cache: dict[Path, tuple[Any, tuple[Any, ...], list[MessageLine], str | None]] = {}
         self._context_status_cache: dict[Path, tuple[int, int, str, str, int]] = {}
         self._session_usage_snapshots: dict[Path, UsageSnapshot] = {}
         self._config_cache: tuple[int, int, dict[str, Any]] | None = None
@@ -1189,6 +1189,8 @@ class AnomxCliApp(
             self._message_line_cache.pop(session.path.expanduser().resolve())
         with suppress(KeyError):
             self._rendered_message_cache.pop(session.path.expanduser().resolve())
+        with suppress(KeyError):
+            self._streaming_base_cache.pop(session.path.expanduser().resolve())
 
     def _project_sessions(self, project_path: Path) -> list[SessionRecord]:
         project_key = str(project_path.expanduser().resolve())

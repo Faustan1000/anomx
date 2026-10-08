@@ -267,16 +267,12 @@ class SessionViewMixin:
         active_bottom_panel = (
             (bottom_panel or file_panel or command_panel) if show_prompt_bar else None
         )
-        display_messages = self._messages_with_transient_state(
-            messages,
-            active_turn_elapsed,
-            streaming_text,
-        )
         rendered = self._session_rendered_lines(
             session,
-            display_messages,
+            messages,
             max(20, width - 8),
             None if streaming_text else working_status_text,
+            streaming_text,
         )
         rendered_line_count = len(rendered)
         visible_rows: list[tuple[int, MessageLine]]

@@ -85,49 +85,90 @@ class MessagesComponentMixin:
         messages: list[MessageLine],
         width: int,
         working_text: str | None = None,
+        streaming_text: str = "",
     ) -> list[MessageLine]:
         cache_key = self._session_cache_key(session.path)
         expanded_turns = self._expanded_work_turns_key()
         expanded_lines = self._expanded_work_lines_key()
         expanded_users = self._expanded_pinned_users_key()
-        working_key = "" if working_text is None else working_text
         message_cache = self._message_line_cache.get(session.path)
-        if (
+        cacheable = (
             cache_key is not None
             and message_cache is not None
             and message_cache[0] == cache_key[0]
             and message_cache[1] == cache_key[1]
             and message_cache[2] == expanded_turns
             and message_cache[3] is messages
-        ):
-            rendered_cache = self._rendered_message_cache.get(session.path)
-            if (
-                rendered_cache is not None
-                and rendered_cache[0] == cache_key[0]
-                and rendered_cache[1] == cache_key[1]
-                and rendered_cache[2] == expanded_turns
-                and rendered_cache[3] == expanded_lines
-                and rendered_cache[4] == expanded_users
-                and rendered_cache[5] == width
-                and rendered_cache[6] == working_key
-            ):
-                return rendered_cache[7]
-            rendered_messages = self._messages_with_working_status(messages, working_text)
-            rendered = self._render_messages(rendered_messages, width)
-            self._rendered_message_cache[session.path] = (
+        )
+        if streaming_text:
+            return self._rendered_with_streaming(
+                session,
+                messages,
+                width,
+                streaming_text,
+                (cache_key, expanded_turns, expanded_lines, expanded_users, width)
+                if cacheable
+                else None,
+            )
+
+        working_key = "" if working_text is None else working_text
+        if cacheable and cache_key is not None:
+            # Keep one rendering per working-status text: the draw loop and the anchor
+            # lookups ask for different ones within the same frame and must not evict
+            # each other.
+            validity = (
                 cache_key[0],
                 cache_key[1],
                 expanded_turns,
                 expanded_lines,
                 expanded_users,
                 width,
-                working_key,
-                rendered,
             )
+            rendered_cache = self._rendered_message_cache.get(session.path)
+            if rendered_cache is None or rendered_cache[:6] != validity:
+                rendered_cache = (*validity, {})
+                self._rendered_message_cache[session.path] = rendered_cache
+            variants = rendered_cache[6]
+            cached_lines = variants.get(working_key)
+            if cached_lines is not None:
+                return cached_lines
+            rendered = self._render_messages(
+                self._messages_with_working_status(messages, working_text),
+                width,
+            )
+            if len(variants) >= 4:
+                variants.clear()
+            variants[working_key] = rendered
             return rendered
 
         rendered_messages = self._messages_with_working_status(messages, working_text)
         return self._render_messages(rendered_messages, width)
+
+    def _rendered_with_streaming(
+        self,
+        session: SessionRecord,
+        messages: list[MessageLine],
+        width: int,
+        streaming_text: str,
+        key: tuple[Any, ...] | None,
+    ) -> list[MessageLine]:
+        """Render history once and re-render only the growing streamed reply."""
+
+        entry = self._streaming_base_cache.get(session.path)
+        if key is None or entry is None or entry[0] is not messages or entry[1] != key:
+            settled = self._settled_work_messages(messages)
+            base = self._render_messages(settled, width)
+            last_kind = self._message_kind(settled[-1].role) if settled else None
+            entry = (messages, key or (), base, last_kind)
+            if key is not None:
+                self._streaming_base_cache[session.path] = entry
+        tail = self._render_messages(
+            [MessageLine("agent", streaming_text)],
+            width,
+            after_kind=entry[3],
+            has_output=bool(entry[2]),
+        )
+        return [*entry[2], *tail]
 
     def _messages_with_working_status(
         self,
@@ -174,13 +215,17 @@ class MessagesComponentMixin:
         del active_turn_elapsed
         if not streaming_text:
             return messages
-        rendered = [
+        return [*self._settled_work_messages(messages), MessageLine("agent", streaming_text)]
+
+    @staticmethod
+    def _settled_work_messages(messages: list[MessageLine]) -> list[MessageLine]:
+        """Collapse still-active work boxes into their summaries once a reply streams."""
+
+        return [
             replace(message, role="work_summary", text=message.summary_text, activity_wave=False)
             if message.role == "work_active" and message.summary_text else message
             for message in messages
         ]
-        rendered.append(MessageLine("agent", streaming_text))
-        return rendered
 
     def _draw_working_line(
         self,
@@ -812,12 +857,21 @@ class MessagesComponentMixin:
     def _session_user_message_key(self, event_index: int) -> str:
         return f"user:{event_index}"
 
-    def _render_messages(self, messages: list[MessageLine], width: int) -> list[MessageLine]:
+    def _render_messages(
+        self,
+        messages: list[MessageLine],
+        width: int,
+        *,
+        after_kind: str | None = None,
+        has_output: bool = False,
+    ) -> list[MessageLine]:
+        """Render messages; ``after_kind``/``has_output`` continue an earlier rendering."""
+
         rendered: list[MessageLine] = []
-        previous_kind: str | None = None
+        previous_kind: str | None = after_kind
         for message in messages:
             kind = self._message_kind(message.role)
-            if rendered and previous_kind is not None and kind != previous_kind:
+            if (rendered or has_output) and previous_kind is not None and kind != previous_kind:
                 rendered.append(MessageLine("meta", ""))
             message_start = len(rendered)
             if message.role == "user":
