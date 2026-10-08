@@ -3002,6 +3002,33 @@ class AnomxCliApp(
         self._active_session_turns.pop(self._session_turn_key(turn.session), None)
         return response
 
+    @staticmethod
+    def _release_blocked_turn_callbacks(turn: ActiveSessionTurn) -> None:
+        """Answer approval/question requests an aborted turn is still waiting on.
+
+        The worker blocks on these response queues; without an answer its thread never
+        ends and an interrupt or requeue has to wait for it. Other queued events are
+        put back so the regular drain still persists them.
+        """
+
+        leftovers: list[RuntimeUiEvent] = []
+        while True:
+            try:
+                leftovers.append(turn.events.get_nowait())
+            except queue.Empty:
+                break
+        for event in [*turn.pending_events, *leftovers]:
+            if event.kind == "approval" and event.approval_response is not None:
+                event.approval_response.put(ApprovalChoice.REJECT)
+            elif event.kind == "question" and event.question_response is not None:
+                event.question_response.put(QuestionResponse(answered=False, cancelled=True))
+        turn.pending_events[:] = [
+            event for event in turn.pending_events if event.kind not in {"approval", "question"}
+        ]
+        for event in leftovers:
+            if event.kind not in {"approval", "question"}:
+                turn.events.put(event)
+
     def _interrupt_session_turn(
         self,
         stdscr: CursesWindow,
@@ -3017,6 +3044,7 @@ class AnomxCliApp(
             turn.runtime.abort_current_turn(turn.session.path)
         with suppress(Exception):
             turn.runtime.shutdown(turn.session.path)
+        self._release_blocked_turn_callbacks(turn)
         self._drain_session_turn_events(
             stdscr,
             turn,
@@ -3057,6 +3085,7 @@ class AnomxCliApp(
         appended user message. Leaves running processes/subagents alive."""
 
         turn.runtime.abort_current_turn(session.path)
+        self._release_blocked_turn_callbacks(turn)
         turn.worker.join(timeout=5)
         self._drain_session_turn_events(
             stdscr,
