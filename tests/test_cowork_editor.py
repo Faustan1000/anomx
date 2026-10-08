@@ -35,6 +35,7 @@ def _write(path: Path, **overrides) -> Path:
         "activeFile": "/ws/anomx/examples/baseline_detection.py",
         "languageId": "python",
         "isDirty": False,
+        "isActiveEditor": True,
         "cursor": {"line": 3, "character": 1},
         "selection": {
             "startLine": 3,
@@ -67,6 +68,7 @@ def test_reads_the_extension_output(tmp_path):
     assert (context.visible_start_line, context.visible_end_line) == (1, 40)
     assert context.workspace_folders == (Path("/ws"),)
     assert context.active_line_text == "from anomx import (" and not context.is_dirty
+    assert context.is_active_editor is True
     assert context_path(tmp_path).name == "editor-context.json"
 
 
@@ -128,7 +130,7 @@ def test_notes_in_view_uses_the_visible_lines_of_the_active_file(tmp_path):
 def test_vsix_contains_manifest_and_only_the_audited_files(tmp_path):
     vsix = build_vsix(tmp_path)
 
-    assert vsix.name == vsix_name() == "anomx-local.anomx-editor-context-0.1.0.vsix"
+    assert vsix.name == vsix_name() == "anomx-local.anomx-editor-context-0.1.1.vsix"
     with zipfile.ZipFile(vsix) as archive:
         assert sorted(archive.namelist()) == [
             "[Content_Types].xml",
@@ -138,7 +140,7 @@ def test_vsix_contains_manifest_and_only_the_audited_files(tmp_path):
             "extension/package.json",
         ]
         manifest = archive.read("extension.vsixmanifest").decode("utf-8")
-    assert 'Publisher="anomx-local"' in manifest and 'Version="0.1.0"' in manifest
+    assert 'Publisher="anomx-local"' in manifest and 'Version="0.1.1"' in manifest
     assert install_command(vsix) == f"code --install-extension {vsix}"
     assert extension_manifest()["main"] == "./extension.js"
 
@@ -180,7 +182,7 @@ const editor = {
 };
 const fake = {
   window: {
-    state, activeTextEditor: editor,
+    state, activeTextEditor: editor, visibleTextEditors: [editor],
     onDidChangeActiveTextEditor: register('editor'),
     onDidChangeTextEditorSelection: register('selection'),
     onDidChangeTextEditorVisibleRanges: register('visible'),
@@ -224,10 +226,16 @@ const read = () => JSON.parse(fs.readFileSync(outPath, 'utf8'));
   results.unfocused = read().cursor;
 
   state.focused = true;
-  fake.window.activeTextEditor = undefined;
+  fake.window.activeTextEditor = undefined;  // e.g. the terminal has focus, editor stays visible
+  handlers.editor();
+  await sleep(250);
+  results.inactive = read();
+
+  fake.window.visibleTextEditors = [];  // the editor was closed
   handlers.editor();
   await sleep(250);
   results.noEditor = read();
+  fake.window.visibleTextEditors = [editor];
 
   fake.window.activeTextEditor = editor;
   handlers.editor();
@@ -268,7 +276,10 @@ def test_extension_writes_the_expected_context_with_a_simulated_vscode(tmp_path)
     assert second["selection"]["isEmpty"] is False and second["isDirty"] is True
     assert (second["selection"]["startLine"], second["selection"]["endLine"]) == (2, 3)
     assert results["unfocused"] == second["cursor"]  # an unfocused window does not write
-    assert results["noEditor"]["activeFile"] is None
+    assert first["isActiveEditor"] is True
+    inactive = results["inactive"]  # terminal focus: keep the last visible editor, flagged
+    assert inactive["activeFile"] == "/ws/app/a.py" and inactive["isActiveEditor"] is False
+    assert results["noEditor"]["activeFile"] is None  # closed editor: nothing stale is kept
     assert results["cleared"]["activeFile"] is None  # disposing clears stale state
     assert results["leftover"] == []
     assert stat.S_IMODE(out.parent.stat().st_mode) == 0o700

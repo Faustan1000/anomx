@@ -37,6 +37,7 @@ function buildContext(snapshot, now = new Date(), pid = process.pid) {
     activeFile: null,
     languageId: null,
     isDirty: false,
+    isActiveEditor: false,
     cursor: null,
     selection: null,
     visibleRange: null,
@@ -55,6 +56,7 @@ function buildContext(snapshot, now = new Date(), pid = process.pid) {
     activeFile: editor.file,
     languageId: editor.languageId,
     isDirty: Boolean(editor.isDirty),
+    isActiveEditor: Boolean(editor.isActive),
     cursor: active,
     selection: {
       startLine: start.line,
@@ -79,10 +81,19 @@ function writeContextFile(filePath, context) {
   fs.renameSync(tmp, filePath);
 }
 
-function takeSnapshot(vscode) {
-  const editor = vscode.window.activeTextEditor;
+// While the user types into the terminal (or any non-text tab) VS Code reports no active
+// text editor. The last one is kept as long as it stays visible, marked as not active, so
+// the agent still knows which file the user was working in.
+function takeSnapshot(vscode, memory) {
   const folders = (vscode.workspace.workspaceFolders || []).map((folder) => folder.uri.fsPath);
+  const active = vscode.window.activeTextEditor;
+  if (active) {
+    memory.lastEditor = active;
+  }
+  const visible = vscode.window.visibleTextEditors || [];
+  const editor = active || (visible.includes(memory.lastEditor) ? memory.lastEditor : undefined);
   if (!editor) {
+    memory.lastEditor = undefined;
     return { workspaceFolders: folders, editor: null };
   }
   const { document, selection } = editor;
@@ -91,6 +102,7 @@ function takeSnapshot(vscode) {
     workspaceFolders: folders,
     editor: {
       scheme: document.uri.scheme,
+      isActive: Boolean(active),
       file: document.uri.fsPath,
       languageId: document.languageId,
       isDirty: document.isDirty,
@@ -114,6 +126,7 @@ function activate(extensionContext) {
   const vscode = require('vscode');
   let timer = null;
   let wroteLast = false;
+  const memory = { lastEditor: undefined };
 
   const settings = () => vscode.workspace.getConfiguration('anomxEditorContext');
   const targetPath = () => settings().get('path') || defaultContextPath();
@@ -126,7 +139,7 @@ function activate(extensionContext) {
       return;
     }
     try {
-      writeContextFile(targetPath(), buildContext(takeSnapshot(vscode)));
+      writeContextFile(targetPath(), buildContext(takeSnapshot(vscode, memory)));
       wroteLast = true;
     } catch (error) {
       console.error('anomx-editor-context: could not write context file', error);

@@ -33,6 +33,7 @@ class EditorContext:
     visible_start_line: int
     visible_end_line: int
     is_dirty: bool
+    is_active_editor: bool
     language_id: str
     active_line_text: str
     updated_at: datetime
@@ -90,6 +91,7 @@ def _parse(data: dict[str, Any]) -> EditorContext | None:
         visible_start_line=_int(visible.get("startLine"), line),
         visible_end_line=_int(visible.get("endLine"), line),
         is_dirty=bool(data.get("isDirty")),
+        is_active_editor=bool(data.get("isActiveEditor")),
         language_id=str(data.get("languageId") or ""),
         active_line_text=str(data.get("activeLineText") or ""),
         updated_at=updated,
