@@ -105,11 +105,13 @@ from anomx.agent.ui.models import (
     MessageLine,
     PromptPasteEvent,
     PromptPasteSpan,
+    PromptState,
     RunningKeyResult,
     RuntimeUiEvent,
     SessionMouseAction,
     SessionTextRow,
     SessionTextSelection,
+    SessionViewState,
     StartupPreparation,
 )
 from anomx.agent.ui.views.approve_update import ApproveUpdateViewMixin
@@ -123,6 +125,7 @@ from anomx.agent.ui.views.subagent import SubagentViewMixin
 
 # Idle screens wake up this often so background work becomes visible without a key press.
 IDLE_POLL_MILLISECONDS = 500
+
 
 class AnomxCliApp(
     MatrixLoadingViewMixin,
@@ -593,15 +596,10 @@ class AnomxCliApp(
 
     def _run_project(self, stdscr: CursesWindow, project: ProjectRecord) -> int:
         self._activate_agent_mode(AgentMode.AUTOMATIC)
-        input_text = ""
-        cursor = 0
         selected = 0
         scroll = 0
-        command_selected = 0
-        file_references: dict[str, str] = {}
-        pasted_spans: list[PromptPasteSpan] = []
-        file_selected = 0
         delete_pending_index: int | None = None
+        prompt = PromptState()
         frame = 0
         exit_confirm_deadline = 0.0
         prompt_notice = ""
@@ -617,23 +615,27 @@ class AnomxCliApp(
             selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
             if delete_pending_index is not None and delete_pending_index >= len(sessions):
                 delete_pending_index = None
-            command_token = self._active_command_token(input_text, cursor)
+            command_token = self._active_command_token(prompt.input_text, prompt.cursor)
             command_suggestions = (
                 self._filtered_project_commands(command_token[2])
                 if command_token is not None
                 else []
             )
             if command_suggestions:
-                command_selected = min(command_selected, len(command_suggestions) - 1)
+                prompt.command_selected = min(prompt.command_selected, len(command_suggestions) - 1)
             else:
-                command_selected = 0
-            file_reference_token = self._active_file_reference_token(input_text, cursor)
+                prompt.command_selected = 0
+            file_reference_token = self._active_file_reference_token(
+                prompt.input_text, prompt.cursor
+            )
             file_suggestions = (
                 self._background_file_reference_suggestions(file_reference_token[2])
                 if file_reference_token is not None
                 else []
             )
-            file_selected = min(file_selected, len(file_suggestions) - 1) if file_suggestions else 0
+            prompt.file_selected = (
+                min(prompt.file_selected, len(file_suggestions) - 1) if file_suggestions else 0
+            )
             file_search_active = (
                 file_reference_token is not None
                 and self._file_reference_search.is_searching(file_reference_token[2])
@@ -644,20 +646,20 @@ class AnomxCliApp(
                 sessions,
                 selected,
                 scroll,
-                input_text,
-                cursor,
+                prompt.input_text,
+                prompt.cursor,
                 prompt_notice,
                 prompt_notice_role,
                 frame,
                 command_suggestions=command_suggestions,
-                command_selected=command_selected,
+                command_selected=prompt.command_selected,
                 delete_pending_index=delete_pending_index,
                 file_suggestions=file_suggestions if file_reference_token else [],
-                file_selected=file_selected,
-                file_references=file_references,
+                file_selected=prompt.file_selected,
+                file_references=prompt.file_references,
                 file_reference_active=file_reference_token is not None,
                 file_reference_searching=file_search_active,
-                pasted_spans=pasted_spans,
+                pasted_spans=prompt.pasted_spans,
             )
             animated = self._project_animation_active(sessions) or file_search_active
             if animated:
@@ -682,13 +684,8 @@ class AnomxCliApp(
                 self._cycle_agent_mode()
                 continue
             if self._is_ctrl_c(key):
-                if input_text:
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_references = {}
-                    file_selected = 0
+                if prompt.input_text:
+                    prompt.clear()
                     prompt_notice = ""
                     continue
                 now = time.monotonic()
@@ -700,26 +697,21 @@ class AnomxCliApp(
                 continue
             if self._is_escape(key):
                 delete_pending_index = None
-                input_text = ""
-                cursor = 0
-                pasted_spans = []
-                command_selected = 0
-                file_references = {}
-                file_selected = 0
+                prompt.clear()
                 prompt_notice = ""
                 continue
             if key == curses.KEY_UP:
                 if file_suggestions:
-                    file_selected = max(0, file_selected - 1)
+                    prompt.file_selected = max(0, prompt.file_selected - 1)
                 elif command_suggestions:
-                    command_selected = max(0, command_selected - 1)
-                elif input_text:
-                    cursor = self._move_prompt_cursor_row(
+                    prompt.command_selected = max(0, prompt.command_selected - 1)
+                elif prompt.input_text:
+                    prompt.cursor = self._move_prompt_cursor_row(
                         stdscr,
-                        input_text,
-                        cursor,
+                        prompt.input_text,
+                        prompt.cursor,
                         -1,
-                        pasted_spans,
+                        prompt.pasted_spans,
                     )
                 elif sessions:
                     selected = max(0, selected - 1)
@@ -727,16 +719,18 @@ class AnomxCliApp(
                 continue
             if key == curses.KEY_DOWN:
                 if file_suggestions:
-                    file_selected = min(len(file_suggestions) - 1, file_selected + 1)
+                    prompt.file_selected = min(len(file_suggestions) - 1, prompt.file_selected + 1)
                 elif command_suggestions:
-                    command_selected = min(len(command_suggestions) - 1, command_selected + 1)
-                elif input_text:
-                    cursor = self._move_prompt_cursor_row(
+                    prompt.command_selected = min(
+                        len(command_suggestions) - 1, prompt.command_selected + 1
+                    )
+                elif prompt.input_text:
+                    prompt.cursor = self._move_prompt_cursor_row(
                         stdscr,
-                        input_text,
-                        cursor,
+                        prompt.input_text,
+                        prompt.cursor,
                         1,
-                        pasted_spans,
+                        prompt.pasted_spans,
                     )
                 elif sessions:
                     selected = min(len(sessions) - 1, selected + 1)
@@ -753,37 +747,37 @@ class AnomxCliApp(
                 delete_pending_index = None
                 continue
             if self._is_option_left(key):
-                cursor = self._previous_prompt_word(input_text, cursor)
+                prompt.cursor = self._previous_prompt_word(prompt.input_text, prompt.cursor)
                 continue
             if self._is_option_right(key):
-                cursor = self._next_prompt_word(input_text, cursor)
+                prompt.cursor = self._next_prompt_word(prompt.input_text, prompt.cursor)
                 continue
             if key == curses.KEY_LEFT:
-                cursor = max(0, cursor - 1)
+                prompt.cursor = max(0, prompt.cursor - 1)
                 continue
             if key == curses.KEY_RIGHT:
-                cursor = min(len(input_text), cursor + 1)
+                prompt.cursor = min(len(prompt.input_text), prompt.cursor + 1)
                 continue
             if key == curses.KEY_HOME:
-                cursor = 0
+                prompt.cursor = 0
                 continue
             if key == curses.KEY_END:
-                cursor = len(input_text)
+                prompt.cursor = len(prompt.input_text)
                 continue
             if key == curses.KEY_MOUSE:
                 action = self._project_mouse_action(
                     stdscr,
-                    input_text,
+                    prompt.input_text,
                     command_suggestions,
-                    command_selected,
+                    prompt.command_selected,
                     file_suggestions=file_suggestions if file_reference_token else [],
-                    file_selected=file_selected,
-                    pasted_spans=pasted_spans,
+                    file_selected=prompt.file_selected,
+                    pasted_spans=prompt.pasted_spans,
                 )
                 if action is None:
                     continue
                 if action.kind == "cursor":
-                    cursor = action.value
+                    prompt.cursor = action.value
                 elif action.kind == "scroll":
                     scroll = max(0, scroll + action.value)
                 elif action.kind == "open_project_session":
@@ -791,31 +785,31 @@ class AnomxCliApp(
                     opened = self._open_project_session(stdscr, sessions[action.value])
                     if isinstance(opened, int):
                         return opened
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
+                    prompt.input_text = ""
+                    prompt.cursor = 0
+                    prompt.pasted_spans = []
+                    prompt.command_selected = 0
                 elif action.kind == "file_reference":
                     if file_reference_token is not None:
-                        input_text, cursor = self._insert_file_reference(
-                            input_text,
-                            cursor,
+                        prompt.input_text, prompt.cursor = self._insert_file_reference(
+                            prompt.input_text,
+                            prompt.cursor,
                             file_reference_token,
                             file_suggestions[action.value],
-                            file_references,
-                            pasted_spans,
+                            prompt.file_references,
+                            prompt.pasted_spans,
                         )
-                        file_selected = 0
+                        prompt.file_selected = 0
                 elif action.kind == "command":
                     suggestion = command_suggestions[action.value]
                     if command_token is not None and self._command_token_is_inline(
-                        input_text,
+                        prompt.input_text,
                         command_token,
                     ):
-                        input_text, cursor = self._remove_command_token(
-                            input_text,
+                        prompt.input_text, prompt.cursor = self._remove_command_token(
+                            prompt.input_text,
                             command_token,
-                            pasted_spans,
+                            prompt.pasted_spans,
                         )
                         result = self._handle_project_command_with_prompt(
                             stdscr,
@@ -825,10 +819,10 @@ class AnomxCliApp(
                             sessions,
                             selected,
                             scroll,
-                            input_text,
-                            cursor,
-                            pasted_spans,
-                            file_references,
+                            prompt.input_text,
+                            prompt.cursor,
+                            prompt.pasted_spans,
+                            prompt.file_references,
                         )
                         if result == "exit":
                             return 0
@@ -838,7 +832,7 @@ class AnomxCliApp(
                                 return opened
                         sessions = self._project_sessions(project.path)
                         selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
-                        command_selected = 0
+                        prompt.command_selected = 0
                     else:
                         command = suggestion.command
                         result = self._handle_project_command(
@@ -859,24 +853,24 @@ class AnomxCliApp(
                         sessions = self._project_sessions(project.path)
                         selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
                         delete_pending_index = None
-                        input_text = ""
-                        cursor = 0
-                        pasted_spans = []
-                        command_selected = 0
+                        prompt.input_text = ""
+                        prompt.cursor = 0
+                        prompt.pasted_spans = []
+                        prompt.command_selected = 0
                 continue
             if self._is_raw_mouse_fragment_key(key):
                 continue
             if isinstance(key, PromptPasteEvent):
                 if key.text:
-                    input_text, cursor = self._insert_prompt_text(
-                        input_text,
-                        cursor,
+                    prompt.input_text, prompt.cursor = self._insert_prompt_text(
+                        prompt.input_text,
+                        prompt.cursor,
                         key.text,
-                        pasted_spans,
+                        prompt.pasted_spans,
                         pasted=True,
                     )
-                    command_selected = 0
-                    file_selected = 0
+                    prompt.command_selected = 0
+                    prompt.file_selected = 0
                     delete_pending_index = None
                     prompt_notice = ""
                 continue
@@ -886,40 +880,41 @@ class AnomxCliApp(
                     prompt_notice = ""
                 continue
             if self._is_shift_enter(key):
-                input_text = input_text[:cursor] + "\n" + input_text[cursor:]
-                pasted_spans[:] = self._prompt_spans_after_replacement(
-                    pasted_spans,
-                    cursor,
-                    cursor,
+                text, at = prompt.input_text, prompt.cursor
+                prompt.input_text = text[:at] + "\n" + text[at:]
+                prompt.pasted_spans[:] = self._prompt_spans_after_replacement(
+                    prompt.pasted_spans,
+                    prompt.cursor,
+                    prompt.cursor,
                     1,
                 )
-                cursor += 1
-                command_selected = 0
+                prompt.cursor += 1
+                prompt.command_selected = 0
                 delete_pending_index = None
                 prompt_notice = ""
                 continue
             if self._is_enter(key):
                 if file_suggestions and file_reference_token is not None:
-                    input_text, cursor = self._insert_file_reference(
-                        input_text,
-                        cursor,
+                    prompt.input_text, prompt.cursor = self._insert_file_reference(
+                        prompt.input_text,
+                        prompt.cursor,
                         file_reference_token,
-                        file_suggestions[file_selected],
-                        file_references,
-                        pasted_spans,
+                        file_suggestions[prompt.file_selected],
+                        prompt.file_references,
+                        prompt.pasted_spans,
                     )
-                    file_selected = 0
+                    prompt.file_selected = 0
                     continue
                 if (
                     command_token is not None
                     and command_suggestions
-                    and self._command_token_is_inline(input_text, command_token)
+                    and self._command_token_is_inline(prompt.input_text, command_token)
                 ):
-                    suggestion = command_suggestions[command_selected]
-                    input_text, cursor = self._remove_command_token(
-                        input_text,
+                    suggestion = command_suggestions[prompt.command_selected]
+                    prompt.input_text, prompt.cursor = self._remove_command_token(
+                        prompt.input_text,
                         command_token,
-                        pasted_spans,
+                        prompt.pasted_spans,
                     )
                     result = self._handle_project_command_with_prompt(
                         stdscr,
@@ -929,10 +924,10 @@ class AnomxCliApp(
                         sessions,
                         selected,
                         scroll,
-                        input_text,
-                        cursor,
-                        pasted_spans,
-                        file_references,
+                        prompt.input_text,
+                        prompt.cursor,
+                        prompt.pasted_spans,
+                        prompt.file_references,
                     )
                     if result == "exit":
                         return 0
@@ -942,15 +937,15 @@ class AnomxCliApp(
                             return opened
                     sessions = self._project_sessions(project.path)
                     selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
-                    command_selected = 0
+                    prompt.command_selected = 0
                     continue
-                submitted = input_text.strip()
+                submitted = prompt.input_text.strip()
                 if submitted:
                     if self._is_slash_command(submitted):
                         command = self._submitted_command(
                             submitted,
                             command_suggestions,
-                            command_selected,
+                            prompt.command_selected,
                         )
                         result = self._handle_project_command(
                             stdscr,
@@ -970,12 +965,12 @@ class AnomxCliApp(
                     else:
                         backend_message = self._backend_message_for_prompt(
                             submitted,
-                            file_references,
+                            prompt.file_references,
                         )
                         prompt_session = self._start_project_prompt_session(
                             submitted,
                             backend_message=backend_message,
-                            file_references=dict(file_references),
+                            file_references=dict(prompt.file_references),
                         )
                         opened = self._open_project_session(stdscr, prompt_session)
                         if isinstance(opened, int):
@@ -983,12 +978,7 @@ class AnomxCliApp(
                         sessions = self._project_sessions(project.path)
                         selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
                         prompt_notice = ""
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_references = {}
-                    file_selected = 0
+                    prompt.clear()
                     delete_pending_index = None
                     continue
                 if delete_pending_index == selected and sessions:
@@ -1005,39 +995,39 @@ class AnomxCliApp(
                         return opened
                 continue
             if self._is_option_delete(key):
-                word_start = self._previous_prompt_word(input_text, cursor)
-                input_text, cursor = self._replace_prompt_range(
-                    input_text,
+                word_start = self._previous_prompt_word(prompt.input_text, prompt.cursor)
+                prompt.input_text, prompt.cursor = self._replace_prompt_range(
+                    prompt.input_text,
                     word_start,
-                    cursor,
+                    prompt.cursor,
                     "",
-                    pasted_spans,
+                    prompt.pasted_spans,
                 )
-                command_selected = 0
-                file_selected = 0
+                prompt.command_selected = 0
+                prompt.file_selected = 0
                 delete_pending_index = None
                 continue
             if self._is_backspace(key):
-                if cursor > 0:
-                    input_text, cursor = self._delete_prompt_backward(
-                        input_text,
-                        cursor,
-                        pasted_spans,
-                        file_references,
+                if prompt.cursor > 0:
+                    prompt.input_text, prompt.cursor = self._delete_prompt_backward(
+                        prompt.input_text,
+                        prompt.cursor,
+                        prompt.pasted_spans,
+                        prompt.file_references,
                     )
-                    command_selected = 0
-                    file_selected = 0
+                    prompt.command_selected = 0
+                    prompt.file_selected = 0
                     delete_pending_index = None
                 continue
             if isinstance(key, str) and key.isprintable():
-                input_text, cursor = self._insert_prompt_text(
-                    input_text,
-                    cursor,
+                prompt.input_text, prompt.cursor = self._insert_prompt_text(
+                    prompt.input_text,
+                    prompt.cursor,
                     key,
-                    pasted_spans,
+                    prompt.pasted_spans,
                 )
-                command_selected = 0
-                file_selected = 0
+                prompt.command_selected = 0
+                prompt.file_selected = 0
                 delete_pending_index = None
                 prompt_notice = ""
 
@@ -1369,27 +1359,14 @@ class AnomxCliApp(
         current_session = session
         self._activate_agent(current_session.agent_kind)
         self._restore_session_model(current_session)
-        input_text = ""
-        cursor = 0
-        file_references: dict[str, str] = {}
-        image_attachments: dict[str, dict[str, str]] = {}
-        pasted_spans: list[PromptPasteSpan] = []
-        scroll = 0
-        command_selected = 0
-        file_selected = 0
-        pinned_anchor: int | None = None
-        exit_confirm_deadline = 0.0
-        exit_notice = ""
-        running_notice = RUNNING_NOTICE
-        running_notice_role = "light"
-        running_abort_key = ""
-        running_abort_deadline = 0.0
+        prompt = PromptState()
+        view = SessionViewState(running_notice=RUNNING_NOTICE)
         frame = 0
 
         while True:
-            if exit_confirm_deadline and time.monotonic() > exit_confirm_deadline:
-                exit_confirm_deadline = 0.0
-                exit_notice = ""
+            if view.exit_confirm_deadline and time.monotonic() > view.exit_confirm_deadline:
+                view.exit_confirm_deadline = 0.0
+                view.exit_notice = ""
             current_session = self._process_title_events(stdscr, current_session)
             self._reap_idle_runtimes()
             active_turn = self._active_turn_for_session(current_session)
@@ -1401,46 +1378,42 @@ class AnomxCliApp(
             if not active_turn_running:
                 self._reconcile_stale_activity(current_session.path)
             if active_turn_running and active_turn is not None:
-                pinned_anchor = self._active_turn_anchor_line(
+                view.pinned_anchor = self._active_turn_anchor_line(
                     stdscr,
                     current_session,
                     active_turn,
-                    pinned_anchor,
+                    view.pinned_anchor,
                 )
                 self._drain_session_turn_events(
                     stdscr,
                     active_turn,
-                    anchor_line=pinned_anchor,
-                    input_text=input_text,
-                    cursor=cursor,
-                    pasted_spans=pasted_spans,
-                    prompt_notice=running_notice,
-                    prompt_notice_role=running_notice_role,
-                    scroll=scroll,
+                    anchor_line=view.pinned_anchor,
+                    input_text=prompt.input_text,
+                    cursor=prompt.cursor,
+                    pasted_spans=prompt.pasted_spans,
+                    prompt_notice=view.running_notice,
+                    prompt_notice_role=view.running_notice_role,
+                    scroll=view.scroll,
                     active_turn_elapsed=time.monotonic() - active_turn.started_at,
-                    sticky_anchor=pinned_anchor is not None,
+                    sticky_anchor=view.pinned_anchor is not None,
                 )
             elif active_turn is not None:
                 self._complete_session_turn(
                     stdscr,
                     active_turn,
-                    anchor_line=pinned_anchor,
-                    scroll=scroll,
-                    input_text=input_text,
-                    cursor=cursor,
-                    pasted_spans=pasted_spans,
+                    anchor_line=view.pinned_anchor,
+                    scroll=view.scroll,
+                    input_text=prompt.input_text,
+                    cursor=prompt.cursor,
+                    pasted_spans=prompt.pasted_spans,
                     render_final=True,
                 )
                 active_turn = None
                 active_turn_running = False
-                running_notice = RUNNING_NOTICE
-                running_notice_role = "light"
-                running_abort_key = ""
-                running_abort_deadline = 0.0
-                pinned_anchor = None
-                scroll = 0
+                view.reset_running_notice(RUNNING_NOTICE)
+                view.jump_to_bottom()
             messages = self._read_message_lines(current_session.path)
-            command_token = self._active_command_token(input_text, cursor)
+            command_token = self._active_command_token(prompt.input_text, prompt.cursor)
             command_suggestions = (
                 (
                     self._filtered_running_commands(command_token[2])
@@ -1450,17 +1423,21 @@ class AnomxCliApp(
                 if command_token is not None
                 else []
             )
-            file_reference_token = self._active_file_reference_token(input_text, cursor)
+            file_reference_token = self._active_file_reference_token(
+                prompt.input_text, prompt.cursor
+            )
             file_suggestions = (
                 self._background_file_reference_suggestions(file_reference_token[2])
                 if file_reference_token is not None and not active_turn_running
                 else []
             )
             if command_suggestions:
-                command_selected = min(command_selected, len(command_suggestions) - 1)
+                prompt.command_selected = min(prompt.command_selected, len(command_suggestions) - 1)
             else:
-                command_selected = 0
-            file_selected = min(file_selected, len(file_suggestions) - 1) if file_suggestions else 0
+                prompt.command_selected = 0
+            prompt.file_selected = (
+                min(prompt.file_selected, len(file_suggestions) - 1) if file_suggestions else 0
+            )
             file_search_active = (
                 file_reference_token is not None
                 and not active_turn_running
@@ -1470,19 +1447,19 @@ class AnomxCliApp(
                 stdscr,
                 current_session,
                 messages,
-                input_text,
-                cursor,
-                scroll,
+                prompt.input_text,
+                prompt.cursor,
+                view.scroll,
                 command_suggestions,
-                command_selected,
+                prompt.command_selected,
                 file_suggestions=file_suggestions,
-                file_selected=file_selected,
+                file_selected=prompt.file_selected,
                 file_reference_searching=file_search_active,
-                file_references=file_references,
-                image_attachments=image_attachments,
-                anchor_line=pinned_anchor,
-                prompt_notice=running_notice if active_turn_running else exit_notice,
-                prompt_notice_role=running_notice_role if active_turn_running else "light",
+                file_references=prompt.file_references,
+                image_attachments=prompt.image_attachments,
+                anchor_line=view.pinned_anchor,
+                prompt_notice=view.running_notice if active_turn_running else view.exit_notice,
+                prompt_notice_role=view.running_notice_role if active_turn_running else "light",
                 working_text=(
                     active_turn.working_text if active_turn_running and active_turn else None
                 ),
@@ -1490,16 +1467,16 @@ class AnomxCliApp(
                     active_turn.working_deadline if active_turn_running and active_turn else None
                 ),
                 working_frame=frame,
-                sticky_anchor=active_turn_running and pinned_anchor is not None,
+                sticky_anchor=active_turn_running and view.pinned_anchor is not None,
                 active_turn_elapsed=(
                     time.monotonic() - active_turn.started_at
                     if active_turn_running and active_turn
                     else None
                 ),
-                pasted_spans=pasted_spans,
+                pasted_spans=prompt.pasted_spans,
             )
             if viewport is not None:
-                scroll = viewport.scroll
+                view.scroll = viewport.scroll
             if (
                 active_turn_running
                 or self._session_animation_active(current_session.path)
@@ -1527,25 +1504,25 @@ class AnomxCliApp(
                     stdscr,
                     current_session,
                     key,
-                    input_text,
-                    cursor,
-                    running_abort_key,
-                    running_abort_deadline,
+                    prompt.input_text,
+                    prompt.cursor,
+                    view.running_abort_key,
+                    view.running_abort_deadline,
                     command_suggestions,
-                    command_selected,
-                    pasted_spans,
+                    prompt.command_selected,
+                    prompt.pasted_spans,
                 )
-                input_text = key_result.input_text
-                cursor = key_result.cursor
-                running_notice = key_result.notice
-                running_notice_role = key_result.notice_role
-                running_abort_key = key_result.abort_key
-                running_abort_deadline = key_result.abort_deadline
-                command_selected = key_result.command_selected
+                prompt.input_text = key_result.input_text
+                prompt.cursor = key_result.cursor
+                view.running_notice = key_result.notice
+                view.running_notice_role = key_result.notice_role
+                view.running_abort_key = key_result.abort_key
+                view.running_abort_deadline = key_result.abort_deadline
+                prompt.command_selected = key_result.command_selected
                 if key_result.clear_anchor and not key_result.scroll_delta:
-                    pinned_anchor = None
+                    view.pinned_anchor = None
                 if key_result.scroll_delta:
-                    scroll += key_result.scroll_delta
+                    view.scroll += key_result.scroll_delta
                 if key_result.command:
                     with suppress(curses.error):
                         stdscr.nodelay(False)
@@ -1555,49 +1532,45 @@ class AnomxCliApp(
                             key_result.command,
                             current_session,
                             key_result.submitted,
-                            input_text,
-                            cursor,
-                            pasted_spans,
-                            file_references,
-                            image_attachments,
+                            prompt.input_text,
+                            prompt.cursor,
+                            prompt.pasted_spans,
+                            prompt.file_references,
+                            prompt.image_attachments,
                         )
                     finally:
                         with suppress(curses.error):
                             stdscr.nodelay(True)
-                    running_notice = RUNNING_NOTICE
-                    running_notice_role = "light"
+                    view.running_notice = RUNNING_NOTICE
+                    view.running_notice_role = "light"
                     if command_result == "exit":
                         self._interrupt_session_turn(
                             stdscr,
                             active_turn,
-                            anchor_line=pinned_anchor,
-                            scroll=scroll,
-                            input_text=input_text,
-                            cursor=cursor,
-                            pasted_spans=pasted_spans,
+                            anchor_line=view.pinned_anchor,
+                            scroll=view.scroll,
+                            input_text=prompt.input_text,
+                            cursor=prompt.cursor,
+                            pasted_spans=prompt.pasted_spans,
                         )
                         return 0
                     if isinstance(command_result, SessionRecord):
                         current_session = command_result
                         self._activate_agent(current_session.agent_kind)
                         self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                        scroll = 0
-                        pinned_anchor = None
+                        view.jump_to_bottom()
                     continue
                 if key_result.exit_requested:
                     self._interrupt_session_turn(
                         stdscr,
                         active_turn,
-                        anchor_line=pinned_anchor,
-                        scroll=scroll,
-                        input_text=input_text,
-                        cursor=cursor,
-                        pasted_spans=pasted_spans,
+                        anchor_line=view.pinned_anchor,
+                        scroll=view.scroll,
+                        input_text=prompt.input_text,
+                        cursor=prompt.cursor,
+                        pasted_spans=prompt.pasted_spans,
                     )
-                    running_notice = RUNNING_NOTICE
-                    running_notice_role = "light"
-                    running_abort_key = ""
-                    running_abort_deadline = 0.0
+                    view.reset_running_notice(RUNNING_NOTICE)
                     continue
                 if key_result.back_requested:
                     return "project"
@@ -1606,26 +1579,17 @@ class AnomxCliApp(
                     # bottom; without resetting here, requeuing a message while a
                     # turn is still running leaves the new streaming reply stuck
                     # off-screen, same as the idle-submit case above.
-                    scroll = 0
+                    view.scroll = 0
                     self._interrupt_and_requeue_session_turn(
                         stdscr,
                         active_turn,
                         current_session,
                         key_result.submitted_message,
-                        anchor_line=pinned_anchor,
-                        scroll=scroll,
+                        anchor_line=view.pinned_anchor,
+                        scroll=view.scroll,
                     )
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_selected = 0
-                    file_references = {}
-                    image_attachments = {}
-                    running_notice = RUNNING_NOTICE
-                    running_notice_role = "light"
-                    running_abort_key = ""
-                    running_abort_deadline = 0.0
+                    prompt.clear()
+                    view.reset_running_notice(RUNNING_NOTICE)
                     continue
                 continue
 
@@ -1637,43 +1601,31 @@ class AnomxCliApp(
                 )
                 continue
             if self._is_ctrl_c(key):
-                if input_text:
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_selected = 0
-                    file_references = {}
-                    image_attachments = {}
-                    exit_confirm_deadline = 0.0
-                    exit_notice = ""
+                if prompt.input_text:
+                    prompt.clear()
+                    view.exit_confirm_deadline = 0.0
+                    view.exit_notice = ""
                     continue
                 now = time.monotonic()
-                if exit_confirm_deadline and now <= exit_confirm_deadline:
+                if view.exit_confirm_deadline and now <= view.exit_confirm_deadline:
                     return 0
-                exit_confirm_deadline = now + 3.0
-                exit_notice = EXIT_ANOMX_CONFIRM_NOTICE
+                view.exit_confirm_deadline = now + 3.0
+                view.exit_notice = EXIT_ANOMX_CONFIRM_NOTICE
                 continue
             if self._is_option_left(key):
-                cursor = self._previous_prompt_word(input_text, cursor)
+                prompt.cursor = self._previous_prompt_word(prompt.input_text, prompt.cursor)
                 continue
             if self._is_option_right(key):
-                cursor = self._next_prompt_word(input_text, cursor)
+                prompt.cursor = self._next_prompt_word(prompt.input_text, prompt.cursor)
                 continue
 
             if self._is_escape(key):
-                exit_confirm_deadline = 0.0
-                exit_notice = ""
-                if input_text:
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_selected = 0
-                    file_references = {}
-                    image_attachments = {}
-                elif pinned_anchor is not None:
-                    pinned_anchor = None
+                view.exit_confirm_deadline = 0.0
+                view.exit_notice = ""
+                if prompt.input_text:
+                    prompt.clear()
+                elif view.pinned_anchor is not None:
+                    view.pinned_anchor = None
                 elif self._session_selection is not None:
                     self._clear_session_selection()
                 else:
@@ -1682,83 +1634,85 @@ class AnomxCliApp(
 
             if key == curses.KEY_UP:
                 if file_suggestions:
-                    file_selected = max(0, file_selected - 1)
+                    prompt.file_selected = max(0, prompt.file_selected - 1)
                     continue
                 if command_suggestions:
-                    command_selected = max(0, command_selected - 1)
+                    prompt.command_selected = max(0, prompt.command_selected - 1)
                     continue
                 moved_cursor = self._move_prompt_cursor_row(
                     stdscr,
-                    input_text,
-                    cursor,
+                    prompt.input_text,
+                    prompt.cursor,
                     direction=-1,
-                    pasted_spans=pasted_spans,
+                    pasted_spans=prompt.pasted_spans,
                 )
-                if moved_cursor != cursor:
-                    cursor = moved_cursor
+                if moved_cursor != prompt.cursor:
+                    prompt.cursor = moved_cursor
                     continue
-                pinned_anchor = None
-                scroll += 1
+                view.pinned_anchor = None
+                view.scroll += 1
                 continue
             if key == curses.KEY_DOWN:
                 if file_suggestions:
-                    file_selected = min(len(file_suggestions) - 1, file_selected + 1)
+                    prompt.file_selected = min(len(file_suggestions) - 1, prompt.file_selected + 1)
                     continue
                 if command_suggestions:
-                    command_selected = min(len(command_suggestions) - 1, command_selected + 1)
+                    prompt.command_selected = min(
+                        len(command_suggestions) - 1, prompt.command_selected + 1
+                    )
                     continue
                 moved_cursor = self._move_prompt_cursor_row(
                     stdscr,
-                    input_text,
-                    cursor,
+                    prompt.input_text,
+                    prompt.cursor,
                     direction=1,
-                    pasted_spans=pasted_spans,
+                    pasted_spans=prompt.pasted_spans,
                 )
-                if moved_cursor != cursor:
-                    cursor = moved_cursor
+                if moved_cursor != prompt.cursor:
+                    prompt.cursor = moved_cursor
                     continue
-                pinned_anchor = None
-                scroll -= 1
+                view.pinned_anchor = None
+                view.scroll -= 1
                 continue
             if key == curses.KEY_PPAGE:
-                pinned_anchor = None
-                scroll += 5
+                view.pinned_anchor = None
+                view.scroll += 5
                 continue
             if key == curses.KEY_NPAGE:
-                pinned_anchor = None
-                scroll -= 5
+                view.pinned_anchor = None
+                view.scroll -= 5
                 continue
             if key == curses.KEY_LEFT:
-                cursor = max(0, cursor - 1)
+                prompt.cursor = max(0, prompt.cursor - 1)
                 continue
             if key == curses.KEY_RIGHT:
-                cursor = min(len(input_text), cursor + 1)
+                prompt.cursor = min(len(prompt.input_text), prompt.cursor + 1)
                 continue
             if key == curses.KEY_HOME:
-                cursor = 0
+                prompt.cursor = 0
                 continue
             if key == curses.KEY_END:
-                cursor = len(input_text)
+                prompt.cursor = len(prompt.input_text)
                 continue
             if key == curses.KEY_MOUSE:
                 mouse_action = self._session_mouse_action(
                     stdscr,
-                    input_text,
+                    prompt.input_text,
                     command_suggestions,
-                    command_selected,
+                    prompt.command_selected,
                     file_suggestions,
-                    file_selected,
-                    pasted_spans,
+                    prompt.file_selected,
+                    prompt.pasted_spans,
                 )
                 if mouse_action is None:
                     continue
                 if mouse_action.kind == "cursor":
-                    cursor = mouse_action.value
+                    prompt.cursor = mouse_action.value
                 elif mouse_action.kind == "back_project":
                     return "project"
                 elif mouse_action.kind == "scroll":
-                    pinned_anchor = None
-                    scroll += mouse_action.value
+                    view.pinned_anchor = None
+                    view.scroll += mouse_action.value
                 elif mouse_action.kind == "toggle_work":
                     self._toggle_work_turn(mouse_action.text)
                 elif mouse_action.kind == "toggle_pinned_user":
@@ -1783,24 +1737,24 @@ class AnomxCliApp(
                 elif mouse_action.kind == "command":
                     suggestion = command_suggestions[mouse_action.value]
                     if command_token is not None and self._command_token_is_inline(
-                        input_text,
+                        prompt.input_text,
                         command_token,
                     ):
-                        input_text, cursor = self._remove_command_token(
-                            input_text,
+                        prompt.input_text, prompt.cursor = self._remove_command_token(
+                            prompt.input_text,
                             command_token,
-                            pasted_spans,
+                            prompt.pasted_spans,
                         )
                         command_result = self._handle_command_with_prompt(
                             stdscr,
                             suggestion.command,
                             current_session,
                             suggestion.command,
-                            input_text,
-                            cursor,
-                            pasted_spans,
-                            file_references,
-                            image_attachments,
+                            prompt.input_text,
+                            prompt.cursor,
+                            prompt.pasted_spans,
+                            prompt.file_references,
+                            prompt.image_attachments,
                         )
                         if command_result == "exit":
                             return 0
@@ -1808,9 +1762,8 @@ class AnomxCliApp(
                             current_session = command_result
                             self._activate_agent(current_session.agent_kind)
                             self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                            scroll = 0
-                            pinned_anchor = None
-                        command_selected = 0
+                            view.jump_to_bottom()
+                        prompt.command_selected = 0
                     else:
                         command = suggestion.command
                         command_result = self._handle_command(stdscr, command, current_session)
@@ -1820,27 +1773,20 @@ class AnomxCliApp(
                             current_session = command_result
                             self._activate_agent(current_session.agent_kind)
                             self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                            scroll = 0
-                            pinned_anchor = None
-                        input_text = ""
-                        cursor = 0
-                        pasted_spans = []
-                        command_selected = 0
-                        file_selected = 0
-                        file_references = {}
-                        image_attachments = {}
+                            view.jump_to_bottom()
+                        prompt.clear()
                 elif mouse_action.kind == "file_reference":
                     if file_reference_token is None:
                         continue
-                    input_text, cursor = self._insert_file_reference(
-                        input_text,
-                        cursor,
+                    prompt.input_text, prompt.cursor = self._insert_file_reference(
+                        prompt.input_text,
+                        prompt.cursor,
                         file_reference_token,
                         file_suggestions[mouse_action.value],
-                        file_references,
-                        pasted_spans,
+                        prompt.file_references,
+                        prompt.pasted_spans,
                     )
-                    file_selected = 0
+                    prompt.file_selected = 0
                 elif mouse_action.kind == "skill":
                     skill = self._skill_for_command(f"/{mouse_action.text}")
                     if skill is None:
@@ -1853,32 +1799,26 @@ class AnomxCliApp(
                     )
                     if command_result == "exit":
                         return 0
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_selected = 0
-                    file_references = {}
-                    image_attachments = {}
+                    prompt.clear()
                 continue
             raw_mouse_action = self._raw_mouse_action(
                 key,
                 stdscr,
-                input_text,
+                prompt.input_text,
                 command_suggestions,
-                command_selected,
+                prompt.command_selected,
                 file_suggestions,
-                file_selected,
-                pasted_spans,
+                prompt.file_selected,
+                prompt.pasted_spans,
             )
             if raw_mouse_action is not None:
                 if raw_mouse_action.kind == "cursor":
-                    cursor = raw_mouse_action.value
+                    prompt.cursor = raw_mouse_action.value
                 elif raw_mouse_action.kind == "back_project":
                     return "project"
                 elif raw_mouse_action.kind == "scroll":
-                    pinned_anchor = None
-                    scroll += raw_mouse_action.value
+                    view.pinned_anchor = None
+                    view.scroll += raw_mouse_action.value
                 elif raw_mouse_action.kind == "toggle_work":
                     self._toggle_work_turn(raw_mouse_action.text)
                 elif raw_mouse_action.kind == "toggle_pinned_user":
@@ -1903,24 +1843,24 @@ class AnomxCliApp(
                 elif raw_mouse_action.kind == "command":
                     suggestion = command_suggestions[raw_mouse_action.value]
                     if command_token is not None and self._command_token_is_inline(
-                        input_text,
+                        prompt.input_text,
                         command_token,
                     ):
-                        input_text, cursor = self._remove_command_token(
-                            input_text,
+                        prompt.input_text, prompt.cursor = self._remove_command_token(
+                            prompt.input_text,
                             command_token,
-                            pasted_spans,
+                            prompt.pasted_spans,
                         )
                         command_result = self._handle_command_with_prompt(
                             stdscr,
                             suggestion.command,
                             current_session,
                             suggestion.command,
-                            input_text,
-                            cursor,
-                            pasted_spans,
-                            file_references,
-                            image_attachments,
+                            prompt.input_text,
+                            prompt.cursor,
+                            prompt.pasted_spans,
+                            prompt.file_references,
+                            prompt.image_attachments,
                         )
                         if command_result == "exit":
                             return 0
@@ -1928,9 +1868,8 @@ class AnomxCliApp(
                             current_session = command_result
                             self._activate_agent(current_session.agent_kind)
                             self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                            scroll = 0
-                            pinned_anchor = None
-                        command_selected = 0
+                            view.jump_to_bottom()
+                        prompt.command_selected = 0
                     else:
                         command = suggestion.command
                         command_result = self._handle_command(stdscr, command, current_session)
@@ -1940,27 +1879,20 @@ class AnomxCliApp(
                             current_session = command_result
                             self._activate_agent(current_session.agent_kind)
                             self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                            scroll = 0
-                            pinned_anchor = None
-                        input_text = ""
-                        cursor = 0
-                        pasted_spans = []
-                        command_selected = 0
-                        file_selected = 0
-                        file_references = {}
-                        image_attachments = {}
+                            view.jump_to_bottom()
+                        prompt.clear()
                 elif raw_mouse_action.kind == "file_reference":
                     if file_reference_token is None:
                         continue
-                    input_text, cursor = self._insert_file_reference(
-                        input_text,
-                        cursor,
+                    prompt.input_text, prompt.cursor = self._insert_file_reference(
+                        prompt.input_text,
+                        prompt.cursor,
                         file_reference_token,
                         file_suggestions[raw_mouse_action.value],
-                        file_references,
-                        pasted_spans,
+                        prompt.file_references,
+                        prompt.pasted_spans,
                     )
-                    file_selected = 0
+                    prompt.file_selected = 0
                 elif raw_mouse_action.kind == "skill":
                     skill = self._skill_for_command(f"/{raw_mouse_action.text}")
                     if skill is None:
@@ -1973,72 +1905,66 @@ class AnomxCliApp(
                     )
                     if command_result == "exit":
                         return 0
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    command_selected = 0
-                    file_selected = 0
-                    file_references = {}
-                    image_attachments = {}
+                    prompt.clear()
                 continue
             if self._is_raw_mouse_fragment_key(key):
                 continue
             if isinstance(key, PromptPasteEvent):
                 if key.text:
-                    input_text, cursor = self._insert_prompt_text(
-                        input_text,
-                        cursor,
+                    prompt.input_text, prompt.cursor = self._insert_prompt_text(
+                        prompt.input_text,
+                        prompt.cursor,
                         key.text,
-                        pasted_spans,
+                        prompt.pasted_spans,
                         pasted=True,
                     )
-                    input_text, cursor, added_images = self._consume_dropped_images(
-                        input_text,
-                        cursor,
-                        image_attachments,
-                        pasted_spans,
+                    prompt.input_text, prompt.cursor, added_images = self._consume_dropped_images(
+                        prompt.input_text,
+                        prompt.cursor,
+                        prompt.image_attachments,
+                        prompt.pasted_spans,
                     )
                     if added_images:
                         self._append_unsupported_image_notice(
                             current_session,
                             added_images,
                         )
-                    command_selected = 0
-                    file_selected = 0
+                    prompt.command_selected = 0
+                    prompt.file_selected = 0
                 continue
             if self._is_enter(key):
                 if file_suggestions and file_reference_token is not None:
-                    input_text, cursor = self._insert_file_reference(
-                        input_text,
-                        cursor,
+                    prompt.input_text, prompt.cursor = self._insert_file_reference(
+                        prompt.input_text,
+                        prompt.cursor,
                         file_reference_token,
-                        file_suggestions[file_selected],
-                        file_references,
-                        pasted_spans,
+                        file_suggestions[prompt.file_selected],
+                        prompt.file_references,
+                        prompt.pasted_spans,
                     )
-                    file_selected = 0
+                    prompt.file_selected = 0
                     continue
                 if (
                     command_token is not None
                     and command_suggestions
-                    and self._command_token_is_inline(input_text, command_token)
+                    and self._command_token_is_inline(prompt.input_text, command_token)
                 ):
-                    suggestion = command_suggestions[command_selected]
-                    input_text, cursor = self._remove_command_token(
-                        input_text,
+                    suggestion = command_suggestions[prompt.command_selected]
+                    prompt.input_text, prompt.cursor = self._remove_command_token(
+                        prompt.input_text,
                         command_token,
-                        pasted_spans,
+                        prompt.pasted_spans,
                     )
                     command_result = self._handle_command_with_prompt(
                         stdscr,
                         suggestion.command,
                         current_session,
                         suggestion.command,
-                        input_text,
-                        cursor,
-                        pasted_spans,
-                        file_references,
-                        image_attachments,
+                        prompt.input_text,
+                        prompt.cursor,
+                        prompt.pasted_spans,
+                        prompt.file_references,
+                        prompt.image_attachments,
                     )
                     if command_result == "exit":
                         return 0
@@ -2046,38 +1972,25 @@ class AnomxCliApp(
                         current_session = command_result
                         self._activate_agent(current_session.agent_kind)
                         self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                        scroll = 0
-                        pinned_anchor = None
-                    command_selected = 0
+                        view.jump_to_bottom()
+                    prompt.command_selected = 0
                     continue
-                submitted = input_text.strip()
+                submitted = prompt.input_text.strip()
                 submitted_image_attachments = self._active_image_attachments(
                     submitted,
-                    image_attachments,
+                    prompt.image_attachments,
                 )
                 backend_message = self._backend_message_for_prompt(
                     submitted,
-                    file_references,
+                    prompt.file_references,
                 )
-                submitted_file_references = dict(file_references)
-                selected_command = command_selected
+                submitted_file_references = dict(prompt.file_references)
+                selected_command = prompt.command_selected
                 if not submitted:
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    file_references = {}
-                    image_attachments = {}
-                    command_selected = 0
-                    file_selected = 0
+                    prompt.clear()
                     continue
                 if self._is_slash_command(submitted):
-                    input_text = ""
-                    cursor = 0
-                    pasted_spans = []
-                    file_references = {}
-                    image_attachments = {}
-                    command_selected = 0
-                    file_selected = 0
+                    prompt.clear()
                     command = self._submitted_command(
                         submitted,
                         command_suggestions,
@@ -2095,13 +2008,12 @@ class AnomxCliApp(
                         current_session = command_result
                         self._activate_agent(current_session.agent_kind)
                         self._prompt_placeholder = random.choice(PROMPT_PLACEHOLDERS)
-                        scroll = 0
-                        pinned_anchor = None
+                        view.jump_to_bottom()
                     continue
                 if self._start_hints_visible_for_prompt(
                     current_session.path,
                     messages,
-                    input_text,
+                    prompt.input_text,
                     command_suggestions,
                     file_suggestions,
                 ):
@@ -2109,16 +2021,10 @@ class AnomxCliApp(
                         stdscr,
                         current_session,
                         messages,
-                        scroll,
-                        pinned_anchor,
+                        view.scroll,
+                        view.pinned_anchor,
                     )
-                input_text = ""
-                cursor = 0
-                pasted_spans = []
-                file_references = {}
-                image_attachments = {}
-                command_selected = 0
-                file_selected = 0
+                prompt.clear()
                 self.home.append_session_event(
                     current_session.path,
                     "user_message",
@@ -2136,62 +2042,59 @@ class AnomxCliApp(
                 turn.anchor_expansion_key = self._latest_root_user_expansion_key(
                     current_session.path
                 )
-                pinned_anchor = anchor_line
+                view.pinned_anchor = anchor_line
                 # A prior turn may have left the view scrolled away from the bottom
                 # (e.g. the user scrolled up to read earlier output). Without this,
                 # the new response streams in below the visible area and the view
                 # never follows it until the user manually scrolls down.
-                scroll = 0
-                running_notice = RUNNING_NOTICE
-                running_notice_role = "light"
-                running_abort_key = ""
-                running_abort_deadline = 0.0
+                view.scroll = 0
+                view.reset_running_notice(RUNNING_NOTICE)
                 continue
 
             if self._is_option_delete(key):
-                word_start = self._previous_prompt_word(input_text, cursor)
-                input_text, cursor = self._replace_prompt_range(
-                    input_text,
+                word_start = self._previous_prompt_word(prompt.input_text, prompt.cursor)
+                prompt.input_text, prompt.cursor = self._replace_prompt_range(
+                    prompt.input_text,
                     word_start,
-                    cursor,
+                    prompt.cursor,
                     "",
-                    pasted_spans,
+                    prompt.pasted_spans,
                 )
-                command_selected = 0
-                file_selected = 0
+                prompt.command_selected = 0
+                prompt.file_selected = 0
                 continue
             if self._is_backspace(key):
-                if cursor > 0:
-                    input_text, cursor = self._delete_prompt_backward(
-                        input_text,
-                        cursor,
-                        pasted_spans,
-                        file_references,
-                        image_attachments,
+                if prompt.cursor > 0:
+                    prompt.input_text, prompt.cursor = self._delete_prompt_backward(
+                        prompt.input_text,
+                        prompt.cursor,
+                        prompt.pasted_spans,
+                        prompt.file_references,
+                        prompt.image_attachments,
                     )
-                    command_selected = 0
-                    file_selected = 0
+                    prompt.command_selected = 0
+                    prompt.file_selected = 0
                 continue
             if isinstance(key, str) and key.isprintable():
-                input_text, cursor = self._insert_prompt_text(
-                    input_text,
-                    cursor,
+                prompt.input_text, prompt.cursor = self._insert_prompt_text(
+                    prompt.input_text,
+                    prompt.cursor,
                     key,
-                    pasted_spans,
+                    prompt.pasted_spans,
                 )
-                input_text, cursor, added_images = self._consume_dropped_images(
-                    input_text,
-                    cursor,
-                    image_attachments,
-                    pasted_spans,
+                prompt.input_text, prompt.cursor, added_images = self._consume_dropped_images(
+                    prompt.input_text,
+                    prompt.cursor,
+                    prompt.image_attachments,
+                    prompt.pasted_spans,
                 )
                 if added_images:
                     self._append_unsupported_image_notice(
                         current_session,
                         added_images,
                     )
-                command_selected = 0
-                file_selected = 0
+                prompt.command_selected = 0
+                prompt.file_selected = 0
 
     def _session_animation_active(self, session_path: Path) -> bool:
         return (

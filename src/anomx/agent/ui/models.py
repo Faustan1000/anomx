@@ -188,6 +188,62 @@ class ActiveSessionTurn:
     pending_events: list[RuntimeUiEvent] = dataclass_field(default_factory=list)
 
 
+@dataclass
+class PromptState:
+    """Editable prompt contents plus its completion selections."""
+
+    input_text: str = ""
+    cursor: int = 0
+    pasted_spans: list[PromptPasteSpan] = dataclass_field(default_factory=list)
+    command_selected: int = 0
+    file_selected: int = 0
+    file_references: dict[str, str] = dataclass_field(default_factory=dict)
+    image_attachments: dict[str, dict[str, str]] = dataclass_field(default_factory=dict)
+
+    def clear(self) -> None:
+        """Empty the prompt and reset completions.
+
+        Fresh containers are bound (rather than clearing in place) so references that
+        a running turn or callback still holds keep their old contents.
+        """
+
+        self.input_text = ""
+        self.cursor = 0
+        self.pasted_spans = []
+        self.command_selected = 0
+        self.file_selected = 0
+        self.file_references = {}
+        self.image_attachments = {}
+
+
+@dataclass
+class SessionViewState:
+    """Scroll position and transient notices of the session screen."""
+
+    scroll: int = 0
+    pinned_anchor: int | None = None
+    exit_confirm_deadline: float = 0.0
+    exit_notice: str = ""
+    running_notice: str = ""
+    running_notice_role: str = "light"
+    running_abort_key: str = ""
+    running_abort_deadline: float = 0.0
+
+    def jump_to_bottom(self) -> None:
+        """Follow the newest output: leave any scroll offset and unpin the user message."""
+
+        self.scroll = 0
+        self.pinned_anchor = None
+
+    def reset_running_notice(self, notice: str) -> None:
+        """Show the default running hint and forget any pending abort confirmation."""
+
+        self.running_notice = notice
+        self.running_notice_role = "light"
+        self.running_abort_key = ""
+        self.running_abort_deadline = 0.0
+
+
 @dataclass(frozen=True)
 class StartupPreparation:
     """Initial session state prepared while the startup animation is visible."""
