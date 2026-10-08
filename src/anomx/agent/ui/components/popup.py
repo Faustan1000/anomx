@@ -724,24 +724,15 @@ class PopupComponentMixin:
         request: CommandApprovalRequest,
     ) -> str | None:
         del request
-        prompt = getattr(self, "_prompt_multiline_text", None)
-        if callable(prompt):
-            reason = prompt(
-                stdscr,
-                "Reject Always",
-                (
-                    "Why should matching commands be rejected? "
-                    "Ctrl+S saves this reason as a memory."
-                ),
-                optional=False,
-            )
-        else:
-            reason = self._run_overlay_text(
-                stdscr,
-                "Reject Always",
-                "Why should matching commands be rejected?",
-                optional=False,
-            )
+        reason = self._prompt_multiline_text(
+            stdscr,
+            "Reject Always",
+            (
+                "Why should matching commands be rejected? "
+                "Ctrl+S saves this reason as a memory."
+            ),
+            optional=False,
+        )
         if reason is None or not reason.strip():
             return None
         return reason.strip()

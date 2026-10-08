@@ -248,6 +248,7 @@ class AnomxCliApp(
         self._active_session_turns: dict[Path, ActiveSessionTurn] = {}
         self._discovered_provider_models: dict[str, tuple[str, ...]] = {}
         self._startup_tasks: CliStartupProcess | None = None
+        self._approval_memory_reason = ""
 
     def prepare_background_startup(self, *, wait_for_runtime: bool = False) -> None:
         """Warm external startup work without blocking terminal rendering."""
@@ -2612,7 +2613,7 @@ class AnomxCliApp(
                     self.home.add_global_allowed_command(allowance_key)
                 else:
                     self.home.add_global_rejected_command(allowance_key)
-                    reason = str(getattr(self, "_approval_memory_reason", "") or "").strip()
+                    reason = self._approval_memory_reason.strip()
                     if reason:
                         self._save_approval_memory(turn_runtime, request, allowance_key, reason)
             return choice

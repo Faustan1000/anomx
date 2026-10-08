@@ -32,7 +32,7 @@ class ApproveUpdateViewMixin:
         self.state = AgentState.VERSION_CHECK
         config = self.home.load_config()
         skipped = str(config.get("skipped_version", "") or "")
-        startup_tasks = getattr(self, "_startup_tasks", None)
+        startup_tasks = self._startup_tasks
         if startup_tasks is not None:
             startup_tasks.poll()
             if not startup_tasks.version_ready:
