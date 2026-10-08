@@ -27,8 +27,9 @@ Lines and characters are 1-based. The file is `$ANOMX_HOME/editor-context.json`
 - no network access, no ports, no child processes, no dependencies
 - it never reads other files and never sends the selected text (only the cursor line)
 - only the focused window writes; a closing window clears the file
-- when no text editor is active (for example while you type in the terminal) the last
-  visible editor is kept and `isActiveEditor` is `false`
+- when no file editor is active (for example while you type in the terminal or write in a
+  comment box) the last visible file editor is kept and `isActiveEditor` is `false`
+- an unchanged state is not rewritten
 
 The whole implementation is `extension.js` (under 200 lines) and is meant to be read.
 

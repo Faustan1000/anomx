@@ -130,7 +130,7 @@ def test_notes_in_view_uses_the_visible_lines_of_the_active_file(tmp_path):
 def test_vsix_contains_manifest_and_only_the_audited_files(tmp_path):
     vsix = build_vsix(tmp_path)
 
-    assert vsix.name == vsix_name() == "anomx-local.anomx-editor-context-0.1.1.vsix"
+    assert vsix.name == vsix_name() == "anomx-local.anomx-editor-context-0.1.2.vsix"
     with zipfile.ZipFile(vsix) as archive:
         assert sorted(archive.namelist()) == [
             "[Content_Types].xml",
@@ -140,7 +140,7 @@ def test_vsix_contains_manifest_and_only_the_audited_files(tmp_path):
             "extension/package.json",
         ]
         manifest = archive.read("extension.vsixmanifest").decode("utf-8")
-    assert 'Publisher="anomx-local"' in manifest and 'Version="0.1.1"' in manifest
+    assert 'Publisher="anomx-local"' in manifest and 'Version="0.1.2"' in manifest
     assert install_command(vsix) == f"code --install-extension {vsix}"
     assert extension_manifest()["main"] == "./extension.js"
 
@@ -231,6 +231,27 @@ const read = () => JSON.parse(fs.readFileSync(outPath, 'utf8'));
   await sleep(250);
   results.inactive = read();
 
+  // The input box of a comment thread becomes the active "text editor" (scheme comment).
+  const commentEditor = {
+    document: { uri: { scheme: 'comment', fsPath: '/comment/1' }, languageId: 'markdown', isDirty: false,
+      lineCount: 1, lineAt: () => ({ text: 'draft' }) },
+    selection: { active: { line: 0, character: 5 }, start: { line: 0, character: 5 },
+      end: { line: 0, character: 5 }, isEmpty: true },
+    visibleRanges: [{ start: { line: 0 }, end: { line: 0 } }],
+  };
+  fake.window.activeTextEditor = commentEditor;
+  fake.window.visibleTextEditors = [editor, commentEditor];
+  handlers.editor();
+  await sleep(250);
+  results.commentBox = read();
+
+  // Identical state again: the file must not be rewritten.
+  const before = fs.statSync(outPath).mtimeMs;
+  handlers.editor();
+  await sleep(250);
+  results.rewritten = fs.statSync(outPath).mtimeMs !== before;
+
+  fake.window.activeTextEditor = undefined;
   fake.window.visibleTextEditors = [];  // the editor was closed
   handlers.editor();
   await sleep(250);
@@ -279,6 +300,9 @@ def test_extension_writes_the_expected_context_with_a_simulated_vscode(tmp_path)
     assert first["isActiveEditor"] is True
     inactive = results["inactive"]  # terminal focus: keep the last visible editor, flagged
     assert inactive["activeFile"] == "/ws/app/a.py" and inactive["isActiveEditor"] is False
+    comment = results["commentBox"]  # writing in a comment box must not forget the file
+    assert comment["activeFile"] == "/ws/app/a.py" and comment["isActiveEditor"] is False
+    assert results["rewritten"] is False
     assert results["noEditor"]["activeFile"] is None  # closed editor: nothing stale is kept
     assert results["cleared"]["activeFile"] is None  # disposing clears stale state
     assert results["leftover"] == []

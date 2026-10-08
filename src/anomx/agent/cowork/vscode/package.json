@@ -2,7 +2,7 @@
   "name": "anomx-editor-context",
   "displayName": "Anomx Editor Context",
   "description": "Writes the active file, cursor, selection and visible lines to a local JSON file so the Anomx CLI agent knows what you are looking at.",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "publisher": "anomx-local",
   "license": "Apache-2.0",
   "engines": { "vscode": "^1.85.0" },

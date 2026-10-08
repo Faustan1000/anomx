@@ -84,9 +84,14 @@ function writeContextFile(filePath, context) {
 // While the user types into the terminal (or any non-text tab) VS Code reports no active
 // text editor. The last one is kept as long as it stays visible, marked as not active, so
 // the agent still knows which file the user was working in.
+//
+// "Text editor" also covers the input box of a comment thread (scheme "comment") and
+// output or diff panes. Only real files count, otherwise opening a comment would make the
+// agent forget the file the comment belongs to.
 function takeSnapshot(vscode, memory) {
   const folders = (vscode.workspace.workspaceFolders || []).map((folder) => folder.uri.fsPath);
-  const active = vscode.window.activeTextEditor;
+  const candidate = vscode.window.activeTextEditor;
+  const active = candidate && candidate.document.uri.scheme === 'file' ? candidate : undefined;
   if (active) {
     memory.lastEditor = active;
   }
@@ -121,11 +126,21 @@ function takeSnapshot(vscode, memory) {
   };
 }
 
+// Everything except the bookkeeping fields; used to skip rewrites of an unchanged state.
+function sameState(previous, next) {
+  if (!previous || !next) {
+    return false;
+  }
+  const strip = ({ updatedAt, pid, ...rest }) => JSON.stringify(rest);
+  return strip(previous) === strip(next);
+}
+
 function activate(extensionContext) {
   // Loaded only inside VS Code; kept out of the top level so tests can require this file.
   const vscode = require('vscode');
   let timer = null;
   let wroteLast = false;
+  let lastWritten = null;
   const memory = { lastEditor: undefined };
 
   const settings = () => vscode.workspace.getConfiguration('anomxEditorContext');
@@ -139,7 +154,12 @@ function activate(extensionContext) {
       return;
     }
     try {
-      writeContextFile(targetPath(), buildContext(takeSnapshot(vscode, memory)));
+      const context = buildContext(takeSnapshot(vscode, memory));
+      if (sameState(lastWritten, context)) {
+        return;
+      }
+      writeContextFile(targetPath(), context);
+      lastWritten = context;
       wroteLast = true;
     } catch (error) {
       console.error('anomx-editor-context: could not write context file', error);
@@ -167,6 +187,7 @@ function activate(extensionContext) {
         if (wroteLast) {
           try {
             writeContextFile(targetPath(), buildContext({ workspaceFolders: [], editor: null }));
+            lastWritten = null;
           } catch (error) {
             console.error('anomx-editor-context: could not clear context file', error);
           }
@@ -179,4 +200,11 @@ function activate(extensionContext) {
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, buildContext, defaultContextPath, writeContextFile };
+module.exports = {
+  activate,
+  deactivate,
+  buildContext,
+  defaultContextPath,
+  sameState,
+  writeContextFile,
+};
