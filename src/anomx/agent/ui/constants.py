@@ -47,6 +47,7 @@ SLASH_COMMANDS = (
     SlashCommand(
         "/feedback", "Send feedback to the connected Anomx Platform", needs_platform=True
     ),
+    SlashCommand("/cowork", "Let agents work on your editor notes, one branch each"),
     SlashCommand("/exit", "Exit Anomx"),
 )
 COMMANDS = tuple(CommandSpec(item.command, item.description) for item in SLASH_COMMANDS)

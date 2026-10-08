@@ -74,9 +74,9 @@ def _parse(data: dict[str, Any]) -> EditorContext | None:
     if updated is None:
         return None
     active_file = data.get("activeFile")
-    cursor = data.get("cursor") if isinstance(data.get("cursor"), dict) else {}
-    selection = data.get("selection") if isinstance(data.get("selection"), dict) else {}
-    visible = data.get("visibleRange") if isinstance(data.get("visibleRange"), dict) else {}
+    cursor = _mapping(data.get("cursor"))
+    selection = _mapping(data.get("selection"))
+    visible = _mapping(data.get("visibleRange"))
     folders = data.get("workspaceFolders")
     line = _int(cursor.get("line"))
     return EditorContext(
@@ -96,6 +96,10 @@ def _parse(data: dict[str, Any]) -> EditorContext | None:
         active_line_text=str(data.get("activeLineText") or ""),
         updated_at=updated,
     )
+
+
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
 
 
 def _int(value: Any, default: int = 0) -> int:

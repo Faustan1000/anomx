@@ -22,6 +22,7 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 from anomx.agent.base.agents import AgentKind, BaseAgent
+from anomx.agent.cowork import CoworkWorkspace
 from anomx.agent.file_reference_search import FileReferenceSearchClient
 from anomx.agent.helpers.anomx_api import call_anomx_api, connection_from_home
 from anomx.agent.helpers.mode import AgentMode, next_agent_mode
@@ -116,6 +117,7 @@ from anomx.agent.ui.models import (
 from anomx.agent.ui.views.approve_update import ApproveUpdateViewMixin
 from anomx.agent.ui.views.approve_workspace import ApproveWorkspaceViewMixin
 from anomx.agent.ui.views.config import ConfigViewMixin
+from anomx.agent.ui.views.cowork import CoworkViewMixin
 from anomx.agent.ui.views.matrix_loading import MatrixLoadingViewMixin
 from anomx.agent.ui.views.onboarding import OnboardingViewMixin
 from anomx.agent.ui.views.project import ProjectViewMixin
@@ -138,6 +140,7 @@ class AnomxCliApp(
     SessionViewMixin,
     SubagentViewMixin,
     ConfigViewMixin,
+    CoworkViewMixin,
     InfoBoxComponentMixin,
     MessagesComponentMixin,
     PopupComponentMixin,
@@ -249,6 +252,7 @@ class AnomxCliApp(
         self._discovered_provider_models: dict[str, tuple[str, ...]] = {}
         self._startup_tasks: CliStartupProcess | None = None
         self._approval_memory_reason = ""
+        self._cowork_panels: dict[Path, CoworkWorkspace] = {}
 
     def prepare_background_startup(self, *, wait_for_runtime: bool = False) -> None:
         """Warm external startup work without blocking terminal rendering."""
@@ -1121,6 +1125,9 @@ class AnomxCliApp(
                     selected,
                     scroll,
                 )
+            return None
+        if command == "/cowork":
+            self._run_cowork_panel(stdscr)
             return None
         if command == "/feedback":
             current_session = (
@@ -2292,6 +2299,9 @@ class AnomxCliApp(
             return None
         if command == "/new":
             return self._create_session()
+        if command == "/cowork":
+            self._run_cowork_panel(stdscr)
+            return None
         skill = self._skill_for_command(command)
         if skill is not None:
             return self._invoke_skill(stdscr, current_session, skill, submitted or command)

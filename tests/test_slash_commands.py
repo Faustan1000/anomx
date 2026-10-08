@@ -20,7 +20,15 @@ def _app(tmp_path):
 def test_derived_sets_follow_the_registry():
     assert [spec.command for spec in COMMANDS] == [item.command for item in SLASH_COMMANDS]
     assert "/rename" not in PROJECT_COMMANDS
-    assert {"/new", "/config", "/model", "/effort", "/feedback", "/exit"} == PROJECT_COMMANDS
+    assert {
+        "/new",
+        "/config",
+        "/model",
+        "/effort",
+        "/feedback",
+        "/cowork",
+        "/exit",
+    } == PROJECT_COMMANDS
     assert {"/config", "/model", "/effort"} == RUNNING_SESSION_COMMANDS
     assert {"/feedback"} == PLATFORM_COMMANDS
 

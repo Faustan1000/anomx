@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import zipfile
 from pathlib import Path
+from typing import cast
 from xml.sax.saxutils import escape
 
 EXTENSION_DIR = Path(__file__).parent / "vscode"
@@ -27,7 +28,8 @@ _CONTENT_TYPES = (
 
 
 def extension_manifest() -> dict[str, object]:
-    return json.loads((EXTENSION_DIR / "package.json").read_text(encoding="utf-8"))
+    manifest = json.loads((EXTENSION_DIR / "package.json").read_text(encoding="utf-8"))
+    return cast("dict[str, object]", manifest)
 
 
 def vsix_name() -> str:
