@@ -1760,6 +1760,17 @@ class CliToolManager:
     def _has_shell_syntax(self, normalized: str) -> bool:
         return bool(self._shell_operator_spans(normalized))
 
+    def _needs_real_shell(self, segment: str) -> bool:
+        """Whether a pipeline segment cannot be run as a plain subprocess."""
+
+        if self._has_shell_syntax(segment):
+            return True
+        try:
+            return shlex.split(segment)[:1] == ["cd"]
+        except ValueError:
+            # Unbalanced quotes: let the real shell report the error.
+            return True
+
     def _pipeline_segments(self, normalized: str) -> list[str]:
         return self._shell_segments(normalized, split_operators=frozenset({PIPE_OPERATOR}))
 
@@ -1882,10 +1893,7 @@ class CliToolManager:
         long_running_callback: LongRunningCommandCallback | None = None,
     ) -> str:
         segments = self._pipeline_segments(normalized)
-        if any(
-            self._has_shell_syntax(segment) or shlex.split(segment)[:1] == ["cd"]
-            for segment in segments
-        ):
+        if any(self._needs_real_shell(segment) for segment in segments):
             # A segment carries a compound operator (&&, ;, redirection) or a shell
             # builtin such as `cd`. Manual stdout->stdin threading cannot represent
             # those, and running a builtin through subprocess.Popen(shell=False)

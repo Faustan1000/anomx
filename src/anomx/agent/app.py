@@ -3160,7 +3160,7 @@ class AnomxCliApp(
         parts: list[str] = []
         with suppress(curses.error):
             stdscr.nodelay(True)
-        deadline = time.monotonic() + 1.0
+        deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             try:
                 next_key = stdscr.get_wch()
@@ -3172,11 +3172,15 @@ class AnomxCliApp(
                 break
             if isinstance(completed, str):
                 parts.append(completed)
-                deadline = time.monotonic() + 0.1
+                deadline = time.monotonic() + 1.0
         if restore_blocking:
             with suppress(curses.error):
                 stdscr.nodelay(False)
-        return PromptPasteEvent("".join(parts))
+        # The inactivity window is generous so a slow link (SSH) does not cut a paste
+        # short and spill the rest into the prompt as typed keys. Terminals deliver
+        # pasted newlines as "\r"; normalise so they are never mistaken for Enter.
+        text = "".join(parts).replace("\r\n", "\n").replace("\r", "\n")
+        return PromptPasteEvent(text)
 
     def _insert_prompt_text(
         self,
