@@ -28,6 +28,21 @@ RUNNABLE = {TaskStatus.QUEUED, TaskStatus.FAILED}
 
 
 @dataclass(frozen=True)
+class ComparisonFile:
+    """One changed file prepared for a side-by-side comparison."""
+
+    file: str
+    status: str  # "A" added, "M" modified, "D" deleted
+    original: Path
+    agent: Path
+
+    @property
+    def label(self) -> str:
+        names = {"A": "added", "M": "changed", "D": "deleted"}
+        return f"{names.get(self.status, self.status)}  {self.file}"
+
+
+@dataclass(frozen=True)
 class RunResult:
     """Outcome of one agent run."""
 
@@ -315,6 +330,30 @@ class CoworkService:
     def diff(self, note_id: str) -> str:
         task = self._require(note_id)
         return self.git.diff(task.branch, task.base_commit)
+
+    def comparison_files(self, note_id: str) -> list[ComparisonFile]:
+        """Files a task changed, with the original and the agent's version on disk.
+
+        The original (the commit the task started from) is written below the task's state
+        folder, so it can be opened next to the agent's file without touching the user's
+        repository. Added and deleted files get an empty placeholder on the missing side.
+        """
+
+        task = self._require(note_id)
+        worktree = Path(task.worktree)
+        root = self.state_dir / "compare" / _slug(note_id)
+        files: list[ComparisonFile] = []
+        for status, relative in self.git.changed_entries(task.branch, task.base_commit):
+            original = root / "original" / relative
+            original.parent.mkdir(parents=True, exist_ok=True)
+            original.write_bytes(self.git.file_at(task.base_commit, relative) or b"")
+            agent = worktree / relative
+            if status == "D":
+                agent = root / "agent" / relative
+                agent.parent.mkdir(parents=True, exist_ok=True)
+                agent.write_bytes(b"")
+            files.append(ComparisonFile(relative, status, original, agent))
+        return files
 
     def changed_files(self, note_id: str) -> list[str]:
         task = self._require(note_id)

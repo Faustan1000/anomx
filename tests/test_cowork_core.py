@@ -393,3 +393,21 @@ def test_tasks_saved_before_anchor_kind_existed_load_as_source(tmp_path):
     path.write_text(json.dumps(data), encoding="utf-8")
 
     assert TaskStore(path).get("n").anchor_kind == "source"
+
+
+def test_changed_entries_and_file_at_describe_added_modified_and_deleted(repo, tmp_path):
+    git = CoworkGit(repo)
+    (repo / "src" / "gone.py").write_text("old\n", encoding="utf-8")
+    run(repo, "add", "-A")
+    run(repo, "commit", "-m", "add gone")
+    workspace = git.create_task("n1", tmp_path / "wt" / "n1")
+    (workspace.path / "src" / "auth.py").write_text("changed\n", encoding="utf-8")
+    (workspace.path / "src" / "added.py").write_text("new\n", encoding="utf-8")
+    (workspace.path / "src" / "gone.py").unlink()
+    git.commit_all(workspace.path, "agent")
+
+    entries = dict((path, status) for status, path in git.changed_entries(workspace.branch, "main"))
+
+    assert entries == {"src/auth.py": "M", "src/added.py": "A", "src/gone.py": "D"}
+    assert git.file_at(workspace.base_commit, "src/gone.py") == b"old\n"
+    assert git.file_at(workspace.base_commit, "src/added.py") is None

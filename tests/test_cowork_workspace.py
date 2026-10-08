@@ -115,12 +115,13 @@ def test_start_runs_in_the_background_and_ends_ready_with_actions(panel, monkeyp
     assert [a.value for a in panel.actions(ready)] == [
         "chat",
         "diff",
+        "compare",
         "follow",
         "merge",
         "start",
         "discard",
     ]
-    assert panel.actions(ready)[3].label == "Merge into main"
+    assert panel.actions(ready)[4].label == "Merge into main"
     assert any("+    return x.a" in line for line in panel.diff_lines(ready))
 
 

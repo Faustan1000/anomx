@@ -33,7 +33,12 @@ from anomx.agent.cowork.margo import (
     note_context,
     read_margo_notes,
 )
-from anomx.agent.cowork.runner import CoworkService, RunResult, build_task_prompt
+from anomx.agent.cowork.runner import (
+    ComparisonFile,
+    CoworkService,
+    RunResult,
+    build_task_prompt,
+)
 from anomx.agent.cowork.tasks import CoworkTask, TaskStatus, TaskStore
 from anomx.agent.cowork.workspace import CoworkAction, CoworkRow, CoworkWorkspace
 
@@ -41,6 +46,7 @@ __all__ = [
     "MARGO_LINE_BASE",
     "CoworkGit",
     "Activation",
+    "ComparisonFile",
     "CoworkAction",
     "CoworkFollower",
     "CoworkRow",

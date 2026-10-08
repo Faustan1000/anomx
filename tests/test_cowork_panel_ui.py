@@ -175,8 +175,8 @@ def test_follow_switches_the_tree_and_back_returns(app, workspace, fake_agent):
     _start_and_finish(app, workspace)
     data = workspace / "proj" / "src" / "data.py"
 
-    # open note -> "Show in editor" (third action) -> message -> close panel
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ESC]))
+    # open note -> "Show in editor" (fourth action) -> message -> close panel
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, ENTER, ESC]))
     assert "x.a" in data.read_text("utf-8")
     assert any("agent's version" in text for _title, text in screen.messages)
 
@@ -193,12 +193,12 @@ def test_merge_needs_confirmation_and_then_updates_the_branch(app, workspace, fa
     _start_and_finish(app, workspace)
     data = workspace / "proj" / "src" / "data.py"
 
-    # open note -> "Merge into main" (fourth action) -> confirm menu: Cancel
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, ENTER, ENTER, ESC]))
+    # open note -> "Merge into main" (fifth action) -> confirm menu: Cancel
+    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 4, ENTER, ENTER, ESC]))
     assert data.read_text("utf-8") == SOURCE  # cancelled: nothing merged
 
     # open note -> Merge -> confirm "Merge into main" (second entry)
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, ENTER, DOWN, ENTER, ESC]))
+    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 4, ENTER, DOWN, ENTER, ESC]))
 
     assert "x.a" in data.read_text("utf-8")
     assert ("Cowork", "Merged into main.") in screen.messages
@@ -212,8 +212,8 @@ def test_discard_asks_first_and_frees_the_note(app, workspace, fake_agent):
     screen = Screen(app)
     _start_and_finish(app, workspace)
 
-    # open note -> actions: chat, diff, follow, merge, run again, discard (index 5) -> confirm
-    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 5, ENTER, DOWN, ENTER, ESC]))
+    # actions: chat, diff, compare, follow, merge, run again, discard (index 6) -> confirm
+    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 6, ENTER, DOWN, ENTER, ESC]))
 
     app._run_cowork_panel(Keys([ESC]))
     assert screen.last_choices()[0][1] == "[new]"
@@ -535,3 +535,123 @@ def test_the_follow_hint_tells_how_to_send_a_fresh_note(app, workspace, monkeypa
     _step(app, ordinary, view)
 
     assert "press Enter on an empty prompt" in view.notice
+
+
+# -- side-by-side comparison ----------------------------------------------------------
+
+
+@pytest.fixture
+def ready_task(app, workspace, monkeypatch):
+    """A finished task whose agent edited one file and added another."""
+
+    def backend_response(self, session_path, callbacks=None, **_kwargs):
+        edits = [
+            ("src/data.py", "x['a']", "x.a"),
+            ("src/new_module.py", "", "VALUE = 1\n"),
+        ]
+        for path, old, new in edits:
+            self._execute_tool(
+                "edit_file",
+                {"statement": "s", "path": path, "old_text": old, "new_text": new},
+                callbacks,
+                session_path,
+            )
+        return "Done."
+
+    monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
+    Screen(app)
+    _start_and_finish(app, workspace)
+    return _panel(app, workspace)
+
+
+def test_comparison_files_pair_the_original_with_the_agents_version(ready_task):
+    row = next(r for r in ready_task.rows() if r.note_id == "n-1")
+
+    files = {item.file: item for item in ready_task.comparison_files(row)}
+
+    assert set(files) == {"src/data.py", "src/new_module.py"}
+    changed = files["src/data.py"]
+    assert changed.status == "M" and changed.label == "changed  src/data.py"
+    assert changed.original.read_text("utf-8") == SOURCE  # what the repo had
+    assert "x.a" in changed.agent.read_text("utf-8")  # the agent's real file
+    assert Path(row.task.worktree) in changed.agent.parents
+    added = files["src/new_module.py"]
+    assert added.status == "A" and added.original.read_text("utf-8") == ""
+    assert added.agent.read_text("utf-8") == "VALUE = 1\n"
+    # the user's repository is untouched by preparing the comparison
+    assert (workspace_path(ready_task) / "proj" / "src" / "data.py").read_text("utf-8") == SOURCE
+
+
+def _fake_vscode(monkeypatch, *, code="/usr/bin/code", returncode=0):
+    """Replace only the cowork view's view of ``shutil``/``subprocess`` (git keeps working)."""
+
+    import subprocess as real_subprocess
+    from types import SimpleNamespace
+
+    from anomx.agent.ui.views import cowork as cowork_view
+
+    calls: list[list[str]] = []
+
+    def run(command, **_kwargs):
+        calls.append(command)
+        return SimpleNamespace(returncode=returncode)
+
+    monkeypatch.setattr(cowork_view, "shutil", SimpleNamespace(which=lambda _name: code))
+    monkeypatch.setattr(
+        cowork_view,
+        "subprocess",
+        SimpleNamespace(run=run, SubprocessError=real_subprocess.SubprocessError),
+    )
+    monkeypatch.setenv("VSCODE_IPC_HOOK_CLI", "/tmp/hook.sock")
+    return calls
+
+
+def workspace_path(panel) -> Path:
+    return panel.margo_workspace
+
+
+def test_compare_opens_vscodes_diff_with_original_left_and_agent_right(
+    app, workspace, ready_task, monkeypatch
+):
+    calls = _fake_vscode(monkeypatch)
+    screen = Screen(app)
+
+    # open note -> "Compare in VS Code" (third action) -> "Open all 2 comparisons"
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ENTER, ESC]))
+
+    assert len(calls) == 2
+    for command in calls:
+        assert command[:3] == ["/usr/bin/code", "--reuse-window", "--diff"]
+        assert "/original/" in command[3] and "/worktrees/" in command[4]
+    assert any("Opened 2 comparison(s)" in text for _title, text in screen.messages)
+
+
+def test_compare_one_file_from_the_picker(app, workspace, ready_task, monkeypatch):
+    calls = _fake_vscode(monkeypatch)
+    Screen(app)
+
+    # picker entries: all, then the files; take the first file
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, DOWN, ENTER, ESC]))
+
+    assert len(calls) == 1 and calls[0][3].endswith("/original/src/data.py")
+
+
+def test_compare_explains_how_to_continue_when_vscode_cannot_be_steered(
+    app, workspace, ready_task, monkeypatch
+):
+    _fake_vscode(monkeypatch, code=None)
+    screen = Screen(app)
+
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ESC]))
+
+    title, text = screen.messages[-1]
+    assert title == "Cannot open VS Code" and "code --diff" in text and "/original/" in text
+
+
+def test_compare_reports_a_failed_vscode_call(app, workspace, ready_task, monkeypatch):
+    _fake_vscode(monkeypatch, returncode=1)
+    screen = Screen(app)
+
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ENTER, ESC]))
+
+    assert screen.messages[-1][0] == "Cannot open VS Code"

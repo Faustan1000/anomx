@@ -14,7 +14,7 @@ from pathlib import Path
 from anomx.agent.cowork.agent import CoworkRuntime
 from anomx.agent.cowork.git import FollowResult, GitError, MergeResult, find_repo_root
 from anomx.agent.cowork.margo import MargoNote, find_margo_workspace, read_margo_notes
-from anomx.agent.cowork.runner import CoworkService
+from anomx.agent.cowork.runner import ComparisonFile, CoworkService
 from anomx.agent.cowork.tasks import CoworkTask, TaskStatus
 from anomx.agent.runtime import RuntimeCallbacks
 from anomx.agent.store import AnomxHome, SessionRecord
@@ -155,6 +155,13 @@ class CoworkWorkspace:
         actions = [CoworkAction("chat", "Open chat", "Talk to the agent about this note")]
         if changes:
             actions.append(CoworkAction("diff", "Show changes"))
+            actions.append(
+                CoworkAction(
+                    "compare",
+                    "Compare in VS Code",
+                    "Side by side: original on the left, the agent's version on the right",
+                )
+            )
             actions.append(CoworkAction("follow", "Show in editor", "Switches your working tree"))
             if row.status == TaskStatus.READY.value:
                 actions.append(CoworkAction("merge", f"Merge into {base}"))
@@ -271,6 +278,11 @@ class CoworkWorkspace:
             if note_id is not None:
                 return service.runtime_for(note_id)
         return None
+
+    def comparison_files(self, row: CoworkRow) -> list[ComparisonFile]:
+        if row.task is None or row.repo_root is None:
+            return []
+        return self._service(row.repo_root).comparison_files(row.note_id)
 
     def diff_lines(self, row: CoworkRow) -> list[str]:
         if row.task is None or row.repo_root is None:

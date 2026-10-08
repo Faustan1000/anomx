@@ -133,6 +133,28 @@ class CoworkGit:
         out = self._git("diff", "--name-only", f"{base}...{branch}").stdout
         return [line for line in out.splitlines() if line]
 
+    def changed_entries(self, branch: str, base: str) -> list[tuple[str, str]]:
+        """``(status, path)`` per changed file; status is ``A``dded, ``M``odified or ``D``eleted."""
+
+        out = self._git("diff", "--name-status", "--no-renames", f"{base}...{branch}").stdout
+        entries: list[tuple[str, str]] = []
+        for line in out.splitlines():
+            status, _, path = line.partition("\t")
+            if status and path:
+                entries.append((status[:1], path))
+        return entries
+
+    def file_at(self, commit: str, relative: str) -> bytes | None:
+        """Content of a file at a commit (``None`` if it did not exist there)."""
+
+        result = subprocess.run(  # noqa: S603 - fixed git binary, no shell
+            ["git", "-C", str(self.repo_root), "show", f"{commit}:{relative}"],
+            capture_output=True,
+            check=False,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"},
+        )
+        return result.stdout if result.returncode == 0 else None
+
     def diff(self, branch: str, base: str) -> str:
         return self._git("diff", f"{base}...{branch}").stdout
 

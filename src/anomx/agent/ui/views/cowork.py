@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 from contextlib import suppress
+from pathlib import Path
 
 from anomx.agent.cowork import (
     CoworkAction,
@@ -166,6 +167,8 @@ class CoworkViewMixin:
             panel.stop(row)
         elif action.value == "diff":
             self._run_text_viewer(stdscr, f"Changes · {row.label}", panel.diff_lines(row))
+        elif action.value == "compare":
+            self._cowork_compare(stdscr, panel, row)
         elif action.value == "follow":
             result = panel.follow(row)
             if not result.ok:
@@ -241,13 +244,17 @@ class CoworkViewMixin:
         )
         return choice == "confirm"
 
+    def _vscode_cli(self) -> str | None:
+        """The ``code`` command, but only when this terminal can steer its VS Code window."""
+
+        code = shutil.which("code")
+        return code if code is not None and os.environ.get("VSCODE_IPC_HOOK_CLI") else None
+
     def _cowork_open_in_editor(self, row: CoworkRow) -> None:
         """Best effort: bring the file to the front in the VS Code window of this terminal."""
 
-        if row.repo_root is None or row.task is None:
-            return
-        code = shutil.which("code")
-        if code is None or not os.environ.get("VSCODE_IPC_HOOK_CLI"):
+        code = self._vscode_cli()
+        if code is None or row.repo_root is None or row.task is None:
             return
         target = f"{row.repo_root / row.task.file}:{row.task.line}"
         with suppress(OSError, subprocess.SubprocessError):
@@ -257,6 +264,68 @@ class CoworkViewMixin:
                 timeout=5,
                 check=False,
             )
+
+    def _open_diff_in_vscode(self, original: Path, agent: Path) -> bool:
+        code = self._vscode_cli()
+        if code is None:
+            return False
+        try:
+            result = subprocess.run(  # noqa: S603 - fixed binary found on PATH, no shell
+                [code, "--reuse-window", "--diff", str(original), str(agent)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return result.returncode == 0
+
+    def _cowork_compare(
+        self, stdscr: CursesWindow, panel: CoworkWorkspace, row: CoworkRow
+    ) -> None:
+        """Open VS Code's side-by-side diff: original on the left, the agent's file on the right."""
+
+        files = panel.comparison_files(row)
+        if not files:
+            self._message(stdscr, "Cowork", "The agent changed no files.")
+            return
+        if self._vscode_cli() is None:
+            first = files[0]
+            self._message(
+                stdscr,
+                "Cannot open VS Code",
+                "This terminal cannot steer a VS Code window. Run this in a VS Code terminal:\n"
+                f"code --diff {first.original} {first.agent}",
+            )
+            return
+        chosen = files
+        if len(files) > 1:
+            picked = self._menu(
+                stdscr,
+                "Compare in VS Code",
+                f"{len(files)} files changed",
+                (
+                    MenuChoice(f"Open all {len(files)} comparisons", "__all__"),
+                    *(MenuChoice(item.label, str(index)) for index, item in enumerate(files)),
+                ),
+            )
+            if picked is None:
+                return
+            chosen = files if picked == "__all__" else [files[int(picked)]]
+        failed = [
+            item.file
+            for item in chosen
+            if not self._open_diff_in_vscode(item.original, item.agent)
+        ]
+        if failed:
+            self._message(stdscr, "Cannot open VS Code", "Failed for: " + ", ".join(failed))
+            return
+        self._message(
+            stdscr,
+            "Cowork",
+            f"Opened {len(chosen)} comparison(s) in VS Code. Left: the original, right: the "
+            "agent's version in its own worktree (you can edit the right side).",
+        )
 
     def _run_text_viewer(
         self, stdscr: CursesWindow, title: str, lines: list[str], *, subtitle: str = ""
