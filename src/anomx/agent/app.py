@@ -5009,9 +5009,10 @@ class AnomxCliApp(
             character.isspace() for character in input_text[token_start:bounded_cursor]
         ):
             return None
-        # Only a "/" that begins a word is a command; "src/foo", "a/b" and "@path/x"
-        # are path-like text and must not open the command suggestions.
-        if token_start > 0 and not input_text[token_start - 1].isspace():
+        fragment_start = token_start
+        while fragment_start > 0 and not input_text[fragment_start - 1].isspace():
+            fragment_start -= 1
+        if input_text[fragment_start:token_start].startswith("@"):
             return None
         token_end = bounded_cursor
         while token_end < len(input_text) and not input_text[token_end].isspace():
