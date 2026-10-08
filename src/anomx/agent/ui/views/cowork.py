@@ -23,6 +23,7 @@ from anomx.agent.cowork import (
 from anomx.agent.store import SessionRecord
 from anomx.agent.ui.models import CursesWindow, MenuChoice
 
+STAY_IN_NOTE_MENU = frozenset({"diff", "compare", "follow"})
 BACK_VALUE = "__back__"
 FOLLOW_VALUE = "__follow__"
 STATUS_TAGS = {
@@ -31,6 +32,7 @@ STATUS_TAGS = {
     "running": "[running]",
     "ready": "[ready]",
     "failed": "[failed]",
+    "merging": "[merging]",
     "merged": "[merged]",
     "orphan": "[note gone]",
     "no-repo": "[no repo]",
@@ -128,20 +130,35 @@ class CoworkViewMixin:
     def _cowork_note_menu(
         self, stdscr: CursesWindow, panel: CoworkWorkspace, row: CoworkRow
     ) -> SessionRecord | None:
-        actions = panel.actions(row)
-        subtitle = f"{row.label}\n{row.detail}".strip()
-        if not actions:
-            self._message(stdscr, "Cowork", f"{row.label}\n\n{row.detail or row.status}")
-            return None
-        choice = self._menu(
-            stdscr,
-            "Cowork",
-            subtitle,
-            tuple(MenuChoice(item.label, item.value, item.detail) for item in actions),
-        )
-        if choice is None:
-            return None
-        return self._cowork_apply(stdscr, panel, row, next(a for a in actions if a.value == choice))
+        """Actions of one note. Esc goes up one level (to the list of notes).
+
+        Actions that only show something (changes, comparison, editor switch) return to
+        this menu afterwards; actions that change the task return to the list.
+        """
+
+        initial: str | None = None
+        while True:
+            current = next((r for r in panel.rows() if r.note_id == row.note_id), row)
+            actions = panel.actions(current)
+            if not actions:
+                detail = current.detail or current.status
+                self._message(stdscr, "Cowork", f"{current.label}\n\n{detail}")
+                return None
+            choice = self._menu(
+                stdscr,
+                "Cowork",
+                f"{current.label}\n{current.detail}".strip(),
+                tuple(MenuChoice(item.label, item.value, item.detail) for item in actions),
+                initial_value=initial,
+            )
+            if choice is None:
+                return None
+            record = self._cowork_apply(
+                stdscr, panel, current, next(a for a in actions if a.value == choice)
+            )
+            if record is not None or choice not in STAY_IN_NOTE_MENU:
+                return record
+            initial = choice
 
     def _cowork_apply(
         self,
@@ -181,23 +198,44 @@ class CoworkViewMixin:
                     "Your working tree now shows the agent's version. Open /cowork and choose "
                     f"'Back to {row.task.base_branch if row.task else 'base'}' when you are done.",
                 )
-        elif action.value == "merge":
-            self._cowork_merge(stdscr, panel, row)
+        elif action.value in {"merge", "merge_now"}:
+            self._cowork_merge(stdscr, panel, row, review=action.value == "merge")
+        elif action.value == "abort_merge":
+            panel.abort_merge(row)
+            message(stdscr, "Cowork", "The pending merge was aborted; nothing is staged anymore.")
         elif action.value == "discard":
             if self._cowork_confirm(stdscr, "Discard this task and its branch?", "Discard"):
                 panel.discard(row)
         return None
 
     def _cowork_merge(
-        self, stdscr: CursesWindow, panel: CoworkWorkspace, row: CoworkRow
+        self, stdscr: CursesWindow, panel: CoworkWorkspace, row: CoworkRow, *, review: bool = True
     ) -> None:
         base = row.task.base_branch if row.task else "the base branch"
         diff_headers = [line for line in panel.diff_lines(row) if line.startswith("diff --git")]
         files = sorted({header.split(" b/")[-1] for header in diff_headers})
-        question = f"Merge into {base}?  Changed: {', '.join(files) or 'nothing'}"
-        if not self._cowork_confirm(stdscr, question, f"Merge into {base}"):
+        changed = ", ".join(files) or "nothing"
+        if review:
+            question = (
+                f"Stage the changes in {base} for review?  Changed: {changed}. You review them "
+                "in VS Code's Source Control panel and commit there."
+            )
+            action = "Stage for review"
+        else:
+            question = f"Merge into {base} now?  Changed: {changed}"
+            action = f"Merge into {base}"
+        if not self._cowork_confirm(stdscr, question, action):
             return
-        result = panel.merge(row)
+        result = panel.merge(row, review=review)
+        if result.ok and result.pending:
+            self._message(
+                stdscr,
+                "Cowork",
+                "The merge is staged. Open Source Control (Ctrl+Shift+G): the files are under "
+                "'Staged Changes' with 'Merge in progress'. Review them and commit there to "
+                "finish, or choose 'Abort the pending merge' in /cowork.",
+            )
+            return
         if result.ok:
             self._message(stdscr, "Cowork", f"Merged into {base}.")
             return

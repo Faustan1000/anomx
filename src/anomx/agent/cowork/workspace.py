@@ -83,12 +83,19 @@ class CoworkWorkspace:
             repo = find_repo_root(self.margo_workspace / note.file)
             service = self._service(repo) if repo is not None else None
             task = service.tasks.get(note.id) if service is not None else None
+            if service is not None and task is not None:
+                service.refresh_merge_state(note.id)  # the user may have committed or aborted
+                task = service.tasks.get(note.id)
             rows.append(
                 self._row(note.id, note.title, note.file, note.line_number, note, task, repo)
             )
         for repo, service in list(self._services.items()):
             for task in service.tasks.list():
                 if task.note_id in seen or not task.is_active:
+                    continue
+                service.refresh_merge_state(task.note_id)
+                task = service.tasks.get(task.note_id) or task
+                if not task.is_active:
                     continue
                 rows.append(
                     self._row(task.note_id, task.title, task.file, task.line, None, task, repo)
@@ -126,6 +133,8 @@ class CoworkWorkspace:
             error = self._errors.get(note_id, "")
         if running:
             return progress or "Starting…"
+        if task.status is TaskStatus.MERGING:
+            return "Staged in your repository: review in Source Control, then commit there."
         return error or " ".join(task.summary.split())[:MAX_PROGRESS_CHARS * 2]
 
     # -- actions ----------------------------------------------------------------------
@@ -136,6 +145,15 @@ class CoworkWorkspace:
         base = row.task.base_branch if row.task else ""
         if row.running:
             return [CoworkAction("stop", "Stop agent")]
+        if row.status == TaskStatus.MERGING.value:
+            return [
+                CoworkAction("diff", "Show changes"),
+                CoworkAction(
+                    "abort_merge",
+                    "Abort the pending merge",
+                    "Unstages the agent's changes again",
+                ),
+            ]
         has_chat = bool(row.task and row.task.session_path)
         if row.status in {NEW, TaskStatus.QUEUED.value}:
             actions = [
@@ -164,7 +182,20 @@ class CoworkWorkspace:
             )
             actions.append(CoworkAction("follow", "Show in editor", "Switches your working tree"))
             if row.status == TaskStatus.READY.value:
-                actions.append(CoworkAction("merge", f"Merge into {base}"))
+                actions.append(
+                    CoworkAction(
+                        "merge",
+                        f"Merge into {base} (review in Source Control)",
+                        "Stages the changes in your repository; you commit them in VS Code",
+                    )
+                )
+                actions.append(
+                    CoworkAction(
+                        "merge_now",
+                        f"Merge into {base} now",
+                        "Commits the merge immediately",
+                    )
+                )
         if row.status in {TaskStatus.READY.value, TaskStatus.FAILED.value, ORPHAN}:
             if row.status != ORPHAN:
                 actions.append(CoworkAction("start", "Run again"))
@@ -294,10 +325,14 @@ class CoworkWorkspace:
             return FollowResult(False, "No repository.")
         return self._service(row.repo_root).follow(row.note_id)
 
-    def merge(self, row: CoworkRow) -> MergeResult:
+    def merge(self, row: CoworkRow, *, review: bool = True) -> MergeResult:
         if row.repo_root is None:
             return MergeResult(False, reason="No repository.")
-        return self._service(row.repo_root).merge(row.note_id)
+        return self._service(row.repo_root).merge(row.note_id, review=review)
+
+    def abort_merge(self, row: CoworkRow) -> None:
+        if row.repo_root is not None:
+            self._service(row.repo_root).abort_pending_merge(row.note_id)
 
     def discard(self, row: CoworkRow) -> None:
         if row.repo_root is not None:

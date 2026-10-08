@@ -367,25 +367,63 @@ class CoworkService:
     def return_to_base(self, note_id: str) -> FollowResult:
         return self.git.return_to(self._require(note_id).base_branch)
 
-    def merge(self, note_id: str) -> MergeResult:
-        """Merge an approved task into its base branch and clean it up."""
+    def merge(self, note_id: str, *, review: bool = True) -> MergeResult:
+        """Merge an approved task into its base branch.
+
+        With ``review`` the merge is only staged in the user's repository (Source Control
+        shows it as a merge in progress) and completes when they commit; otherwise a merge
+        commit is made right away.
+        """
 
         task = self._require(note_id)
         if task.status is not TaskStatus.READY:
             return MergeResult(False, reason=f"Task is {task.status.value}, not ready.")
         if self.git.commits_ahead(task.branch, task.base_commit) == 0:
             return MergeResult(False, reason="The agent made no changes; nothing to merge.")
-        result = self.git.merge(task.branch, task.base_branch, f"Merge cowork task: {task.title}")
+        message = f"Merge cowork task: {task.title}"
+        if review:
+            result = self.git.merge_pending(task.branch, task.base_branch, message)
+            if result.ok and result.pending:
+                self.tasks.update(note_id, status=TaskStatus.MERGING)
+                return result
+        else:
+            result = self.git.merge(task.branch, task.base_branch, message)
         if result.ok:
-            self.git.remove_task(task.branch, Path(task.worktree))
-            self.tasks.update(note_id, status=TaskStatus.MERGED)
+            self._finish_merge(task)
         return result
+
+    def refresh_merge_state(self, note_id: str) -> TaskStatus | None:
+        """Notice what the user did with a staged merge: committed it or aborted it."""
+
+        task = self.tasks.get(note_id)
+        if task is None or task.status is not TaskStatus.MERGING:
+            return task.status if task else None
+        if self.git.is_ancestor(task.branch, task.base_branch):
+            self._finish_merge(task)
+            return TaskStatus.MERGED
+        if not self.git.merge_in_progress():
+            self.tasks.update(note_id, status=TaskStatus.READY)
+            return TaskStatus.READY
+        return TaskStatus.MERGING
+
+    def abort_pending_merge(self, note_id: str) -> None:
+        """Undo a staged merge; the task goes back to ``ready``."""
+
+        task = self._require(note_id)
+        if task.status is TaskStatus.MERGING:
+            self.git.abort_merge()
+            self.tasks.update(note_id, status=TaskStatus.READY)
+
+    def _finish_merge(self, task: CoworkTask) -> None:
+        self.git.remove_task(task.branch, Path(task.worktree))
+        self.tasks.update(task.note_id, status=TaskStatus.MERGED)
 
     def discard(self, note_id: str) -> None:
         """Throw a task away, including unmerged work."""
 
         task = self._require(note_id)
         self.abort(note_id)
+        self.abort_pending_merge(note_id)
         if self.git.current_branch() is None:
             # The user may be looking at this very task; step back before deleting it.
             self.git.return_to(task.base_branch)

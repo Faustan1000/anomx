@@ -20,6 +20,7 @@ class TaskStatus(StrEnum):
     RUNNING = "running"  # an agent is working in the worktree
     READY = "ready"  # the agent finished; the user reviews the branch
     FAILED = "failed"  # the agent stopped without a usable result
+    MERGING = "merging"  # staged in the user's tree, waiting for their commit
     MERGED = "merged"  # approved and merged into the base branch
     DISCARDED = "discarded"  # thrown away by the user
 
@@ -56,6 +57,7 @@ class CoworkTask:
             TaskStatus.RUNNING,
             TaskStatus.READY,
             TaskStatus.FAILED,
+            TaskStatus.MERGING,
         }
 
 

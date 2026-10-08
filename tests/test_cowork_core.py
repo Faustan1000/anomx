@@ -272,7 +272,7 @@ def test_merge_is_refused_with_uncommitted_changes(repo, tmp_path):
 
     result = git.merge(workspace.branch, "main", "Merge")
 
-    assert not result.ok and "uncommitted" in result.reason
+    assert not result.ok and "overwritten" in result.reason  # git refuses: the file overlaps
 
 
 def test_discarding_an_unmerged_task_needs_force(repo, tmp_path):
@@ -411,3 +411,105 @@ def test_changed_entries_and_file_at_describe_added_modified_and_deleted(repo, t
     assert entries == {"src/auth.py": "M", "src/added.py": "A", "src/gone.py": "D"}
     assert git.file_at(workspace.base_commit, "src/gone.py") == b"old\n"
     assert git.file_at(workspace.base_commit, "src/added.py") is None
+
+
+# -- cleanliness, pending merges ------------------------------------------------------
+
+
+def _agent_change(git: CoworkGit, tmp_path: Path, name: str = "n1", text: str = "agent\n"):
+    workspace = git.create_task(name, tmp_path / "wt" / name)
+    (workspace.path / "src" / "auth.py").write_text(text, encoding="utf-8")
+    git.commit_all(workspace.path, "agent change")
+    return workspace
+
+
+def test_a_modified_submodule_does_not_make_the_tree_unclean(repo, tmp_path):
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    run(sub, "init", "-b", "main")
+    run(sub, "config", "user.name", "Dev")
+    run(sub, "config", "user.email", "dev@example.com")
+    (sub / "f.txt").write_text("1\n", encoding="utf-8")
+    run(sub, "add", "-A")
+    run(sub, "commit", "-m", "sub init")
+    run(repo, "-c", "protocol.file.allow=always", "submodule", "add", str(sub), "vendor/sub")
+    run(repo, "commit", "-m", "add submodule")
+    (sub / "f.txt").write_text("2\n", encoding="utf-8")
+    run(sub, "commit", "-am", "sub moves on")
+    run(repo / "vendor" / "sub", "-c", "protocol.file.allow=always", "pull", "-q", "origin", "main")
+    assert " M vendor/sub" in run(repo, "status", "--porcelain", "--untracked-files=no")
+
+    assert CoworkGit(repo).is_clean()  # git status is not clean, but nothing a merge touches
+
+
+def test_unrelated_uncommitted_work_does_not_block_a_merge(repo, tmp_path):
+    git = CoworkGit(repo)
+    workspace = _agent_change(git, tmp_path)
+    (repo / "notes.txt").write_text("mine\n", encoding="utf-8")
+    run(repo, "add", "notes.txt")
+    run(repo, "commit", "-m", "tracked file")
+    (repo / "notes.txt").write_text("my unsaved edit\n", encoding="utf-8")
+
+    result = git.merge(workspace.branch, "main", "Merge")
+
+    assert result.ok
+    assert (repo / "notes.txt").read_text(encoding="utf-8") == "my unsaved edit\n"
+
+
+def test_pending_merge_stages_the_changes_without_committing(repo, tmp_path):
+    git = CoworkGit(repo)
+    workspace = _agent_change(git, tmp_path)
+    head_before = git.head()
+
+    result = git.merge_pending(workspace.branch, "main", "Merge cowork task: x")
+
+    assert result.ok and result.pending
+    assert git.merge_in_progress() and git.head() == head_before  # nothing committed yet
+    assert run(repo, "diff", "--cached", "--name-only").split() == ["src/auth.py"]
+    assert (repo / "src" / "auth.py").read_text(encoding="utf-8") == "agent\n"
+    assert "Merge cowork task: x" in (repo / ".git" / "MERGE_MSG").read_text(encoding="utf-8")
+    assert not git.is_ancestor(workspace.branch, "main")  # not merged until the user commits
+
+    run(repo, "commit", "--no-edit")  # what the user does in Source Control
+
+    assert git.is_ancestor(workspace.branch, "main") and not git.merge_in_progress()
+
+
+def test_a_pending_merge_can_be_aborted(repo, tmp_path):
+    git = CoworkGit(repo)
+    workspace = _agent_change(git, tmp_path)
+    git.merge_pending(workspace.branch, "main", "Merge")
+
+    git.abort_merge()
+
+    assert not git.merge_in_progress() and git.is_clean() and not git.has_staged_changes()
+    assert (repo / "src" / "auth.py").read_text(encoding="utf-8") == AUTH
+
+
+def test_pending_merge_is_refused_with_staged_changes_or_a_running_merge(repo, tmp_path):
+    git = CoworkGit(repo)
+    first = _agent_change(git, tmp_path, "n1", "one\n")
+    second = _agent_change(git, tmp_path, "n2", "two\n")
+    (repo / "extra.txt").write_text("staged work\n", encoding="utf-8")
+    run(repo, "add", "extra.txt")
+
+    staged = git.merge_pending(first.branch, "main", "Merge")
+    assert not staged.ok and "staged changes" in staged.reason
+
+    run(repo, "reset", "-q", "extra.txt")
+    (repo / "extra.txt").unlink()
+    assert git.merge_pending(first.branch, "main", "Merge").pending
+    again = git.merge_pending(second.branch, "main", "Merge")
+    assert not again.ok and "already in progress" in again.reason
+
+
+def test_a_conflicting_pending_merge_is_aborted_cleanly(repo, tmp_path):
+    git = CoworkGit(repo)
+    workspace = _agent_change(git, tmp_path)
+    (repo / "src" / "auth.py").write_text("user\n", encoding="utf-8")
+    run(repo, "commit", "-am", "user change on main")
+
+    result = git.merge_pending(workspace.branch, "main", "Merge")
+
+    assert not result.ok and result.conflicts == ("src/auth.py",)
+    assert not git.merge_in_progress() and git.is_clean()

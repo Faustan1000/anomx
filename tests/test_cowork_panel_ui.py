@@ -163,8 +163,8 @@ def test_diff_viewer_shows_the_agents_change(app, workspace, fake_agent):
     screen = Screen(app)
     _start_and_finish(app, workspace)
 
-    # open note -> "Show changes" (second action) -> close viewer -> close menu
-    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER, ESC, ESC]))
+    # open note -> "Show changes" -> Esc: viewer -> note menu -> list -> close (one level each)
+    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER, ESC, ESC, ESC]))
 
     viewer = next(o for o in screen.overlays if o["title"].startswith("Changes"))
     assert "+    return x.a" in viewer["body_lines"]
@@ -176,7 +176,7 @@ def test_follow_switches_the_tree_and_back_returns(app, workspace, fake_agent):
     data = workspace / "proj" / "src" / "data.py"
 
     # open note -> "Show in editor" (fourth action) -> message -> close panel
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, ENTER, ESC]))
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, ENTER, ESC, ESC]))
     assert "x.a" in data.read_text("utf-8")
     assert any("agent's version" in text for _title, text in screen.messages)
 
@@ -200,20 +200,24 @@ def test_merge_needs_confirmation_and_then_updates_the_branch(app, workspace, fa
     # open note -> Merge -> confirm "Merge into main" (second entry)
     app._run_cowork_panel(Keys([ENTER, *[DOWN] * 4, ENTER, DOWN, ENTER, ESC]))
 
+    # staged for review: the files are in the working tree, the merge waits for the commit
     assert "x.a" in data.read_text("utf-8")
-    assert ("Cowork", "Merged into main.") in screen.messages
-    assert any("Merge into main?" in (o.get("subtitle") or "") for o in screen.overlays)
-    assert "Changed: src/data.py" in next(
-        o["subtitle"] for o in screen.overlays if "Merge into main?" in (o.get("subtitle") or "")
+    assert git(workspace / "proj", "rev-parse", "-q", "--verify", "MERGE_HEAD").strip()
+    assert "src/data.py" in git(workspace / "proj", "diff", "--cached", "--name-only")
+    assert any("Merge in progress" in text for _title, text in screen.messages)
+    question = next(
+        o["subtitle"] for o in screen.overlays if "for review?" in (o.get("subtitle") or "")
     )
+    assert "Stage the changes in main for review?" in question
+    assert "Changed: src/data.py" in question
 
 
 def test_discard_asks_first_and_frees_the_note(app, workspace, fake_agent):
     screen = Screen(app)
     _start_and_finish(app, workspace)
 
-    # actions: chat, diff, compare, follow, merge, run again, discard (index 6) -> confirm
-    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 6, ENTER, DOWN, ENTER, ESC]))
+    # actions: chat, diff, compare, follow, merge, merge now, run again, discard (index 7)
+    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 7, ENTER, DOWN, ENTER, ESC]))
 
     app._run_cowork_panel(Keys([ESC]))
     assert screen.last_choices()[0][1] == "[new]"
@@ -617,7 +621,7 @@ def test_compare_opens_vscodes_diff_with_original_left_and_agent_right(
     screen = Screen(app)
 
     # open note -> "Compare in VS Code" (third action) -> "Open all 2 comparisons"
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ENTER, ESC]))
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ENTER, ESC, ESC]))
 
     assert len(calls) == 2
     for command in calls:
@@ -631,7 +635,7 @@ def test_compare_one_file_from_the_picker(app, workspace, ready_task, monkeypatc
     Screen(app)
 
     # picker entries: all, then the files; take the first file
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, DOWN, ENTER, ESC]))
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, DOWN, ENTER, ESC, ESC]))
 
     assert len(calls) == 1 and calls[0][3].endswith("/original/src/data.py")
 
@@ -642,7 +646,7 @@ def test_compare_explains_how_to_continue_when_vscode_cannot_be_steered(
     _fake_vscode(monkeypatch, code=None)
     screen = Screen(app)
 
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ESC]))
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ESC, ESC]))
 
     title, text = screen.messages[-1]
     assert title == "Cannot open VS Code" and "code --diff" in text and "/original/" in text
@@ -652,6 +656,104 @@ def test_compare_reports_a_failed_vscode_call(app, workspace, ready_task, monkey
     _fake_vscode(monkeypatch, returncode=1)
     screen = Screen(app)
 
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ENTER, ESC]))
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ENTER, ESC, ESC]))
 
     assert screen.messages[-1][0] == "Cannot open VS Code"
+
+
+# -- Esc goes up exactly one level ----------------------------------------------------
+
+
+def test_closing_the_diff_viewer_returns_to_the_note_menu_not_the_list(
+    app, workspace, ready_task
+):
+    screen = Screen(app)
+
+    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER, ESC, ESC, ESC]))
+
+    titles = [o["title"] for o in screen.overlays]
+    viewer = next(i for i, title in enumerate(titles) if title.startswith("Changes"))
+    after_viewer = screen.overlays[viewer + 1]
+    assert after_viewer["title"] == "Cowork"
+    assert "proj/src/data.py:1" in after_viewer["subtitle"]  # the note menu, not the list
+    assert [c.label for c in after_viewer["choices"]][:2] == ["Open chat", "Show changes"]
+
+
+def test_the_selection_in_the_note_menu_is_kept_after_a_viewing_action(
+    app, workspace, ready_task
+):
+    screen = Screen(app)
+
+    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER, ESC, ESC, ESC]))
+
+    note_menus = [o for o in screen.overlays if o.get("choices") and "Show changes" in [
+        c.label for c in o["choices"]
+    ]]
+    assert note_menus[0]["selected"] == 0 and note_menus[-1]["selected"] == 1
+
+
+def test_esc_in_a_note_chat_leads_back_to_the_panel_not_the_project(app, workspace, monkeypatch):
+    Screen(app)
+    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+
+    assert app._is_cowork_chat(chat) and not app._is_cowork_chat(ordinary)
+    assert app._session_exit_target(chat) == "cowork"
+    assert app._session_exit_target(ordinary) == "project"
+
+    class Viewport:
+        scroll = 0
+        max_scroll = 0
+
+    monkeypatch.setattr(app, "_draw_session", lambda *a, **k: Viewport())
+    assert app._run_session(Keys([ESC]), chat) == "cowork"
+    assert app._run_session(Keys([ESC]), ordinary) == "project"
+
+
+def test_opening_a_chat_from_the_project_comes_back_through_the_panel(app, workspace, monkeypatch):
+    Screen(app)
+    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+    other = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+    sessions = iter(["cowork", "cowork", "project"])
+    opened: list[str] = []
+    panels = iter([other, None])  # first the panel opens another chat, then the user closes it
+
+    def fake_run_session(_stdscr, session):
+        opened.append(session.title)
+        return next(sessions)
+
+    monkeypatch.setattr(app, "_run_session", fake_run_session)
+    monkeypatch.setattr(app, "_run_cowork_panel", lambda _stdscr: next(panels))
+
+    result = app._open_project_session(Keys([]), chat)
+
+    # chat -> Esc -> panel -> another chat -> Esc -> panel -> Esc -> back at the project list
+    assert result is None
+    assert opened == [chat.title, other.title]
+
+
+def test_merge_now_commits_immediately_and_cleans_up(app, workspace, ready_task):
+    screen = Screen(app)
+    repo = workspace / "proj"
+
+    # actions: chat, diff, compare, follow, merge, merge now (index 5) -> confirm "Merge into main"
+    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 5, ENTER, DOWN, ENTER, ESC]))
+
+    assert ("Cowork", "Merged into main.") in screen.messages
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert "cowork" in git(repo, "log", "-1", "--format=%s").lower()
+    assert "x.a" in (repo / "src" / "data.py").read_text("utf-8")
+
+
+def test_a_pending_merge_offers_to_abort_it_from_the_panel(app, workspace, ready_task):
+    screen = Screen(app)
+    repo = workspace / "proj"
+    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 4, ENTER, DOWN, ENTER, ESC]))  # stage for review
+    assert (repo / ".git" / "MERGE_HEAD").exists()
+
+    # the note now shows [merging]; its menu has "Show changes" and "Abort the pending merge"
+    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER, ESC]))
+
+    assert not (repo / ".git" / "MERGE_HEAD").exists()
+    assert any("pending merge was aborted" in text for _title, text in screen.messages)
+    assert (repo / "src" / "data.py").read_text("utf-8") == SOURCE

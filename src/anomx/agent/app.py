@@ -1053,6 +1053,13 @@ class AnomxCliApp(
     ) -> int | None:
         opened = self._prepare_session_for_opening(session)
         result = self._run_session(stdscr, opened)
+        while result == "cowork":
+            # A chat opened from /cowork: Esc goes back to that panel, one level up.
+            chat = self._run_cowork_panel(stdscr)
+            if chat is None:
+                result = "project"
+                break
+            result = self._run_session(stdscr, self._prepare_session_for_opening(chat))
         if result == "project":
             self._activate_agent_mode(AgentMode.AUTOMATIC)
             return None
@@ -1594,7 +1601,7 @@ class AnomxCliApp(
                     view.reset_running_notice(RUNNING_NOTICE)
                     continue
                 if key_result.back_requested:
-                    return "project"
+                    return self._session_exit_target(current_session)
                 if key_result.submitted_message:
                     # A prior turn may have left the view scrolled away from the
                     # bottom; without resetting here, requeuing a message while a
@@ -1657,7 +1664,7 @@ class AnomxCliApp(
                 elif self._session_selection is not None:
                     self._clear_session_selection()
                 else:
-                    return "project"
+                    return self._session_exit_target(current_session)
                 continue
 
             if key == curses.KEY_UP:
@@ -1737,7 +1744,7 @@ class AnomxCliApp(
                 if mouse_action.kind == "cursor":
                     prompt.cursor = mouse_action.value
                 elif mouse_action.kind == "back_project":
-                    return "project"
+                    return self._session_exit_target(current_session)
                 elif mouse_action.kind == "scroll":
                     view.pinned_anchor = None
                     view.scroll += mouse_action.value
@@ -1843,7 +1850,7 @@ class AnomxCliApp(
                 if raw_mouse_action.kind == "cursor":
                     prompt.cursor = raw_mouse_action.value
                 elif raw_mouse_action.kind == "back_project":
-                    return "project"
+                    return self._session_exit_target(current_session)
                 elif raw_mouse_action.kind == "scroll":
                     view.pinned_anchor = None
                     view.scroll += raw_mouse_action.value
@@ -2651,10 +2658,18 @@ class AnomxCliApp(
                 if self._complete_session_turn(stdscr, turn, render_final=False):
                     self.home.set_session_unread(turn.session.path, True)
 
+    def _is_cowork_chat(self, session: SessionRecord) -> bool:
+        return (self.home.root / "cowork") in Path(session.cwd).parents
+
+    def _session_exit_target(self, session: SessionRecord) -> str:
+        """Where Esc leads from a session: back to /cowork for note chats, else the project."""
+
+        return "cowork" if self._is_cowork_chat(session) else "project"
+
     def _cowork_runtime_for(self, session: SessionRecord) -> AgentRuntime | None:
         """Runtime of a cowork chat (a session living in a task worktree), else ``None``."""
 
-        if (self.home.root / "cowork") not in Path(session.cwd).parents:
+        if not self._is_cowork_chat(session):
             return None
         panel = self._cowork_workspace()
         return panel.runtime_for_session(session.path) if panel is not None else None

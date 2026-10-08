@@ -47,6 +47,8 @@ class MergeResult:
     ok: bool
     conflicts: tuple[str, ...] = ()
     reason: str = ""
+    pending: bool = False
+    """The merge is staged in the user's tree and waits for their commit."""
 
 
 def find_repo_root(path: Path) -> Path | None:
@@ -96,9 +98,34 @@ class CoworkGit:
         return self._git("rev-parse", "HEAD", cwd=cwd).stdout.strip()
 
     def is_clean(self) -> bool:
-        """No uncommitted changes to tracked files (untracked files are ignored)."""
+        """No uncommitted changes to tracked files.
 
-        return not self._git("status", "--porcelain", "--untracked-files=no").stdout.strip()
+        Untracked files and submodules are ignored: a submodule checked out at another
+        commit shows up as "modified" but does not stand in the way of switching or merging.
+        """
+
+        status = self._git(
+            "status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all"
+        )
+        return not status.stdout.strip()
+
+    def has_staged_changes(self) -> bool:
+        """Something is staged; a merge commit would swallow it."""
+
+        staged = self._git("diff", "--cached", "--quiet", "--ignore-submodules=all", check=False)
+        return staged.returncode != 0
+
+    def merge_in_progress(self) -> bool:
+        return self._git("rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0
+
+    def is_ancestor(self, branch: str, of: str) -> bool:
+        """Whether everything on ``branch`` is already contained in ``of``."""
+
+        return self._git("merge-base", "--is-ancestor", branch, of, check=False).returncode == 0
+
+    def abort_merge(self) -> None:
+        if self.merge_in_progress():
+            self._git("merge", "--abort", check=False)
 
     def tip(self, branch: str) -> str:
         """Commit a branch currently points to (empty string if it does not exist)."""
@@ -225,29 +252,53 @@ class CoworkGit:
         return FollowResult(True)
 
     def merge(self, branch: str, base_branch: str, message: str) -> MergeResult:
-        """Merge a task branch into the base branch with a merge commit.
+        """Merge a task branch into the base branch with a merge commit right away."""
 
-        Runs in the user's tree (the base branch is checked out there). On conflicts the
+        return self._merge(branch, base_branch, message, commit=True)
+
+    def merge_pending(self, branch: str, base_branch: str, message: str) -> MergeResult:
+        """Stage the merge in the user's tree without committing it.
+
+        VS Code's Source Control panel then shows the changes under "Staged Changes" with
+        "Merge in progress"; the user reviews them and commits (or aborts the merge).
+        """
+
+        return self._merge(branch, base_branch, message, commit=False)
+
+    def _merge(self, branch: str, base_branch: str, message: str, *, commit: bool) -> MergeResult:
+        """Merge in the user's tree (the base branch is checked out there).
+
+        Other uncommitted work does not block a merge: git itself refuses when the merge
+        would touch a file the user has changed, and that refusal is reported. Staged
+        changes do block it, because the merge commit would swallow them. On conflicts the
         merge is aborted so nothing half-merged is left behind.
         """
 
+        if self.merge_in_progress():
+            return MergeResult(False, reason="A merge is already in progress in your repository.")
         back = FollowResult(True)
         if self.current_branch() != base_branch:
             back = self.return_to(base_branch)
         if not back.ok:
             return MergeResult(False, reason=back.reason)
-        if not self.is_clean():
-            return MergeResult(False, reason="You have uncommitted changes in tracked files.")
-        result = self._git(*AGENT_IDENTITY, "merge", "--no-ff", "-m", message, branch, check=False)
+        if self.has_staged_changes():
+            return MergeResult(
+                False, reason="You have staged changes; commit or unstage them before merging."
+            )
+        args = ["merge", "--no-ff", "-m", message]
+        if not commit:
+            args.insert(1, "--no-commit")
+        result = self._git(*AGENT_IDENTITY, *args, branch, check=False)
         if result.returncode == 0:
-            return MergeResult(True)
+            return MergeResult(True, pending=not commit and self.merge_in_progress())
         unmerged = self._git("diff", "--name-only", "--diff-filter=U", check=False)
         conflicts = tuple(line for line in unmerged.stdout.splitlines() if line)
-        self._git("merge", "--abort", check=False)
-        reason = result.stderr.strip()
+        self.abort_merge()
+        reason = (result.stderr.strip() or result.stdout.strip()).splitlines()
+        text = " ".join(reason[:3])
         if conflicts:
-            reason = "Merge conflicts; the branch was not merged."
-        return MergeResult(False, conflicts, reason)
+            text = "Merge conflicts; the branch was not merged."
+        return MergeResult(False, conflicts, text)
 
     # -- plumbing ---------------------------------------------------------------------
 

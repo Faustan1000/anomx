@@ -333,7 +333,7 @@ def test_merge_after_approval_updates_the_users_branch_and_cleans_up(
     assert service.follow(task.note_id).ok  # the user looks at the agent's version
     assert "item.name" in (workspace / "proj" / "src" / "data.py").read_text("utf-8")
 
-    result = service.merge(task.note_id)
+    result = service.merge(task.note_id, review=False)
 
     assert result.ok
     assert service.git.current_branch() == "main"
@@ -592,3 +592,82 @@ def test_uncommitted_changes_are_reported_as_such(service, workspace):
 
     assert "has uncommitted changes" in str(raised.value)
     assert "not tracked" not in str(raised.value)
+
+
+# -- merges that wait for the user's commit -------------------------------------------
+
+
+def _ready_task(service, workspace, monkeypatch):
+    _fake_agent(monkeypatch, edits=[("item['name']", "item.name")])
+    task = service.prepare(_note(workspace), workspace)
+    service.run(task.note_id)
+    return task
+
+
+def test_the_default_merge_waits_for_the_users_commit(service, workspace, monkeypatch):
+    task = _ready_task(service, workspace, monkeypatch)
+    repo = workspace / "proj"
+
+    result = service.merge(task.note_id)
+
+    assert result.ok and result.pending
+    assert service.tasks.get(task.note_id).status is TaskStatus.MERGING
+    assert service.refresh_merge_state(task.note_id) is TaskStatus.MERGING
+    assert Path(task.worktree).exists()  # the task keeps its worktree until it is committed
+    assert "src/data.py" in git(repo, "diff", "--cached", "--name-only")
+
+    git(repo, "commit", "--no-edit")  # the user commits in Source Control
+
+    assert service.refresh_merge_state(task.note_id) is TaskStatus.MERGED
+    assert not Path(task.worktree).exists() and not service.git.branch_exists(task.branch)
+
+
+def test_aborting_the_merge_in_vscode_returns_the_task_to_ready(service, workspace, monkeypatch):
+    task = _ready_task(service, workspace, monkeypatch)
+    service.merge(task.note_id)
+
+    git(workspace / "proj", "merge", "--abort")  # "Abort merge" in Source Control
+
+    assert service.refresh_merge_state(task.note_id) is TaskStatus.READY
+    assert service.merge(task.note_id).pending  # and it can be staged again
+
+
+def test_aborting_from_anomx_unstages_everything(service, workspace, monkeypatch):
+    task = _ready_task(service, workspace, monkeypatch)
+    service.merge(task.note_id)
+
+    service.abort_pending_merge(task.note_id)
+
+    assert service.tasks.get(task.note_id).status is TaskStatus.READY
+    assert not service.git.merge_in_progress() and service.git.is_clean()
+    assert (workspace / "proj" / "src" / "data.py").read_text("utf-8") == SOURCE
+
+
+def test_discarding_a_task_with_a_staged_merge_undoes_the_merge(service, workspace, monkeypatch):
+    task = _ready_task(service, workspace, monkeypatch)
+    service.merge(task.note_id)
+
+    service.discard(task.note_id)
+
+    assert not service.git.merge_in_progress()
+    assert (workspace / "proj" / "src" / "data.py").read_text("utf-8") == SOURCE
+    assert service.tasks.get(task.note_id).status is TaskStatus.DISCARDED
+
+
+def test_the_panel_reports_a_staged_merge_and_notices_the_commit(
+    service, home, workspace, monkeypatch
+):
+    from anomx.agent.cowork import CoworkWorkspace
+
+    task = _ready_task(service, workspace, monkeypatch)
+    panel = CoworkWorkspace.locate(home, workspace)
+    row = next(r for r in panel.rows() if r.note_id == task.note_id)
+    assert panel.merge(row).pending
+
+    merging = next(r for r in panel.rows() if r.note_id == task.note_id)
+    assert merging.status == "merging" and "Source Control" in merging.detail
+    assert [a.value for a in panel.actions(merging)] == ["diff", "abort_merge"]
+
+    git(workspace / "proj", "commit", "--no-edit")
+
+    assert next(r for r in panel.rows() if r.note_id == task.note_id).status == "merged"

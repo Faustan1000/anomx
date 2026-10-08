@@ -118,10 +118,11 @@ def test_start_runs_in_the_background_and_ends_ready_with_actions(panel, monkeyp
         "compare",
         "follow",
         "merge",
+        "merge_now",
         "start",
         "discard",
     ]
-    assert panel.actions(ready)[4].label == "Merge into main"
+    assert panel.actions(ready)[4].label == "Merge into main (review in Source Control)"
     assert any("+    return x.a" in line for line in panel.diff_lines(ready))
 
 
@@ -188,7 +189,7 @@ def test_follow_show_return_and_merge(panel, workspace, monkeypatch):
     assert panel.return_to_base(ready).ok and panel.following() is None
     assert data.read_text("utf-8") == SOURCE
 
-    merged = panel.merge(ready)
+    merged = panel.merge(ready, review=False)
 
     assert merged.ok and "x.a" in data.read_text("utf-8")
     after = _row(panel, "n-1")
