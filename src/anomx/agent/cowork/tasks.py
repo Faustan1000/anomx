@@ -38,6 +38,9 @@ class CoworkTask:
     base_branch: str
     base_commit: str
     anchor_text: str = ""
+    anchor_kind: str = "source"
+    """``source`` for a committed file, ``generated`` when the note sits on a file git does
+    not track (build output, ignored or new files) that the agent cannot see."""
     status: TaskStatus = TaskStatus.QUEUED
     summary: str = ""
     session_path: str = ""

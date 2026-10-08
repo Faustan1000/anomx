@@ -377,7 +377,7 @@ def test_prompt_contains_only_the_note_and_nearby_code(workspace):
     assert repo == workspace / "proj"
 
     class _Task:
-        file, line, request = "src/data.py", 1, note.request
+        file, line, request, anchor_kind = "src/data.py", 1, note.request, "source"
 
     prompt = build_task_prompt(_Task(), context)  # type: ignore[arg-type]
 
@@ -529,3 +529,66 @@ def test_a_fresh_chat_awaits_a_reply_until_the_agent_has_answered(service, home,
 
     home.append_session_event(record.path, "agent_message", {"message": "Here are options."})
     assert service.awaiting_reply(record.path) is False
+
+
+# -- notes on files git does not track ------------------------------------------------
+
+
+@pytest.fixture
+def generated_note(workspace):
+    """A note sitting on build output that is ignored by git (like dist/bundle.mjs)."""
+
+    repo = workspace / "proj"
+    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    git(repo, "add", ".gitignore")
+    git(repo, "commit", "-m", "ignore dist")
+    (repo / "dist").mkdir()
+    (repo / "dist" / "bundle.mjs").write_text("var a=1;" * 50, encoding="utf-8")
+    vault = {
+        "./proj/dist/bundle.mjs": [
+            {"id": "g-1", "line": 0, "title": "show languages as a dropdown", "text": ""}
+        ]
+    }
+    (workspace / ".margo" / "local.notes.json").write_text(json.dumps(vault), encoding="utf-8")
+    return next(n for n in read_margo_notes(workspace) if n.id == "g-1")
+
+
+def test_a_note_on_ignored_build_output_can_still_start(service, workspace, generated_note):
+    task = service.prepare(generated_note, workspace)
+
+    assert task.anchor_kind == "generated" and task.anchor_text == ""
+    assert task.file == "dist/bundle.mjs"
+    assert not Path(task.worktree, "dist").exists()  # the agent cannot see build output
+
+
+def test_the_prompt_for_generated_files_points_the_agent_at_the_sources(
+    service, home, workspace, generated_note
+):
+    task, record = service.open_chat(generated_note, workspace)
+
+    (prompt,) = _messages(home, record.path)
+    assert "git does not track" in prompt and "dist/bundle.mjs" in prompt
+    assert "find the source files" in prompt and "show languages as a dropdown" in prompt
+    assert "var a=1;" not in prompt  # no minified junk in the context
+    assert "Code around line" not in prompt
+    _task, discussion = service.open_chat(generated_note, workspace, discuss=True)
+    assert discussion.path == record.path  # same chat; discuss only matters at creation
+
+
+def test_discussing_a_generated_note_tells_the_agent_not_to_edit(
+    service, home, workspace, generated_note
+):
+    _task, record = service.open_chat(generated_note, workspace, discuss=True)
+
+    (prompt,) = _messages(home, record.path)
+    assert "Do not edit any file until they ask" in prompt
+
+
+def test_uncommitted_changes_are_reported_as_such(service, workspace):
+    (workspace / "proj" / "src" / "data.py").write_text(SOURCE + "# wip\n", encoding="utf-8")
+
+    with pytest.raises(GitError) as raised:
+        service.prepare(_note(workspace), workspace)
+
+    assert "has uncommitted changes" in str(raised.value)
+    assert "not tracked" not in str(raised.value)

@@ -363,3 +363,33 @@ def test_note_is_resolved_to_the_repository_of_its_own_file(workspace):
 
 def test_missing_files_still_resolve_to_a_repository(workspace):
     assert find_repo_root(workspace / "anomx" / "deleted" / "gone.py") == workspace / "anomx"
+
+
+def test_file_state_distinguishes_committed_modified_ignored_and_untracked(repo):
+    (repo / ".gitignore").write_text("dist/\n", encoding="utf-8")
+    (repo / "dist").mkdir()
+    (repo / "dist" / "bundle.js").write_text("built\n", encoding="utf-8")
+    (repo / "new.py").write_text("x = 1\n", encoding="utf-8")
+    run(repo, "add", ".gitignore")
+    run(repo, "commit", "-m", "ignore dist")
+    git = CoworkGit(repo)
+    (repo / "src" / "edited.py").write_text("a\n", encoding="utf-8")
+    run(repo, "add", "src/edited.py")
+    run(repo, "commit", "-m", "add edited")
+    (repo / "src" / "edited.py").write_text("a changed\n", encoding="utf-8")
+
+    assert git.file_state("src/auth.py") == "committed"
+    assert git.file_state("src/edited.py") == "modified"
+    assert git.file_state("dist/bundle.js") == "ignored"
+    assert git.file_state("new.py") == "untracked"
+    assert git.is_file_committed("src/auth.py") and not git.is_file_committed("dist/bundle.js")
+
+
+def test_tasks_saved_before_anchor_kind_existed_load_as_source(tmp_path):
+    path = tmp_path / "tasks.json"
+    task = _task("n")
+    data = {"version": 1, "tasks": {"n": {**task.__dict__, "status": "queued"}}}
+    data["tasks"]["n"].pop("anchor_kind", None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert TaskStore(path).get("n").anchor_kind == "source"

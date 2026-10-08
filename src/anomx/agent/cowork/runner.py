@@ -64,6 +64,24 @@ def build_task_prompt(task: CoworkTask, context: NoteContext, *, discuss: bool =
     edit anything until asked.
     """
 
+    if task.anchor_kind == "generated":
+        lines = [
+            "The user left this note in their editor on a file that git does not track "
+            f"({task.file}). That is generated output (for example a build result) or a new "
+            "file, so it is not in your worktree and must not be edited.",
+            "",
+            "Note:",
+            task.request,
+            "",
+            "Treat the note as an instruction for the project: find the source files that "
+            "produce what the note is about and change those.",
+        ]
+        if discuss:
+            lines.append(
+                "The user wants to talk this through first. Do not edit any file until they "
+                "ask you to make a change; name the options and ask what they prefer."
+            )
+        return "\n".join(lines)
     lines = [
         "The user left this note in their editor:",
         "",
@@ -118,11 +136,15 @@ class CoworkService:
             relative = absolute.relative_to(self.repo_root).as_posix()
         except ValueError:
             raise GitError(f"{note.file} is not inside {self.repo_root}.") from None
-        if not self.git.is_file_committed(relative):
+        state = self.git.file_state(relative)
+        if state == "modified":
             raise GitError(
-                f"{relative} has uncommitted changes or is not tracked. The agent works "
-                "from the committed version, so commit or stash it first."
+                f"{relative} has uncommitted changes. The agent works from the committed "
+                "version, so commit or stash it first."
             )
+        # Ignored or untracked files (for example dist/ output) are not part of the agent's
+        # checkout; the note then acts as an instruction for the project.
+        generated = state in {"ignored", "untracked"}
         context = note_context(workspace, note)
         workspace_info = self.git.create_task(note.id, self.worktrees / _slug(note.id))
         task = CoworkTask(
@@ -135,7 +157,8 @@ class CoworkService:
             worktree=str(workspace_info.path),
             base_branch=workspace_info.base_branch,
             base_commit=workspace_info.base_commit,
-            anchor_text=context.anchor_text,
+            anchor_text="" if generated else context.anchor_text,
+            anchor_kind="generated" if generated else "source",
         )
         return self.tasks.save(task)
 

@@ -106,13 +106,24 @@ class CoworkGit:
         result = self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
         return result.stdout.strip() if result.returncode == 0 else ""
 
+    def file_state(self, relative: str) -> str:
+        """How git sees a file: ``committed``, ``modified``, ``ignored`` or ``untracked``.
+
+        An agent working from a fresh checkout only sees ``committed`` files as they are;
+        ``ignored`` ones are typically build output such as ``dist/``.
+        """
+
+        tracked = self._git("ls-files", "--error-unmatch", "--", relative, check=False)
+        if tracked.returncode == 0:
+            changed = self._git("status", "--porcelain", "--", relative).stdout.strip()
+            return "modified" if changed else "committed"
+        ignored = self._git("check-ignore", "-q", "--", relative, check=False)
+        return "ignored" if ignored.returncode == 0 else "untracked"
+
     def is_file_committed(self, relative: str) -> bool:
         """The file is tracked and has no uncommitted changes (what an agent would see)."""
 
-        tracked = self._git("ls-files", "--error-unmatch", "--", relative, check=False)
-        if tracked.returncode != 0:
-            return False
-        return not self._git("status", "--porcelain", "--", relative).stdout.strip()
+        return self.file_state(relative) == "committed"
 
     def branch_exists(self, branch: str) -> bool:
         ref = f"refs/heads/{branch}"
