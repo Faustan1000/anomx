@@ -58,6 +58,7 @@ from anomx.agent.ui.models import (
     InfoRow,
     MenuChoice,
     PlatformConnectionDraft,
+    PromptPasteEvent,
     SkillFormDraft,
 )
 
@@ -249,7 +250,16 @@ class ConfigViewMixin:
         while True:
             self._draw_skill_editor_panel(stdscr, title, draft, selected, cursor=cursor)
             stdscr.refresh()
-            key = stdscr.get_wch()
+            key = self._read_prompt_key(stdscr)
+            if isinstance(key, PromptPasteEvent):
+                value, cursor = self._paste_into(
+                    self._skill_editor_value(draft, selected),
+                    cursor,
+                    key,
+                    multiline=selected == 2,
+                )
+                draft = self._update_skill_draft(draft, self._skill_editor_field(selected), value)
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None
             if self._is_ctrl_s(key):
@@ -577,6 +587,21 @@ class ConfigViewMixin:
         self._message(stdscr, "Delete Skill", f"Deleted /{skill.command}.")
         return True
 
+    @staticmethod
+    def _paste_into(
+        value: str,
+        cursor: int,
+        event: PromptPasteEvent,
+        *,
+        multiline: bool,
+    ) -> tuple[str, int]:
+        """Insert a bracketed paste into an editor value, normalising line endings."""
+
+        text = event.text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
+        if not multiline:
+            text = text.replace("\n", "")
+        return value[:cursor] + text + value[cursor:], cursor + len(text)
+
     def _prompt_multiline_text(
         self,
         stdscr: CursesWindow,
@@ -595,7 +620,10 @@ class ConfigViewMixin:
                 editor_cursor=cursor,
                 footer="Esc Cancel · Enter New line · Ctrl+S Save",
             )
-            key = stdscr.get_wch()
+            key = self._read_prompt_key(stdscr)
+            if isinstance(key, PromptPasteEvent):
+                value, cursor = self._paste_into(value, cursor, key, multiline=True)
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None if optional else ""
             if self._is_ctrl_s(key):
@@ -1771,7 +1799,10 @@ class ConfigViewMixin:
                 editor_cursor=cursor_pos,
                 footer=footer,
             )
-            key = stdscr.get_wch()
+            key = self._read_prompt_key(stdscr)
+            if isinstance(key, PromptPasteEvent):
+                text, cursor_pos = self._paste_into(text, cursor_pos, key, multiline=True)
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return
             if self._is_ctrl_s(key):
@@ -2125,7 +2156,14 @@ class ConfigViewMixin:
         error = ""
         while True:
             self._draw_platform_connection_form(stdscr, draft, selected, error=error)
-            key = stdscr.get_wch()
+            key = self._read_prompt_key(stdscr)
+            if isinstance(key, PromptPasteEvent):
+                current = self._platform_form_value(draft, selected)
+                value, _cursor = self._paste_into(current, len(current), key, multiline=False)
+                draft = self._update_platform_form_draft(draft, selected, value)
+                error = ""
+                self._save_platform_form_defaults(draft)
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 self._save_platform_form_defaults(draft)
                 return None
