@@ -29,7 +29,6 @@ from anomx.agent.context_management import (
     transient_context_message,
 )
 from anomx.agent.exceptions import BackendFailure
-from anomx.agent.helpers.http_pool import pooled_https_post
 from anomx.agent.helpers.tool_manager import CommandRiskEvaluation
 from anomx.agent.memories import MemoryKind, MemoryMetadata
 
@@ -344,7 +343,12 @@ class AnthropicCompatibleBackend(BaseBackend):
 
         def stream_once() -> AnthropicStreamResponse | str:
             self.runtime._debug_log_step(self.provider_key, payload)
-            request_body = json.dumps(payload).encode("utf-8")
+            request = urllib.request.Request(
+                endpoint,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
             text_parts: list[str] = []
             text_filter = ThinkingTagStreamFilter()
             content_by_index: dict[int, dict[str, Any]] = {}
@@ -352,12 +356,7 @@ class AnthropicCompatibleBackend(BaseBackend):
             stop_reason: str | None = None
             usage_payload: dict[str, Any] = {}
             emitted_thought_indices: set[int] = set()
-            with pooled_https_post(
-                endpoint,
-                data=request_body,
-                headers=headers,
-                timeout=120,
-            ) as response:
+            with urllib.request.urlopen(request, timeout=120) as response:
                 for raw_line in response:
                     if self.runtime._turn_aborted():
                         return ""

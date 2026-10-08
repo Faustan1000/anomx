@@ -208,10 +208,10 @@ def test_anthropic_stream_reports_merged_usage(tmp_path, monkeypatch):
     home.append_session_event(session.path, "user_message", {"message": "Hello."})
     runtime = AgentRuntime(home, tmp_path)
 
-    def fake_pooled_https_post(endpoint, *, data, headers, timeout):
+    def fake_urlopen(request, timeout):
         return FakeStreamResponse(next(responses))
 
-    monkeypatch.setattr(anthropic_module, "pooled_https_post", fake_pooled_https_post)
+    monkeypatch.setattr(anthropic_module.urllib.request, "urlopen", fake_urlopen)
 
     snapshots = []
     response = AnthropicBackend(runtime).generate(
@@ -255,11 +255,11 @@ def test_anthropic_payload_marks_system_and_tools_cacheable(tmp_path, monkeypatc
 
     captured: list[dict[str, object]] = []
 
-    def fake_pooled_https_post(endpoint, *, data, headers, timeout):
-        captured.append(json.loads(data))
+    def fake_urlopen(request, timeout):
+        captured.append(json.loads(request.data))
         return FakeStreamResponse([b'data: {"type":"message_stop"}\n'])
 
-    monkeypatch.setattr(anthropic_module, "pooled_https_post", fake_pooled_https_post)
+    monkeypatch.setattr(anthropic_module.urllib.request, "urlopen", fake_urlopen)
 
     AnthropicBackend(runtime).generate(
         session.path,

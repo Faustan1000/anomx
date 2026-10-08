@@ -2761,8 +2761,8 @@ def test_startup_loading_exits_after_deadline_without_platform(tmp_path, monkeyp
         sleeps.append(seconds)
         clock["now"] += 2.0
 
-    monkeypatch.setattr(ui_module.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(ui_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(time, "sleep", fake_sleep)
     monkeypatch.setattr(
         matrix_loading_module,
         "heartbeat_platform_connection",
@@ -2831,8 +2831,8 @@ def test_startup_loading_exits_when_platform_heartbeat_succeeds(
         clock["now"] += 2.0
         real_sleep(0)
 
-    monkeypatch.setattr(ui_module.time, "monotonic", lambda: clock["now"])
-    monkeypatch.setattr(ui_module.time, "sleep", fake_sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(time, "sleep", fake_sleep)
     monkeypatch.setattr(matrix_loading_module, "heartbeat_platform_connection", lambda _home: True)
     window = Window()
 
@@ -9990,7 +9990,7 @@ def test_draw_project_running_session_shows_statement_and_timer(tmp_path, monkey
         working_text="Reading project overview",
     )
     app._active_session_turns[app._session_turn_key(session)] = turn
-    monkeypatch.setattr(ui_module.time, "monotonic", lambda: 12.0)
+    monkeypatch.setattr(time, "monotonic", lambda: 12.0)
     window = Window()
 
     app._draw_project(window, project, [session], 0, 0, "", 0, "", "light", 0)

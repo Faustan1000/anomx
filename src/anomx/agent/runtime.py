@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import time
 from collections.abc import Callable, Mapping, MutableSet
@@ -154,29 +153,6 @@ UsageCallback = Callable[[UsageSnapshot], None]
 ContextSummarizer = Callable[[str, str], str | None]
 
 MAX_PLAN_FINISH_REPROMPTS = 6
-# Some models end a turn with "Let me read X." (or leak tool-call markup as plain
-# text) without issuing the tool call. The turn is nudged to follow through, at most
-# this many times per turn, so a model that keeps doing it still terminates.
-MAX_UNFULFILLED_ACTION_NUDGES = 5
-_ANNOUNCED_ACTION_RE = re.compile(
-    r"^\W*(?:let me|let\'s|let us|i\'ll|i will|i\'m going to|i am going to|i need to|"
-    r"now i(?:\'ll| will)?|next,? i|lass mich|ich werde|ich lese|ich prüfe|ich schaue|"
-    r"als nächstes|jetzt (?:lese|prüfe|schaue|mache|führe|starte|setze))\b",
-    re.IGNORECASE,
-)
-_LEAKED_TOOL_MARKUP_RE = re.compile(
-    r"DSML|</?tool_calls?>|<invoke\b|<function_calls>",
-    re.IGNORECASE,
-)
-UNFULFILLED_ACTION_PROMPT = (
-    "Your last message announced an action but did not make a tool call, so the turn "
-    "stopped. Make the tool call now using the tool-calling interface. If the work is "
-    "actually finished, reply with the final answer instead."
-)
-LEAKED_TOOL_MARKUP_PROMPT = (
-    "Your last message contained tool-call markup as plain text instead of a real tool "
-    "call, so nothing was executed. Make the call using the tool-calling interface."
-)
 IMAGE_FILE_EXTENSIONS = (".gif", ".jpeg", ".jpg", ".png", ".webp")
 
 
@@ -293,7 +269,6 @@ class AgentRuntime:
         self.agent_spec: AgentSpec = agent_spec(agent_kind)
         self.agent_kind = self.agent_spec.kind
         self._turn_abort_event = threading.Event()
-        self._unfulfilled_action_nudges = 0
         self._processes: dict[str, AsyncProcessState] = {}
         self._process_lock = threading.Lock()
         self._subagents: dict[str, SubagentRuntimeState] = {}
@@ -608,7 +583,6 @@ class AgentRuntime:
 
         self.produced_output: str | None = None
         self._turn_abort_event.clear()
-        self._unfulfilled_action_nudges = 0
         previous_debug_session_path = self._debug_session_path
         self._debug_session_path = debug_session_path or session_path
         try:
@@ -2048,17 +2022,6 @@ class AgentRuntime:
             wait_output = self._wait_for_active_targets(callbacks)
             return self._command_continuation_prompt(wait_output), False
 
-        # If the agent is handing control back to ask the user something, deliver the
-        # message and end the turn instead of suppressing it with the plan-finish guard.
-        # Otherwise a prose question would be swallowed and the agent forced to guess on.
-        if message.strip().endswith("?"):
-            return None, False
-
-        unfulfilled_prompt = self._unfulfilled_action_prompt(message)
-        if unfulfilled_prompt is not None:
-            self._unfulfilled_action_nudges += 1
-            return unfulfilled_prompt, False
-
         if self.agent_kind == AgentKind.MAIN:
             return self._plan_finish_continuation_prompt(
                 session_path,
@@ -2066,21 +2029,6 @@ class AgentRuntime:
                 callbacks,
             )
         return None, False
-
-    def _unfulfilled_action_prompt(self, message: str) -> str | None:
-        """Nudge for a turn that ended on an announced-but-not-made tool call."""
-
-        if self._unfulfilled_action_nudges >= MAX_UNFULFILLED_ACTION_NUDGES:
-            return None
-        if _LEAKED_TOOL_MARKUP_RE.search(message):
-            return LEAKED_TOOL_MARKUP_PROMPT
-        lines = [line.strip() for line in message.strip().splitlines() if line.strip()]
-        if not lines:
-            return None
-        last_line = lines[-1]
-        if len(last_line) <= 400 and _ANNOUNCED_ACTION_RE.match(last_line):
-            return UNFULFILLED_ACTION_PROMPT
-        return None
 
     def _wait_for_active_targets(self, callbacks: RuntimeCallbacks) -> str:
         return wait_tool("active command tool calls or subagents").execute(

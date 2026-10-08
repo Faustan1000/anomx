@@ -9,7 +9,7 @@ import pytest
 
 from anomx.agent import AnomxHome
 from anomx.agent.backends.blablador import BlabladorBackend
-from anomx.agent.backends.desy_assistant import _DesyReasoningBackend
+from anomx.agent.backends.desy_assistant import DesyAssistantBackend, _DesyReasoningBackend
 from anomx.agent.backends.ollama import OllamaBackend
 from anomx.agent.backends.openai import OpenAIBackend
 from anomx.agent.base.backends import (
