@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import curses
 import queue
+import re
 import shutil
 import textwrap
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import suppress
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from anomx.agent.helpers.platform_client import (
@@ -64,6 +65,49 @@ from anomx.agent.ui.models import (
 
 BACKEND_MODEL_CHOICE_SEPARATOR = "::"
 CUSTOM_MODEL_CHOICE_PREFIX = "__custom__"
+
+
+@dataclass(frozen=True)
+class SandboxLimit:
+    """One configurable sandbox resource limit."""
+
+    config_key: str
+    title: str
+    hint: str
+    default: str
+
+
+SANDBOX_LIMITS = {
+    "cpu": SandboxLimit(
+        "sandbox_cpu_limit", "CPU Limit", "Number of CPU cores (e.g. 2, 1.5)", "2"
+    ),
+    "ram": SandboxLimit(
+        "sandbox_ram_limit", "RAM Limit", "Memory limit (e.g. 4g, 8g, 2048m)", "4g"
+    ),
+    "hd": SandboxLimit(
+        "sandbox_hd_limit", "Disk Limit", "Storage limit (e.g. 10g, 20g, 51200m)", "10g"
+    ),
+}
+_CPU_LIMIT_RE = re.compile(r"^(\d+(?:\.\d+)?)$")
+_SIZE_LIMIT_RE = re.compile(r"^(\d+(?:\.\d+)?)[kmgt]?b?$", re.IGNORECASE)
+
+
+def validate_sandbox_limit(kind: str, value: str) -> str | None:
+    """Return a user-facing problem with a sandbox limit, or ``None`` when it is valid.
+
+    Limits are handed to Docker/Podman, which would only fail later at container start.
+    """
+
+    text = value.strip()
+    if kind == "cpu":
+        match = _CPU_LIMIT_RE.match(text)
+        if match and float(match.group(1)) > 0:
+            return None
+        return "CPU cores must be a positive number such as 2 or 1.5."
+    match = _SIZE_LIMIT_RE.match(text)
+    if match and float(match.group(1)) > 0:
+        return None
+    return "Use a positive size such as 4g, 8g or 2048m."
 
 
 class ConfigViewMixin:
@@ -1670,39 +1714,23 @@ class ConfigViewMixin:
             )
             if selected is None:
                 return
-            if selected == "cpu":
-                value = self._run_overlay_text(
-                    stdscr,
-                    "CPU Limit",
-                    "Number of CPU cores (e.g. 2, 1.5)",
-                    default=str(config.get("sandbox_cpu_limit", "2")),
-                    optional=False,
-                )
-                if value is not None and value.strip():
-                    config = self.home.update_config({"sandbox_cpu_limit": value.strip()})
+            limit = SANDBOX_LIMITS.get(selected)
+            if limit is None:
                 continue
-            if selected == "ram":
-                value = self._run_overlay_text(
-                    stdscr,
-                    "RAM Limit",
-                    "Memory limit (e.g. 4g, 8g, 2048m)",
-                    default=str(config.get("sandbox_ram_limit", "4g")),
-                    optional=False,
-                )
-                if value is not None and value.strip():
-                    config = self.home.update_config({"sandbox_ram_limit": value.strip()})
+            value = self._run_overlay_text(
+                stdscr,
+                limit.title,
+                limit.hint,
+                default=str(config.get(limit.config_key, limit.default)),
+                optional=False,
+            )
+            if value is None or not value.strip():
                 continue
-            if selected == "hd":
-                value = self._run_overlay_text(
-                    stdscr,
-                    "Disk Limit",
-                    "Storage limit (e.g. 10g, 20g, 51200m)",
-                    default=str(config.get("sandbox_hd_limit", "10g")),
-                    optional=False,
-                )
-                if value is not None and value.strip():
-                    config = self.home.update_config({"sandbox_hd_limit": value.strip()})
+            problem = validate_sandbox_limit(selected, value)
+            if problem is not None:
+                self._message(stdscr, "Invalid Limit", problem)
                 continue
+            self.home.update_config({limit.config_key: value.strip()})
 
     def _sandbox_limits_choices(self, config: Mapping[str, object]) -> tuple[MenuChoice, ...]:
         return (
@@ -1777,9 +1805,24 @@ class ConfigViewMixin:
     def _bool_config_detail(self, value: object) -> str:
         return "true" if bool(value) else "false"
 
+    def _confirm_discard_changes(self, stdscr: CursesWindow) -> bool:
+        """Ask before throwing away unsaved edits; ``True`` means discard."""
+
+        choice = self._menu(
+            stdscr,
+            "Unsaved Changes",
+            "Leave without saving?",
+            (
+                MenuChoice("Keep editing", "keep"),
+                MenuChoice("Discard changes", "discard"),
+            ),
+        )
+        return choice == "discard"
+
     def _run_manage_instructions_panel(self, stdscr: CursesWindow) -> None:
         instruction_path = self.home.instructions_dir / "instruction.md"
         text = instruction_path.read_text(encoding="utf-8") if instruction_path.exists() else ""
+        saved_text = text
         cursor_pos = 0
         footer = "Esc Cancel  \u00b7  Ctrl+S Save  \u00b7  \u2191\u2193 Home End"
         while True:
@@ -1796,7 +1839,9 @@ class ConfigViewMixin:
                 text, cursor_pos = self._paste_into(text, cursor_pos, key, multiline=True)
                 continue
             if self._is_escape(key) or self._is_ctrl_c(key):
-                return
+                if text == saved_text or self._confirm_discard_changes(stdscr):
+                    return
+                continue
             if self._is_ctrl_s(key):
                 instruction_path.parent.mkdir(parents=True, exist_ok=True)
                 instruction_path.write_text(text, encoding="utf-8")
