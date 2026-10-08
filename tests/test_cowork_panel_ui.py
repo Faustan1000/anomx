@@ -78,6 +78,13 @@ class Screen:
         return [(c.label, c.detail) for c in choices]
 
 
+@pytest.fixture(autouse=True)
+def _quiet_backend(monkeypatch):
+    """Opening a chat now sends the note; never let a test reach a real model."""
+
+    monkeypatch.setattr(AgentRuntime, "backend_response", lambda self, *a, **k: "ok")
+
+
 @pytest.fixture
 def app(tmp_path: Path, workspace: Path) -> AnomxCliApp:
     return AnomxCliApp(home=AnomxHome(tmp_path / "home"), cwd=workspace / "proj" / "src")
@@ -257,7 +264,6 @@ def test_only_chats_of_notes_get_the_cowork_runtime(app, workspace):
 
 def test_a_chat_turn_runs_in_the_worktree_and_is_committed(app, workspace, monkeypatch):
     Screen(app)
-    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
     seen: dict[str, object] = {}
 
     def backend_response(self, session_path, callbacks=None, **_kwargs):
@@ -272,7 +278,8 @@ def test_a_chat_turn_runs_in_the_worktree_and_is_committed(app, workspace, monke
 
     monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
 
-    turn = app._start_session_turn(chat)
+    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))  # opens the chat and sends the note
+    (turn,) = app._active_session_turns.values()
     turn.worker.join(10)
 
     assert isinstance(turn.runtime, CoworkRuntime)
@@ -442,3 +449,89 @@ def test_notices_expire_on_their_own():
     assert view.notice == "hello"
     view.expire_notice(107.0)
     assert view.notice == ""
+
+
+# -- the note must actually be sent ---------------------------------------------------
+
+
+@pytest.fixture
+def agent_calls(monkeypatch):
+    calls: list[str] = []
+
+    def backend_response(self, session_path, callbacks=None, **_kwargs):
+        calls.append(str(session_path))
+        return "Here are the options."
+
+    monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
+    return calls
+
+
+def test_opening_a_chat_from_the_panel_sends_the_note_right_away(
+    app, workspace, agent_calls
+):
+    Screen(app)
+
+    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))  # "Discuss first"
+
+    (turn,) = app._active_session_turns.values()
+    turn.worker.join(10)
+    assert agent_calls == [str(chat.path)]
+
+
+def test_reopening_an_answered_chat_does_not_send_anything_again(app, workspace, agent_calls):
+    Screen(app)
+    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+    (turn,) = app._active_session_turns.values()
+    turn.worker.join(10)
+    app._complete_session_turn(Keys([]), turn, render_final=False)  # stores the answer
+
+    again = app._run_cowork_panel(Keys([ENTER, ENTER]))  # "Open chat" is the first action
+
+    assert again is not None and again.path == chat.path
+    assert agent_calls == [str(chat.path)]  # still just the first turn
+    assert not app._active_session_turns
+
+
+def test_an_empty_enter_sends_the_unanswered_note(app, workspace, agent_calls, monkeypatch):
+    class Stop(Exception):
+        pass
+
+    panel = app._cowork_workspace()
+    row = next(r for r in panel.rows() if r.note_id == "n-1")
+    chat, problem = panel.open_chat(row, discuss=True)  # as the follow mode does: not sent
+    assert problem is None and chat is not None and not agent_calls
+
+    def fake_draw(_stdscr, session, *_args, **_kwargs):
+        if app._active_session_turns:
+            raise Stop
+
+        class Viewport:
+            scroll = 0
+
+        return Viewport()
+
+    monkeypatch.setattr(app, "_draw_session", fake_draw)
+
+    with pytest.raises(Stop):
+        app._run_session(Keys(["\n"]), chat)
+
+    (turn,) = app._active_session_turns.values()
+    turn.worker.join(10)
+    assert agent_calls == [str(chat.path)]
+
+
+def test_a_normal_session_is_not_touched_by_an_empty_enter(app, workspace, agent_calls):
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+
+    assert app._cowork_send_pending(ordinary) is False
+    assert not app._active_session_turns and not agent_calls
+
+
+def test_the_follow_hint_tells_how_to_send_a_fresh_note(app, workspace, monkeypatch):
+    _screen, view = _enable_follow(app, workspace, monkeypatch)
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+
+    _step(app, ordinary, view)
+    _step(app, ordinary, view)
+
+    assert "press Enter on an empty prompt" in view.notice

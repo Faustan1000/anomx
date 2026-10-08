@@ -502,3 +502,30 @@ def test_the_cowork_runtime_never_starts_a_sandbox(home, tmp_path):
     worktree.mkdir()
 
     assert CoworkRuntime(home, worktree).init_sandbox() is False
+
+
+# -- unanswered notes -----------------------------------------------------------------
+
+
+def _event(kind: str) -> dict:
+    return {"type": "event_msg", "payload": {"type": kind, "message": "x"}}
+
+
+def test_awaiting_reply_follows_the_last_user_and_agent_messages():
+    from anomx.agent.cowork.runner import awaiting_reply
+
+    meta = {"type": "session_meta", "payload": {}}
+    assert awaiting_reply([]) is False
+    assert awaiting_reply([meta, _event("user_message")]) is True
+    assert awaiting_reply([meta, _event("user_message"), _event("agent_message")]) is False
+    assert awaiting_reply([_event("user_message"), _event("agent_message"), _event("user_message")])
+    assert awaiting_reply([_event("user_message"), _event("work_message")]) is True
+
+
+def test_a_fresh_chat_awaits_a_reply_until_the_agent_has_answered(service, home, workspace):
+    _task, record = service.open_chat(_note(workspace), workspace, discuss=True)
+
+    assert service.awaiting_reply(record.path) is True
+
+    home.append_session_event(record.path, "agent_message", {"message": "Here are options."})
+    assert service.awaiting_reply(record.path) is False

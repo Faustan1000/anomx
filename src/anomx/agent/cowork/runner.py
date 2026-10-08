@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import threading
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from anomx.agent.base.agents import AgentKind
 from anomx.agent.cowork.agent import CoworkRuntime
@@ -33,6 +35,26 @@ class RunResult:
     committed: bool
     summary: str
     error: str = ""
+
+
+def awaiting_reply(events: Sequence[Mapping[str, Any]]) -> bool:
+    """Whether the latest user message of a transcript has not been answered yet.
+
+    A fresh cowork chat contains only the note; nothing is sent to the model until a turn
+    is started, so this is what tells the screens that the note still has to be sent.
+    """
+
+    state = False
+    for event in events:
+        payload = event.get("payload")
+        if event.get("type") != "event_msg" or not isinstance(payload, dict):
+            continue
+        kind = payload.get("type")
+        if kind == "user_message":
+            state = True
+        elif kind == "agent_message":
+            state = False
+    return state
 
 
 def build_task_prompt(task: CoworkTask, context: NoteContext, *, discuss: bool = False) -> str:
@@ -194,6 +216,9 @@ class CoworkService:
 
         runtime.after_turn = after_turn
         return runtime
+
+    def awaiting_reply(self, session_path: Path) -> bool:
+        return awaiting_reply(self.home.read_session_events(session_path))
 
     def note_for_session(self, session_path: Path) -> str | None:
         """Note whose chat is this session, if any."""

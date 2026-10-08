@@ -154,6 +154,9 @@ class CoworkViewMixin:
             record, problem = panel.open_chat(row, discuss=action.value == "discuss")
             if problem:
                 message(stdscr, "Cannot open chat", problem)
+            elif record is not None:
+                # Opening the chat from the panel is an explicit request: answer the note now.
+                self._cowork_send_pending(record)
             return record
         if action.value == "start":
             problem = panel.start(row)
@@ -199,6 +202,17 @@ class CoworkViewMixin:
         if result.conflicts:
             detail += "\nConflicting files: " + ", ".join(result.conflicts)
         self._message(stdscr, "Cannot merge", detail)
+
+    def _cowork_send_pending(self, session: SessionRecord) -> bool:
+        """Send the note of a cowork chat to the agent if nobody has answered it yet."""
+
+        panel = self._cowork_workspace()
+        if panel is None or self._active_turn_for_session(session) is not None:
+            return False
+        if not panel.awaiting_reply(session.path):
+            return False
+        self._start_session_turn(session)
+        return True
 
     def _cowork_toggle_follow(self, stdscr: CursesWindow, panel: CoworkWorkspace) -> None:
         if self._cowork_follower is not None:

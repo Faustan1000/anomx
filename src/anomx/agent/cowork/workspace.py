@@ -252,6 +252,16 @@ class CoworkWorkspace:
         except GitError as error:
             return None, str(error)
 
+    def awaiting_reply(self, session_path: Path) -> bool:
+        """The chat is one of ours and its latest message is still unanswered."""
+
+        self.rows()
+        return any(
+            service.note_for_session(session_path) is not None
+            and service.awaiting_reply(session_path)
+            for service in list(self._services.values())
+        )
+
     def runtime_for_session(self, session_path: Path) -> CoworkRuntime | None:
         """Runtime for a session that is the chat of one of our tasks, else ``None``."""
 

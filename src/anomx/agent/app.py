@@ -2013,6 +2013,10 @@ class AnomxCliApp(
                 selected_command = prompt.command_selected
                 if not submitted:
                     prompt.clear()
+                    # An empty Enter in a cowork chat sends the note that has not been answered.
+                    if self._cowork_send_pending(current_session):
+                        view.reset_running_notice(RUNNING_NOTICE)
+                        view.jump_to_bottom()
                     continue
                 if self._is_slash_command(submitted):
                     prompt.clear()
@@ -2596,7 +2600,9 @@ class AnomxCliApp(
         tree_notice = panel.sync_tree(fresh, editor_dirty=activation.editor_dirty)
         if tree_notice:
             notices.append(tree_notice)
-        view.show_notice(" · ".join(notices), now=now)
+        if record is not None and panel.awaiting_reply(record.path):
+            notices.append("press Enter on an empty prompt to send the note to the agent")
+        view.show_notice(" · ".join(notices), now=now, seconds=10.0)
         if record is None or record.path == session.path:
             return session
         self._activate_agent(record.agent_kind)
