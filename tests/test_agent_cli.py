@@ -101,7 +101,6 @@ from anomx.agent.ui import (
     RUNNING_COMMAND_BLOCKED_NOTICE,
     RUNNING_NOTICE,
     AgentState,
-    BackendTurnResult,
     BottomPanel,
     InfoRow,
     MenuChoice,
@@ -2076,11 +2075,6 @@ def test_skill_invocation_records_prompt_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_maybe_start_session_rename", lambda _session: None)
     monkeypatch.setattr(app, "_latest_user_anchor_line", lambda _stdscr, _session: None)
     monkeypatch.setattr(app, "_animate_message_anchor", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(
-        app,
-        "_run_backend_turn",
-        lambda *_args, **_kwargs: BackendTurnResult("", 0),
-    )
 
     assert app._invoke_skill(object(), session, skill, "/quality-scan data/raw") is None
 
@@ -3751,88 +3745,6 @@ def test_running_ctrl_x_confirmation_requests_interrupt_without_writing(tmp_path
 
     assert second.exit_requested
     assert app._read_message_lines(session.path) == []
-
-
-def test_running_ctrl_c_confirmation_aborts_turn_without_exiting_cli(tmp_path, monkeypatch):
-    class Window:
-        def __init__(self):
-            self._keys = iter(("\x03", "\x03"))
-
-        def get_wch(self):
-            try:
-                return next(self._keys)
-            except StopIteration as error:
-                raise curses.error from error
-
-        def nodelay(self, flag):
-            self.nodelay_flag = flag
-
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    app = AnomxCliApp(home=home, use_color=False)
-
-    def fake_backend_response(_session_path, callbacks=None):
-        del callbacks
-        while not app.runtime._turn_aborted():
-            runtime_module.time.sleep(0.01)
-        return ""
-
-    monkeypatch.setattr(app.runtime, "backend_response", fake_backend_response)
-    monkeypatch.setattr(app, "_draw_session", lambda *args, **kwargs: None)
-
-    result = app._run_backend_turn(Window(), session)
-
-    assert result.exit_requested is False
-    assert app.runtime._turn_aborted() is True
-    assert app._read_message_lines(session.path) == [MessageLine("agent", MANUAL_INTERRUPT_MESSAGE)]
-
-
-def test_running_interrupt_collapses_completed_work_before_manual_notice(tmp_path, monkeypatch):
-    class Window:
-        def __init__(self):
-            self._calls = 0
-
-        def get_wch(self):
-            self._calls += 1
-            if self._calls <= 2:
-                runtime_module.time.sleep(0.05)
-                raise curses.error
-            if self._calls == 3:
-                return "\x03"
-            if self._calls == 4:
-                return "\x03"
-            raise curses.error
-
-        def nodelay(self, flag):
-            self.nodelay_flag = flag
-
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    app = AnomxCliApp(home=home, use_color=False)
-
-    def fake_backend_response(_session_path, callbacks=None):
-        assert callbacks is not None
-        assert callbacks.tool_message is not None
-        callbacks.tool_message("Checking repository")
-        while not app.runtime._turn_aborted():
-            runtime_module.time.sleep(0.01)
-        return ""
-
-    monkeypatch.setattr(app.runtime, "backend_response", fake_backend_response)
-    monkeypatch.setattr(app, "_draw_session", lambda *args, **kwargs: None)
-
-    app._run_backend_turn(Window(), session)
-
-    messages = app._read_message_lines(session.path)
-    assert len(messages) == 2
-    assert messages[0].role == "work_summary"
-    assert messages[0].text.startswith("Worked for ")
-    assert messages[0].text.endswith(" min")
-    assert messages[1] == MessageLine("agent", MANUAL_INTERRUPT_MESSAGE)
 
 
 def test_abort_current_turn_interrupts_working_subagents(tmp_path):

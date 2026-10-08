@@ -276,18 +276,6 @@ class SessionTextSelection:
 
 
 @dataclass(frozen=True)
-class BackendTurnResult:
-    """State returned from a non-blocking backend turn."""
-
-    input_text: str
-    cursor: int
-    exit_requested: bool = False
-    anchor_line: int | None = None
-    scroll: int = 0
-    back_requested: bool = False
-
-
-@dataclass(frozen=True)
 class RunningKeyResult:
     """Input state update while a backend turn is active."""
 

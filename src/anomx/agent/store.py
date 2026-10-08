@@ -64,34 +64,6 @@ class ModelMenuOption:
 
 @dataclass(frozen=True)
 class BackgroundWorkModelSetting:
-    """Configurable model used for one class of background work."""
-
-    config_key: str
-    label: str
-    description: str
-    default: str
-
-
-@dataclass(frozen=True)
-class ContextManagementOption:
-    """Selectable limit or target used by automatic context management."""
-
-    value: int
-    label: str
-    description: str
-
-
-@dataclass(frozen=True)
-class ModelMenuOption:
-    """Curated model exposed by the CLI ``/model`` menu."""
-
-    provider_key: str
-    model: str
-    label: str
-
-
-@dataclass(frozen=True)
-class BackgroundWorkModelSetting:
     """Configurable standard model used for one task difficulty."""
 
     config_key: str

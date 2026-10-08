@@ -50,7 +50,6 @@ from anomx.agent.ui.models import (  # noqa: F401
     ActivityDetailRow,
     ActivityItem,
     AgentState,
-    BackendTurnResult,
     BottomPanel,
     BottomPanelViewport,
     CommandSpec,
