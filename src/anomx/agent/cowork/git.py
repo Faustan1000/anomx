@@ -100,6 +100,14 @@ class CoworkGit:
 
         return not self._git("status", "--porcelain", "--untracked-files=no").stdout.strip()
 
+    def is_file_committed(self, relative: str) -> bool:
+        """The file is tracked and has no uncommitted changes (what an agent would see)."""
+
+        tracked = self._git("ls-files", "--error-unmatch", "--", relative, check=False)
+        if tracked.returncode != 0:
+            return False
+        return not self._git("status", "--porcelain", "--", relative).stdout.strip()
+
     def branch_exists(self, branch: str) -> bool:
         ref = f"refs/heads/{branch}"
         return self._git("rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0
