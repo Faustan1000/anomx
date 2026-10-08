@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import curses
 import textwrap
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import replace
 
@@ -104,75 +104,34 @@ class PopupComponentMixin:
         prompt_notice_role: str = "light",
         searchable: bool = False,
     ) -> str | None:
-        selected = 0
         current_scroll = scroll
-        query = ""
+
+        def draw(panel: BottomPanel) -> None:
+            nonlocal current_scroll
+            viewport = self._draw_session(
+                stdscr,
+                session,
+                self._read_message_lines(session.path),
+                self._modal_prompt_text,
+                self._modal_prompt_cursor,
+                current_scroll,
+                bottom_panel=panel,
+                anchor_line=anchor_line,
+                prompt_notice=prompt_notice,
+                prompt_notice_role=prompt_notice_role,
+                file_references=self._modal_prompt_file_references,
+                image_attachments=self._modal_prompt_image_attachments,
+                pasted_spans=self._modal_prompt_pasted_spans,
+            )
+            if viewport is not None:
+                current_scroll = viewport.scroll
+
         with suppress(curses.error):
             stdscr.nodelay(False)
         try:
-            while True:
-                messages = self._read_message_lines(session.path)
-                active_choices = (
-                    self._filter_menu_choices(choices, query) if searchable else choices
-                )
-                selected = max(0, min(selected, len(active_choices) - 1)) if active_choices else 0
-                panel = BottomPanel(
-                    title,
-                    self._menu_search_subtitle(subtitle, query, searchable),
-                    active_choices,
-                    selected,
-                    highlight_attr="match" if searchable else "accent",
-                    selected_highlight_attr="match" if searchable else "selected",
-                )
-                viewport = self._draw_session(
-                    stdscr,
-                    session,
-                    messages,
-                    self._modal_prompt_text,
-                    self._modal_prompt_cursor,
-                    current_scroll,
-                    bottom_panel=panel,
-                    anchor_line=anchor_line,
-                    prompt_notice=prompt_notice,
-                    prompt_notice_role=prompt_notice_role,
-                    file_references=self._modal_prompt_file_references,
-                    image_attachments=self._modal_prompt_image_attachments,
-                    pasted_spans=self._modal_prompt_pasted_spans,
-                )
-                if viewport is not None:
-                    current_scroll = viewport.scroll
-                key = stdscr.get_wch()
-                if self._is_escape(key) or self._is_ctrl_c(key):
-                    return None
-                if self._is_shift_tab(key):
-                    self._cycle_agent_mode()
-                    continue
-                if key == curses.KEY_UP:
-                    selected = max(0, selected - 1)
-                elif key == curses.KEY_DOWN:
-                    selected = min(len(active_choices) - 1, selected + 1)
-                elif key == curses.KEY_PPAGE:
-                    panel_viewport = self._bottom_panel_viewport(stdscr, panel)
-                    page_size = max(1, len(panel_viewport.visible_indices))
-                    selected = max(0, selected - page_size)
-                elif key == curses.KEY_NPAGE:
-                    panel_viewport = self._bottom_panel_viewport(stdscr, panel)
-                    page_size = max(1, len(panel_viewport.visible_indices))
-                    selected = min(len(active_choices) - 1, selected + page_size)
-                elif key == curses.KEY_MOUSE:
-                    choice = self._bottom_panel_mouse_choice(stdscr, panel)
-                    if choice is not None and choice < len(active_choices):
-                        return active_choices[choice].value
-                elif self._is_enter(key):
-                    if active_choices:
-                        return active_choices[selected].value
-                elif searchable and self._is_backspace(key):
-                    query = query[:-1]
-                    selected = 0
-                elif searchable:
-                    query, consumed = self._apply_menu_search_key(key, query)
-                    if consumed:
-                        selected = 0
+            return self._run_bottom_menu(
+                stdscr, title, subtitle, choices, searchable=searchable, draw=draw
+            )
         finally:
             if restore_nodelay:
                 with suppress(curses.error):
@@ -193,29 +152,15 @@ class PopupComponentMixin:
     ) -> str | None:
         if not choices:
             return None
-        selected = 0
         current_scroll = scroll
-        query = ""
         visible_sessions = list(sessions)
-        with suppress(curses.error):
-            stdscr.nodelay(False)
-        while True:
+
+        def draw(panel: BottomPanel) -> None:
+            nonlocal current_scroll, session_selected, visible_sessions
             if not visible_sessions:
                 visible_sessions = self._project_sessions(project.path)
             session_selected = (
                 max(0, min(session_selected, len(visible_sessions) - 1)) if visible_sessions else 0
-            )
-            active_choices = (
-                self._filter_menu_choices(choices, query) if searchable else choices
-            )
-            selected = max(0, min(selected, len(active_choices) - 1)) if active_choices else 0
-            panel = BottomPanel(
-                title,
-                self._menu_search_subtitle(subtitle, query, searchable),
-                active_choices,
-                selected,
-                highlight_attr="match" if searchable else "accent",
-                selected_highlight_attr="match" if searchable else "selected",
             )
             current_scroll = self._draw_project(
                 stdscr,
@@ -232,6 +177,43 @@ class PopupComponentMixin:
                 file_references=self._modal_prompt_file_references,
                 pasted_spans=self._modal_prompt_pasted_spans,
             )
+
+        with suppress(curses.error):
+            stdscr.nodelay(False)
+        return self._run_bottom_menu(
+            stdscr, title, subtitle, choices, searchable=searchable, draw=draw
+        )
+
+    def _run_bottom_menu(
+        self,
+        stdscr: CursesWindow,
+        title: str,
+        subtitle: str,
+        choices: tuple[MenuChoice, ...],
+        *,
+        searchable: bool,
+        draw: Callable[[BottomPanel], None],
+    ) -> str | None:
+        """Shared menu loop of the session and project bottom panels.
+
+        ``draw`` paints the screen behind the panel (session or project view) and is
+        called with the panel to overlay on every iteration.
+        """
+
+        selected = 0
+        query = ""
+        while True:
+            active_choices = self._filter_menu_choices(choices, query) if searchable else choices
+            selected = max(0, min(selected, len(active_choices) - 1)) if active_choices else 0
+            panel = BottomPanel(
+                title,
+                self._menu_search_subtitle(subtitle, query, searchable),
+                active_choices,
+                selected,
+                highlight_attr="match" if searchable else "accent",
+                selected_highlight_attr="match" if searchable else "selected",
+            )
+            draw(panel)
             key = stdscr.get_wch()
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None
@@ -326,10 +308,8 @@ class PopupComponentMixin:
         footer: str = "Esc Cancel · Enter Save",
     ) -> str | None:
         """Run an overlay single-line text input loop."""
-        value = default
-        cursor = len(value)
-        while True:
-            display_value = "*" * len(value) if mask else value
+
+        def draw(display_value: str, cursor: int) -> None:
             self._draw_overlay(
                 stdscr,
                 title=title,
@@ -339,163 +319,26 @@ class PopupComponentMixin:
                 footer=footer,
                 show_input_cursor=True,
             )
-            key = self._read_prompt_key(stdscr)
-            if isinstance(key, PromptPasteEvent):
-                value, cursor = self._insert_single_line_paste(value, cursor, key.text)
-                continue
-            if self._is_escape(key) or self._is_ctrl_c(key):
-                return None if optional else ""
-            if self._is_enter(key) and (value or optional):
-                return value
-            if self._is_option_left(key):
-                cursor = self._previous_prompt_word(value, cursor)
-            elif self._is_option_right(key):
-                cursor = self._next_prompt_word(value, cursor)
-            elif self._is_option_delete(key):
-                value, cursor = self._delete_previous_prompt_word(value, cursor)
-            elif key == curses.KEY_LEFT:
-                cursor = max(0, cursor - 1)
-            elif key == curses.KEY_RIGHT:
-                cursor = min(len(value), cursor + 1)
-            elif key == curses.KEY_HOME:
-                cursor = 0
-            elif key == curses.KEY_END:
-                cursor = len(value)
-            elif self._is_backspace(key):
-                if cursor > 0:
-                    value = value[: cursor - 1] + value[cursor:]
-                    cursor -= 1
-            elif isinstance(key, str) and key.isprintable():
-                value = value[:cursor] + key + value[cursor:]
-                cursor += 1
-        height, width = stdscr.getmaxyx()
-        attr = self._attr("background")
-        for y in range(height):
-            self._add(stdscr, y, 0, " " * max(1, width), width, attr)
 
-    def _prompt_text(
-        self,
-        stdscr: CursesWindow,
-        title: str,
-        label: str,
-        mask: bool = False,
-        optional: bool = True,
-        default: str = "",
-    ) -> str | None:
-        return self._run_overlay_text(
-            stdscr,
-            title,
-            label,
-            mask=mask,
-            optional=optional,
-            default=default,
+        return self._run_single_line_input(
+            stdscr, draw, mask=mask, optional=optional, default=default
         )
 
-    def _prompt_popover_text(
+    def _run_single_line_input(
         self,
         stdscr: CursesWindow,
-        session: SessionRecord,
-        title: str,
-        label: str,
-        mask: bool = False,
-        optional: bool = True,
-        default: str = "",
+        draw: Callable[[str, int], None],
+        *,
+        mask: bool,
+        optional: bool,
+        default: str,
     ) -> str | None:
-        value = default
-        cursor = len(value)
-        while True:
-            self._draw_session(
-                stdscr,
-                session,
-                self._read_message_lines(session.path),
-                self._modal_prompt_text,
-                self._modal_prompt_cursor,
-                0,
-                prompt_hint_suffix=" · Esc Cancel · Enter Save",
-                file_references=self._modal_prompt_file_references,
-                image_attachments=self._modal_prompt_image_attachments,
-                pasted_spans=self._modal_prompt_pasted_spans,
-            )
-            display_value = "*" * len(value) if mask else value
-            self._draw_text_popover(
-                stdscr,
-                title,
-                label,
-                display_value,
-                cursor,
-                "",
-            )
-            key = self._read_prompt_key(stdscr)
-            if isinstance(key, PromptPasteEvent):
-                value, cursor = self._insert_single_line_paste(value, cursor, key.text)
-                continue
-            if self._is_escape(key) or self._is_ctrl_c(key):
-                return None if optional else ""
-            if self._is_enter(key) and (value or optional):
-                return value
-            if self._is_option_left(key):
-                cursor = self._previous_prompt_word(value, cursor)
-            elif self._is_option_right(key):
-                cursor = self._next_prompt_word(value, cursor)
-            elif self._is_option_delete(key):
-                value, cursor = self._delete_previous_prompt_word(value, cursor)
-            elif key == curses.KEY_LEFT:
-                cursor = max(0, cursor - 1)
-            elif key == curses.KEY_RIGHT:
-                cursor = min(len(value), cursor + 1)
-            elif key == curses.KEY_HOME:
-                cursor = 0
-            elif key == curses.KEY_END:
-                cursor = len(value)
-            elif self._is_backspace(key):
-                if cursor > 0:
-                    value = value[: cursor - 1] + value[cursor:]
-                    cursor -= 1
-            elif isinstance(key, str) and key.isprintable():
-                value = value[:cursor] + key + value[cursor:]
-                cursor += 1
+        """Shared single-line input loop; ``draw(display_value, cursor)`` paints one frame."""
 
-    def _prompt_project_popover_text(
-        self,
-        stdscr: CursesWindow,
-        project: ProjectRecord,
-        title: str,
-        label: str,
-        mask: bool = False,
-        optional: bool = True,
-        default: str = "",
-        session_selected: int = 0,
-        scroll: int = 0,
-    ) -> str | None:
         value = default
         cursor = len(value)
-        current_scroll = scroll
         while True:
-            sessions = self._project_sessions(project.path)
-            current_scroll = self._draw_project(
-                stdscr,
-                project,
-                sessions,
-                session_selected,
-                current_scroll,
-                self._modal_prompt_text,
-                self._modal_prompt_cursor,
-                "",
-                "light",
-                0,
-                prompt_hint_suffix=" · Esc Cancel · Enter Save",
-                file_references=self._modal_prompt_file_references,
-                pasted_spans=self._modal_prompt_pasted_spans,
-            )
-            display_value = "*" * len(value) if mask else value
-            self._draw_text_popover(
-                stdscr,
-                title,
-                label,
-                display_value,
-                cursor,
-                "",
-            )
+            draw("*" * len(value) if mask else value, cursor)
             key = self._read_prompt_key(stdscr)
             if isinstance(key, PromptPasteEvent):
                 value, cursor = self._insert_single_line_paste(value, cursor, key.text)
@@ -525,6 +368,90 @@ class PopupComponentMixin:
             elif isinstance(key, str) and key.isprintable():
                 value = value[:cursor] + key + value[cursor:]
                 cursor += len(key)
+
+    def _prompt_text(
+        self,
+        stdscr: CursesWindow,
+        title: str,
+        label: str,
+        mask: bool = False,
+        optional: bool = True,
+        default: str = "",
+    ) -> str | None:
+        return self._run_overlay_text(
+            stdscr,
+            title,
+            label,
+            mask=mask,
+            optional=optional,
+            default=default,
+        )
+
+    def _prompt_popover_text(
+        self,
+        stdscr: CursesWindow,
+        session: SessionRecord,
+        title: str,
+        label: str,
+        mask: bool = False,
+        optional: bool = True,
+        default: str = "",
+    ) -> str | None:
+        def draw(display_value: str, cursor: int) -> None:
+            self._draw_session(
+                stdscr,
+                session,
+                self._read_message_lines(session.path),
+                self._modal_prompt_text,
+                self._modal_prompt_cursor,
+                0,
+                prompt_hint_suffix=" · Esc Cancel · Enter Save",
+                file_references=self._modal_prompt_file_references,
+                image_attachments=self._modal_prompt_image_attachments,
+                pasted_spans=self._modal_prompt_pasted_spans,
+            )
+            self._draw_text_popover(stdscr, title, label, display_value, cursor, "")
+
+        return self._run_single_line_input(
+            stdscr, draw, mask=mask, optional=optional, default=default
+        )
+
+    def _prompt_project_popover_text(
+        self,
+        stdscr: CursesWindow,
+        project: ProjectRecord,
+        title: str,
+        label: str,
+        mask: bool = False,
+        optional: bool = True,
+        default: str = "",
+        session_selected: int = 0,
+        scroll: int = 0,
+    ) -> str | None:
+        current_scroll = scroll
+
+        def draw(display_value: str, cursor: int) -> None:
+            nonlocal current_scroll
+            current_scroll = self._draw_project(
+                stdscr,
+                project,
+                self._project_sessions(project.path),
+                session_selected,
+                current_scroll,
+                self._modal_prompt_text,
+                self._modal_prompt_cursor,
+                "",
+                "light",
+                0,
+                prompt_hint_suffix=" · Esc Cancel · Enter Save",
+                file_references=self._modal_prompt_file_references,
+                pasted_spans=self._modal_prompt_pasted_spans,
+            )
+            self._draw_text_popover(stdscr, title, label, display_value, cursor, "")
+
+        return self._run_single_line_input(
+            stdscr, draw, mask=mask, optional=optional, default=default
+        )
 
     def _draw_text_popover(
         self,
