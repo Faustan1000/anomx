@@ -182,7 +182,7 @@ class ProjectViewMixin:
         self._add(stdscr, y, title_x, title, title_width, title_attr)
         if running:
             statement = self._project_session_statement(session)
-            if statement:
+            if statement or needs_confirmation:
                 statement_x = title_x + min(len(title), title_width)
                 separator = " › "
                 separator_width = max(0, min(len(separator), right_x - statement_x - 1))
@@ -206,7 +206,7 @@ class ProjectViewMixin:
                         max(1, right_x - statement_x - 1),
                         self._attr("warning_badge"),
                     )
-                elif statement_x < right_x - 1:
+                elif statement and statement_x < right_x - 1:
                     self._add(
                         stdscr,
                         y,

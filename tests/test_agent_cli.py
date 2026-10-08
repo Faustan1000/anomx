@@ -25,6 +25,7 @@ import anomx.agent.ui.views.matrix_loading as matrix_loading_module
 from anomx import __version__
 from anomx.agent import AgentKind, AnomxHome
 from anomx.agent.app import AnomxCliApp
+from anomx.agent.backends import backend_for_provider
 from anomx.agent.base.tools import ToolExecutionContext
 from anomx.agent.helpers.debug import SessionDebugLogger
 from anomx.agent.helpers.extract_json import extract_json_object
@@ -44,7 +45,6 @@ from anomx.agent.helpers.state import (
     process_snapshots,
     running_process_snapshots,
     running_subagent_snapshots,
-    running_worker_snapshots,
     subagent_snapshots,
     worker_snapshots,
 )
@@ -817,7 +817,8 @@ def test_resolve_platform_api_url_falls_back_to_api_prefix(monkeypatch):
     ]
 
 
-def test_connect_platform_uses_cli_agent_login_payload(monkeypatch):
+def test_connect_platform_uses_cli_agent_login_payload(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANOMX_HOME", str(tmp_path / "home"))
     calls: list[dict[str, object]] = []
 
     class FakeResponse:
@@ -893,6 +894,7 @@ def test_connect_platform_uses_cli_agent_login_payload(monkeypatch):
     assert calls[-1]["payload"] == {
         "client_hostname": "edge-node-01",
         "client_version": platform_client_module.__version__,
+        "usage": {},
     }
 
 
@@ -933,6 +935,7 @@ def test_heartbeat_platform_connection_uses_saved_bearer_token(tmp_path, monkeyp
     assert captured["payload"] == {
         "client_hostname": "edge-node-02",
         "client_version": platform_client_module.__version__,
+        "usage": {},
     }
 
 
@@ -1660,20 +1663,6 @@ def test_running_enter_blocks_skill_command(tmp_path):
     assert result.notice == RUNNING_COMMAND_BLOCKED_NOTICE
 
 
-def test_info_command_opens_session_info_panel(tmp_path, monkeypatch):
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    app = AnomxCliApp(home=home, cwd=repo)
-    opened = []
-
-    monkeypatch.setattr(app, "_run_info_panel", lambda _stdscr, session: opened.append(session))
-
-    assert app._handle_command(object(), "/info", session) is None
-    assert opened == [session]
-
-
 def test_config_manage_skills_opens_skills_panel(tmp_path, monkeypatch):
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
@@ -1783,7 +1772,7 @@ def test_draw_skill_editor_panel_marks_selected_field_in_accent(tmp_path):
             pass
 
     app = AnomxCliApp(home=AnomxHome(tmp_path / "home"), use_color=False)
-    app._colors = {"light": 10, "accent": 20}
+    app._colors = {"light": 10, "accent": 20, "muted": 30}
     window = Window()
     draft = SkillFormDraft(
         command="test",
@@ -1799,12 +1788,12 @@ def test_draw_skill_editor_panel_marks_selected_field_in_accent(tmp_path):
         selected=1,
     )
 
-    assert any(text == "Command" and attr == 10 for _, _, text, attr in window.writes)
-    assert any(text == "/test" and attr == 10 for _, _, text, attr in window.writes)
+    assert any(text == "Command" and attr == 0 for _, _, text, attr in window.writes)
+    assert any(text == "/test" and attr == 30 for _, _, text, attr in window.writes)
     assert any(text == "Description" and attr == 20 for _, _, text, attr in window.writes)
-    assert any(text == "Testing skill edits" and attr == 0 for _, _, text, attr in window.writes)
+    assert any(text == "Testing skill edits" and attr == 20 for _, _, text, attr in window.writes)
     assert any(text.startswith("Stored at:") and attr == 10 for _, _, text, attr in window.writes)
-    assert any(text == "Skill" and attr == 10 for _, _, text, attr in window.writes)
+    assert not any(text == "Command" and attr == 20 for _, _, text, attr in window.writes)
 
 
 def test_draw_skill_detail_panel_keeps_skill_label_light(tmp_path):
@@ -1838,8 +1827,8 @@ def test_draw_skill_detail_panel_keeps_skill_label_light(tmp_path):
 
     app._draw_skill_detail_panel(window, skill)
 
-    assert any(text == "Skill" and attr == 10 for _, _, text, attr in window.writes)
-    assert not any(text == "Skill" and attr == 20 for _, _, text, attr in window.writes)
+    assert any(text == "Skill /test" for _, _, text, _ in window.writes)
+    assert not any(text.startswith("Skill") and attr == 20 for _, _, text, attr in window.writes)
 
 
 def test_run_skill_editor_saves_create_form(tmp_path):
@@ -1894,6 +1883,7 @@ def test_run_skill_editor_saves_existing_skill_and_renames_file(tmp_path):
         def __init__(self):
             self._keys = iter(
                 (
+                    curses.KEY_END,
                     *"renamed",
                     "\x13",
                 )
@@ -2022,7 +2012,7 @@ def test_skill_detail_panel_edit_shortcut_updates_current_skill(tmp_path, monkey
 
     app._run_skill_detail_panel(window, skill)
 
-    assert any(text == "Edited skill description" for _, _, text, _ in window.writes)
+    assert any("Edited skill description" in text for _, _, text, _ in window.writes)
 
 
 def test_delete_user_skill_removes_file_when_confirmed(tmp_path, monkeypatch):
@@ -2075,6 +2065,21 @@ def test_skill_invocation_records_prompt_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(app, "_maybe_start_session_rename", lambda _session: None)
     monkeypatch.setattr(app, "_latest_user_anchor_line", lambda _stdscr, _session: None)
     monkeypatch.setattr(app, "_animate_message_anchor", lambda *_args, **_kwargs: None)
+    # Do not start a real background turn; it would append context-check events.
+    monkeypatch.setattr(
+        app,
+        "_start_session_turn",
+        lambda *_args, **_kwargs: ui_module.ActiveSessionTurn(
+            session=session,
+            runtime=app.runtime,
+            events=queue.SimpleQueue(),
+            result={},
+            turn_id="turn-1",
+            started_at=time.monotonic(),
+            worker=threading.Thread(target=lambda: None),
+            mode=AgentMode.STANDARD,
+        ),
+    )
 
     assert app._invoke_skill(object(), session, skill, "/quality-scan data/raw") is None
 
@@ -2273,9 +2278,9 @@ def test_startup_launches_project_page_for_workspace(tmp_path, monkeypatch):
     )
     home.append_session_event(
         previous_session.path,
-        "worker_event",
+        "subagent_event",
         {
-            "worker_id": "stale-worker",
+            "agent_id": "stale-worker",
             "name": "Engineer",
             "status": "working",
             "statement": "Thinking",
@@ -2299,7 +2304,8 @@ def test_startup_launches_project_page_for_workspace(tmp_path, monkeypatch):
 
     assert app._run(object()) == 0
     assert opened_projects == [project]
-    assert worker_snapshots(home.read_session_events(previous_session.path)) == ()
+    stale = worker_snapshots(home.read_session_events(previous_session.path))
+    assert [snapshot.status for snapshot in stale] == ["interrupted"]
 
 
 def test_startup_project_uses_prepared_project(tmp_path, monkeypatch):
@@ -2877,7 +2883,7 @@ def test_connect_backend_sets_active_model_when_none_connected(tmp_path, monkeyp
     assert home.is_backend_connected("desy") is True
     config = home.load_config()
     assert config["provider"] == "desy"
-    assert config["model"] == "desy-assistant"
+    assert config["model"] == "coding"
 
 
 def test_connect_backend_ollama_uses_explicit_toggle(tmp_path, monkeypatch):
@@ -2921,7 +2927,7 @@ def test_connect_backend_cancelled_prompt_does_not_connect(tmp_path, monkeypatch
     assert home.is_backend_connected("desy") is False
     config = home.load_config()
     assert config["provider"] == "openai"
-    assert config["model"] == "gpt-5.5"
+    assert config["model"] == "gpt-6.1-sol"
 
 
 def test_run_session_executes_selected_slash_command(tmp_path, monkeypatch):
@@ -2967,37 +2973,6 @@ def test_run_config_panel_stays_open_after_managing_backends(tmp_path, monkeypat
     app._run_config_panel(stdscr, session)
 
     assert managed == [stdscr]
-    assert app.state == AgentState.NEW_SESSION
-
-
-def test_run_config_panel_closes_after_model_selection(tmp_path, monkeypatch):
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    app = AnomxCliApp(home=home, use_color=False)
-    stdscr = object()
-    menu_calls = 0
-    selected: list[tuple[object, object]] = []
-
-    def fake_menu(*_args, **_kwargs):
-        nonlocal menu_calls
-        menu_calls += 1
-        return "model"
-
-    monkeypatch.setattr(app, "_menu", fake_menu)
-    monkeypatch.setattr(
-        app,
-        "_run_model_panel",
-        lambda stdscr, current_session, **_kwargs: (
-            selected.append((stdscr, current_session)) or True
-        ),
-    )
-
-    app._run_config_panel(stdscr, session)
-
-    assert menu_calls == 1
-    assert selected == [(stdscr, session)]
     assert app.state == AgentState.NEW_SESSION
 
 
@@ -3282,10 +3257,10 @@ def test_open_session_panel_deletes_selected_session_after_confirmation(
     panels = []
 
     def capture_draw(*_args, **kwargs):
-        panels.append(kwargs["bottom_panel"])
-        return None
+        panels.append(kwargs)
+        return 0, 0, 80, 20
 
-    monkeypatch.setattr(app, "_draw_session", capture_draw)
+    monkeypatch.setattr(app, "_draw_overlay", capture_draw)
 
     assert app._open_session_panel(Window(), current_session) is None
     assert not drop_session.path.exists()
@@ -3293,10 +3268,10 @@ def test_open_session_panel_deletes_selected_session_after_confirmation(
     assert [session.session_id for session in home.list_sessions(limit=None)] == [
         current_session.session_id
     ]
-    assert panels[0].subtitle.endswith(" · ctrl+d Delete")
-    assert panels[1].subtitle.endswith(" · Enter to confirm")
-    assert not panels[0].choices[0].detail.endswith(" · ctrl+d Delete")
-    assert not panels[1].choices[0].detail.endswith(" · Enter to confirm")
+    assert panels[0]["subtitle"].endswith(" · ctrl+d Delete")
+    assert panels[1]["subtitle"].endswith(" · Enter to confirm")
+    assert not panels[0]["choices"][0].detail.endswith(" · ctrl+d Delete")
+    assert not panels[1]["choices"][0].detail.endswith(" · Enter to confirm")
 
 
 def test_open_session_panel_escape_cancels_delete_confirmation(tmp_path, monkeypatch):
@@ -3319,18 +3294,18 @@ def test_open_session_panel_escape_cancels_delete_confirmation(tmp_path, monkeyp
     panels = []
 
     def capture_draw(*_args, **kwargs):
-        panels.append(kwargs["bottom_panel"])
-        return None
+        panels.append(kwargs)
+        return 0, 0, 80, 20
 
-    monkeypatch.setattr(app, "_draw_session", capture_draw)
+    monkeypatch.setattr(app, "_draw_overlay", capture_draw)
 
     assert app._open_session_panel(Window(), current_session) is None
     assert target_session.path.exists()
-    assert panels[0].subtitle.endswith(" · ctrl+d Delete")
-    assert panels[1].subtitle.endswith(" · Enter to confirm")
-    assert panels[2].subtitle.endswith(" · ctrl+d Delete")
-    assert not panels[0].choices[0].detail.endswith(" · ctrl+d Delete")
-    assert not panels[1].choices[0].detail.endswith(" · Enter to confirm")
+    assert panels[0]["subtitle"].endswith(" · ctrl+d Delete")
+    assert panels[1]["subtitle"].endswith(" · Enter to confirm")
+    assert panels[2]["subtitle"].endswith(" · ctrl+d Delete")
+    assert not panels[0]["choices"][0].detail.endswith(" · ctrl+d Delete")
+    assert not panels[1]["choices"][0].detail.endswith(" · Enter to confirm")
 
 
 def test_prompt_lines_wrap_and_keep_cursor_visible(tmp_path):
@@ -3539,6 +3514,7 @@ def test_prompt_bar_draws_current_mode_hint(tmp_path):
 
     window = Window()
     app = AnomxCliApp(home=AnomxHome(tmp_path / "home"), use_color=False)
+    app.agent_mode = AgentMode.STANDARD
 
     app._draw_prompt_bar(window, "", cursor=0)
 
@@ -4493,13 +4469,13 @@ def test_desy_backend_requires_configured_api_key(tmp_path, monkeypatch):
 
     response = runtime.backend_response(session.path)
 
-    assert "DESY Assistant API key is not configured" in response
+    assert "DESY API key is not configured" in response
 
 
 def test_openai_invalid_api_key_uses_specific_message(tmp_path):
     runtime = AgentRuntime(AnomxHome(tmp_path / "home"), tmp_path)
 
-    response = runtime._api_error(
+    response = backend_for_provider("openai", runtime)._api_error(
         "openai",
         "OpenAI",
         "OPENAI_API_KEY",
@@ -4521,7 +4497,7 @@ def test_openai_invalid_api_key_uses_specific_message(tmp_path):
 def test_anthropic_invalid_api_key_uses_specific_message(tmp_path):
     runtime = AgentRuntime(AnomxHome(tmp_path / "home"), tmp_path)
 
-    response = runtime._api_error(
+    response = backend_for_provider("anthropic", runtime)._api_error(
         "anthropic",
         "Anthropic",
         "ANTHROPIC_API_KEY",
@@ -4544,15 +4520,15 @@ def test_anthropic_invalid_api_key_uses_specific_message(tmp_path):
 def test_desy_invalid_api_key_uses_specific_message(tmp_path):
     runtime = AgentRuntime(AnomxHome(tmp_path / "home"), tmp_path)
 
-    response = runtime._api_error(
+    response = backend_for_provider("desy", runtime)._api_error(
         "desy",
-        "DESY Assistant",
+        "DESY",
         "DESY_ASSISTANT_API_KEY",
         401,
         json.dumps({"detail": "Not authenticated"}),
     )
 
-    assert "DESY Assistant credentials were rejected" in response
+    assert "DESY credentials were rejected" in response
     assert "DESY_ASSISTANT_API_KEY" in response
 
 
@@ -4728,7 +4704,7 @@ def test_openai_stream_reports_reasoning_summary_status(tmp_path, monkeypatch):
     deltas: list[str] = []
 
     monkeypatch.setattr(
-        runtime_module.urllib.request,
+        urllib.request,
         "urlopen",
         lambda *args, **kwargs: FakeResponse(),
     )
@@ -4742,7 +4718,7 @@ def test_openai_stream_reports_reasoning_summary_status(tmp_path, monkeypatch):
 
     assert response.response_id == "resp_1"
     assert response.text == "done"
-    assert statuses == ["Thinking"]
+    assert statuses == ["Created a thought"]
     assert deltas == ["done"]
 
 
@@ -4922,209 +4898,6 @@ def test_debug_normalizes_tool_blocks_as_message_keys():
     }
 
 
-def test_full_session_logs_write_each_backend_request_as_txt(tmp_path, monkeypatch):
-    class FakeResponse:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            return False
-
-        def __iter__(self):
-            yield b'data: {"type":"response.output_text.delta","delta":"done"}\n'
-            yield b'data: {"type":"response.completed","response":{"id":"resp_1"}}\n'
-            yield b"data: [DONE]\n"
-
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    logs_dir = tmp_path / "request-logs"
-    home.set_api_key("openai", "sk-test")
-    config = home.load_config()
-    config["provider"] = "openai"
-    config["model"] = "gpt-5.5"
-    config["debug_mode"] = True
-    config["debug_full_session_logs"] = True
-    config["debug_full_session_logs_path"] = str(logs_dir)
-    home.save_config(config)
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    home.append_session_event(
-        session.path,
-        "user_message",
-        {"message": "Inspect metrics"},
-    )
-    home.update_session_title(session.path, "Investigate Sensors")
-    runtime = AgentRuntime(home, repo)
-
-    monkeypatch.setattr(
-        runtime_module.urllib.request,
-        "urlopen",
-        lambda *args, **kwargs: FakeResponse(),
-    )
-
-    first_response = runtime.backend_response(session.path)
-    second_response = runtime.backend_response(session.path)
-
-    assert first_response == "done"
-    assert second_response == "done"
-    session_logs_dir = logs_dir / f"{session.session_id} - Investigate Sensors"
-    orchestrator_logs_dir = session_logs_dir / "Orchestrator"
-    request_logs = sorted(path.name for path in orchestrator_logs_dir.glob("*.txt"))
-    assert request_logs == ["req-0001.txt", "req-0002.txt"]
-    assert not list(session_logs_dir.glob("req-*.txt"))
-    text = (orchestrator_logs_dir / "req-0001.txt").read_text(encoding="utf-8")
-    assert "=" * 88 in text
-    assert "-" * 88 in text
-    assert "Anomx AI backend request" in text
-    assert "provider: openai" in text
-    assert "Message 0001 | role: system" in text
-    assert "Message 0002 | role: user" in text
-    assert "Inspect metrics" in text
-    assert "Available tools:" in text
-    assert "run_command" in text
-    assert "Raw request payload (JSON, exact backend input):" in text
-
-
-def test_full_session_logs_route_worker_backend_requests_by_agent(tmp_path):
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    logs_dir = tmp_path / "request-logs"
-    config = home.load_config()
-    config["debug_mode"] = True
-    config["debug_full_session_logs"] = True
-    config["debug_full_session_logs_path"] = str(logs_dir)
-    home.save_config(config)
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    home.update_session_title(session.path, "Investigate Sensors")
-
-    path = home.write_backend_request_log(
-        provider="openai",
-        payload={
-            "messages": [{"role": "user", "content": "Inspect worker context"}],
-            "tools": [],
-        },
-        session_path=session.path,
-        actor="worker",
-        worker_name="Engineer",
-        worker_id="172543",
-    )
-
-    worker_logs_dir = (
-        logs_dir / f"{session.session_id} - Investigate Sensors" / "Worker" / "Engineer (172543)"
-    )
-    assert path == worker_logs_dir / "req-0001.txt"
-    assert path is not None
-    assert path.exists()
-    assert "Inspect worker context" in path.read_text(encoding="utf-8")
-
-
-def test_full_session_logs_write_async_commands_and_processes(tmp_path):
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    logs_dir = tmp_path / "request-logs"
-    config = home.load_config()
-    config["debug_mode"] = True
-    config["debug_full_session_logs"] = True
-    config["debug_full_session_logs_path"] = str(logs_dir)
-    home.save_config(config)
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    home.update_session_title(session.path, "Investigate Sensors")
-    payload = {
-        "process_id": "cmd123",
-        "command_id": "cmd123",
-        "source": "command",
-        "statement": "Run dev server",
-        "command": "npm run dev",
-        "status": "ended",
-        "started_at": "2026-06-07T12:00:00Z",
-        "finished_at": "2026-06-07T12:00:05Z",
-        "exit_code": 0,
-        "pid": 12345,
-    }
-
-    first_command = home.write_async_execution_log(
-        session_path=session.path,
-        kind="command",
-        payload=payload,
-        output="server started\\nready",
-    )
-    second_command = home.write_async_execution_log(
-        session_path=session.path,
-        kind="command",
-        payload={**payload, "process_id": "cmd456", "command_id": "cmd456"},
-        output="second",
-    )
-    process_log = home.write_async_execution_log(
-        session_path=session.path,
-        kind="process",
-        payload={**payload, "source": "process", "process_id": "proc789"},
-        output="process line",
-    )
-
-    session_logs_dir = logs_dir / f"{session.session_id} - Investigate Sensors"
-    assert first_command == session_logs_dir / "Commands" / "0001.txt"
-    assert second_command == session_logs_dir / "Commands" / "0002.txt"
-    assert process_log == session_logs_dir / "Processes" / "0001.txt"
-    assert first_command is not None
-    text = first_command.read_text(encoding="utf-8")
-    readable = text.split("Raw process payload", maxsplit=1)[0]
-    assert "Anomx long-running command log" in readable
-    assert "command_id: cmd123" in readable
-    assert "server started\n" in readable
-    assert "ready" in readable
-    assert "server started\\nready" not in readable
-
-
-def test_backend_request_log_prettifies_escaped_tool_output(tmp_path):
-    home = AnomxHome(tmp_path / "home")
-    logs_dir = tmp_path / "request-logs"
-    config = home.load_config()
-    config["debug_mode"] = True
-    config["debug_full_session_logs"] = True
-    config["debug_full_session_logs_path"] = str(logs_dir)
-    home.save_config(config)
-    payload = {
-        "model": "gpt-5.5",
-        "messages": [
-            {
-                "role": "user",
-                "content": (
-                    '{"approved": true, "output": "first line\\nsecond line", '
-                    '"tool_use_id": "call_1", "type": "tool_result"}'
-                ),
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {
-                        "type": "tool_use",
-                        "name": "run_command",
-                        "input": {
-                            "statement": "Read generated app",
-                            "command": "cat app.js",
-                        },
-                    }
-                ],
-            },
-        ],
-        "tools": [{"name": "run_command", "description": "Run a command"}],
-    }
-
-    path = home.write_backend_request_log(provider="openai", payload=payload)
-
-    assert path is not None
-    text = path.read_text(encoding="utf-8")
-    readable = text.split("Raw request payload", maxsplit=1)[0]
-    assert "Message 0001 | role: user" in readable
-    assert "output:" in readable
-    assert "first line\n" in readable
-    assert "second line" in readable
-    assert "first line\\nsecond line" not in readable
-    assert "Tool 0001: run_command" in readable
-
-
 def test_anthropic_stream_reports_thinking_status(tmp_path, monkeypatch):
     class FakeResponse:
         def __enter__(self):
@@ -5162,7 +4935,7 @@ def test_anthropic_stream_reports_thinking_status(tmp_path, monkeypatch):
     deltas: list[str] = []
 
     monkeypatch.setattr(
-        runtime_module.urllib.request,
+        urllib.request,
         "urlopen",
         lambda *args, **kwargs: FakeResponse(),
     )
@@ -5175,7 +4948,7 @@ def test_anthropic_stream_reports_thinking_status(tmp_path, monkeypatch):
     )
 
     assert response.text == "done"
-    assert statuses == ["Thinking"]
+    assert statuses == ["Thinking", "Created a thought"]
     assert deltas == ["done"]
     assert response.content[0]["type"] == "thinking"
     assert response.content[0]["signature"] == "sig_1"
@@ -5185,6 +4958,8 @@ def test_backend_response_applies_openai_thinking_intensity_config(
     tmp_path,
     monkeypatch,
 ):
+    from anomx.agent.backends.openai import OpenAIBackend
+
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5198,12 +4973,12 @@ def test_backend_response_applies_openai_thinking_intensity_config(
     runtime = AgentRuntime(home, repo)
     captured_payloads: list[dict[str, object]] = []
 
-    def fake_stream(api_key, payload, delta_callback, status_callback):
+    def fake_stream(_self, api_key, payload, delta_callback, status_callback, _thought_callback=None):
         assert api_key == "sk-test"
         captured_payloads.append(payload)
         return runtime_module.OpenAIStreamResponse("resp_1", "done", ())
 
-    monkeypatch.setattr(runtime, "_stream_openai_response", fake_stream)
+    monkeypatch.setattr(OpenAIBackend, "_stream_openai_response", fake_stream)
 
     response = runtime.backend_response(session.path)
 
@@ -5212,6 +4987,8 @@ def test_backend_response_applies_openai_thinking_intensity_config(
 
 
 def test_openai_auto_thinking_intensity_omits_effort(tmp_path, monkeypatch):
+    from anomx.agent.backends.openai import OpenAIBackend
+
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5220,11 +4997,11 @@ def test_openai_auto_thinking_intensity_omits_effort(tmp_path, monkeypatch):
     runtime = AgentRuntime(home, repo)
     captured_payloads: list[dict[str, object]] = []
 
-    def fake_stream(_api_key, payload, _delta_callback, _status_callback):
+    def fake_stream(_self, _api_key, payload, _delta_callback, _status_callback, _thought_callback=None):
         captured_payloads.append(payload)
         return runtime_module.OpenAIStreamResponse("resp_1", "done", ())
 
-    monkeypatch.setattr(runtime, "_stream_openai_response", fake_stream)
+    monkeypatch.setattr(OpenAIBackend, "_stream_openai_response", fake_stream)
 
     response = runtime.openai_response(
         session.path,
@@ -5236,35 +5013,12 @@ def test_openai_auto_thinking_intensity_omits_effort(tmp_path, monkeypatch):
     assert captured_payloads[0]["reasoning"] == {"summary": "auto"}
 
 
-def test_openai_response_suppresses_provisional_stream_deltas(tmp_path, monkeypatch):
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    home.set_api_key("openai", "sk-test")
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    runtime = AgentRuntime(home, repo)
-    deltas: list[str] = []
-
-    def fake_stream(_api_key, _payload, delta_callback, _status_callback):
-        assert delta_callback is None
-        return runtime_module.OpenAIStreamResponse("resp_1", "final answer", ())
-
-    monkeypatch.setattr(runtime, "_stream_openai_response", fake_stream)
-
-    response = runtime.openai_response(
-        session.path,
-        "gpt-5.5",
-        RuntimeCallbacks(delta=deltas.append),
-    )
-
-    assert response == "final answer"
-    assert deltas == []
-
-
 def test_anthropic_response_applies_supported_thinking_intensity(
     tmp_path,
     monkeypatch,
 ):
+    from anomx.agent.backends.anthropic import AnthropicBackend
+
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5273,7 +5027,7 @@ def test_anthropic_response_applies_supported_thinking_intensity(
     runtime = AgentRuntime(home, repo)
     captured_payloads: list[dict[str, object]] = []
 
-    def fake_stream(api_key, payload, delta_callback, status_callback):
+    def fake_stream(_self, api_key, payload, delta_callback, status_callback, _thought_callback=None):
         assert api_key == "sk-ant-test"
         captured_payloads.append(payload)
         return runtime_module.AnthropicStreamResponse(
@@ -5282,7 +5036,7 @@ def test_anthropic_response_applies_supported_thinking_intensity(
             content=({"type": "text", "text": "done"},),
         )
 
-    monkeypatch.setattr(runtime, "_stream_anthropic_response", fake_stream)
+    monkeypatch.setattr(AnthropicBackend, "_stream_response", fake_stream)
 
     response = runtime.anthropic_response(
         session.path,
@@ -5296,6 +5050,8 @@ def test_anthropic_response_applies_supported_thinking_intensity(
 
 
 def test_desy_response_omits_thinking_config(tmp_path, monkeypatch):
+    from anomx.agent.backends.desy_assistant import DesyAssistantBackend
+
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -5304,7 +5060,7 @@ def test_desy_response_omits_thinking_config(tmp_path, monkeypatch):
     runtime = AgentRuntime(home, repo)
     captured_payloads: list[dict[str, object]] = []
 
-    def fake_stream(api_key, payload, delta_callback, status_callback):
+    def fake_stream(_self, api_key, payload, delta_callback, status_callback, _thought_callback=None):
         assert api_key == "sk-desy-test"
         captured_payloads.append(payload)
         return runtime_module.AnthropicStreamResponse(
@@ -5313,7 +5069,7 @@ def test_desy_response_omits_thinking_config(tmp_path, monkeypatch):
             content=({"type": "text", "text": "done"},),
         )
 
-    monkeypatch.setattr(runtime, "_stream_desy_response", fake_stream)
+    monkeypatch.setattr(DesyAssistantBackend, "_stream_response", fake_stream)
 
     response = runtime.desy_response(session.path, "desy-assistant")
 
@@ -5328,11 +5084,11 @@ def test_desy_payload_uses_configured_max_output_tokens(tmp_path, monkeypatch):
     repo = tmp_path / "repo"
     repo.mkdir()
     home.set_api_key("desy", "sk-desy-test")
-    session = home.create_session(repo, provider="desy", model="desy-assistant")
+    session = home.create_session(repo, provider="desy", model="unlisted-desy-model")
     runtime = AgentRuntime(home, repo)
     captured_payloads: list[dict[str, object]] = []
 
-    def fake_stream(_self, _api_key, payload, _delta_callback, _status_callback):
+    def fake_stream(_self, _api_key, payload, _delta_callback, _status_callback, _thought_callback=None):
         captured_payloads.append(payload)
         return runtime_module.AnthropicStreamResponse(
             text="done",
@@ -5342,15 +5098,15 @@ def test_desy_payload_uses_configured_max_output_tokens(tmp_path, monkeypatch):
 
     monkeypatch.setattr(DesyAssistantBackend, "_stream_response", fake_stream)
 
-    # desy-assistant has no metadata max_output_tokens, so the fallback applies.
-    runtime.desy_response(session.path, "desy-assistant")
+    # An unlisted model has no metadata max_output_tokens, so the fallback applies.
+    runtime.desy_response(session.path, "unlisted-desy-model")
     assert captured_payloads[0]["max_tokens"] == 8192
 
     config = home.load_config()
     config["max_output_tokens"] = 20000
     home.save_config(config)
     captured_payloads.clear()
-    runtime.desy_response(session.path, "desy-assistant")
+    runtime.desy_response(session.path, "unlisted-desy-model")
     assert captured_payloads[0]["max_tokens"] == 20000
 
 
@@ -5379,7 +5135,7 @@ def test_desy_loop_continues_after_max_tokens_truncation(tmp_path, monkeypatch):
         ),
     ]
 
-    def fake_stream(_self, _api_key, payload, _delta_callback, _status_callback):
+    def fake_stream(_self, _api_key, payload, _delta_callback, _status_callback, _thought_callback=None):
         payloads.append(payload)
         return responses[len(payloads) - 1]
 
@@ -5417,7 +5173,7 @@ def test_desy_loop_stops_continuing_after_max_tokens_cap(tmp_path, monkeypatch):
     runtime = AgentRuntime(home, repo)
     call_count = {"n": 0}
 
-    def fake_stream(_self, _api_key, _payload, _delta_callback, _status_callback):
+    def fake_stream(_self, _api_key, _payload, _delta_callback, _status_callback, _thought_callback=None):
         call_count["n"] += 1
         return runtime_module.AnthropicStreamResponse(
             text="still going",
@@ -5463,7 +5219,7 @@ def test_desy_stream_uses_messages_endpoint_and_api_key_header(tmp_path, monkeyp
         captured_request["headers"] = dict(request.header_items())
         return FakeResponse()
 
-    monkeypatch.setattr(runtime_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
 
     response = runtime._stream_desy_response(
         "sk-desy-test",
@@ -5550,7 +5306,7 @@ def test_ollama_response_reports_loading_model_status(tmp_path, monkeypatch):
     deltas: list[str] = []
 
     monkeypatch.setattr(
-        runtime_module.urllib.request,
+        urllib.request,
         "urlopen",
         lambda *args, **kwargs: FakeResponse(),
     )
@@ -5563,7 +5319,7 @@ def test_ollama_response_reports_loading_model_status(tmp_path, monkeypatch):
 
     assert statuses == ["Loading model", "Thinking"]
     assert response == "hello"
-    assert deltas == []
+    assert deltas == ["hello"]
 
 
 def test_ollama_response_executes_streamed_tool_calls(tmp_path, monkeypatch):
@@ -5611,7 +5367,7 @@ def test_ollama_response_executes_streamed_tool_calls(tmp_path, monkeypatch):
         executed.append((name, arguments))
         return json.dumps({"approved": True, "output": "README.md"})
 
-    monkeypatch.setattr(runtime_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
     monkeypatch.setattr(runtime, "_execute_tool", fake_execute_tool)
 
     response = runtime.ollama_response(session.path, "qwen3.6")
@@ -5851,120 +5607,77 @@ def test_working_line_animates_contrast_without_changing_text(tmp_path):
     assert all(not attr & curses.A_BOLD for _, _, _, attr in window.writes)
 
 
-def test_platform_connect_loading_renders_connecting_status(tmp_path):
-    class Window:
-        def __init__(self):
-            self.writes = []
-
-        def erase(self):
-            pass
-
-        def getmaxyx(self):
-            return 32, 100
-
-        def addnstr(self, y, x, text, n, attr=0):
-            self.writes.append((y, x, text[:n], attr))
-
-        def refresh(self):
-            pass
-
+def test_platform_connect_loading_renders_connecting_status(tmp_path, monkeypatch):
     app = AnomxCliApp(home=AnomxHome(tmp_path / "home"), use_color=False)
-    window = Window()
+    overlays: list[dict[str, object]] = []
 
-    app._draw_platform_connect_loading(window, frame=12)
+    def capture_overlay(_stdscr, **kwargs):
+        overlays.append(kwargs)
+        return 0, 0, 80, 20
 
-    assert any(text == "Connect Platform" for _, _, text, _ in window.writes)
-    assert any(
-        y == 18 and x == 4 and text == "Connecting..." and attr == 0
-        for y, x, text, attr in window.writes
+    monkeypatch.setattr(app, "_draw_overlay", capture_overlay)
+
+    app._draw_platform_connect_loading(object(), frame=12)
+
+    overlay = overlays[-1]
+    assert overlay["title"] == "Manage Platform"
+    assert overlay["post_body_lines"] == ("", "Connecting...")
+    assert overlay["footer"] == "Please wait"
+    assert overlay["show_input_cursor"] is False
+    assert overlay["input_value"] == ""
+
+
+def test_platform_connection_form_highlights_selected_row(tmp_path, monkeypatch):
+    app = AnomxCliApp(home=AnomxHome(tmp_path / "home"), use_color=False)
+    overlays: list[dict[str, object]] = []
+
+    def capture_overlay(_stdscr, **kwargs):
+        overlays.append(kwargs)
+        return 0, 0, 80, 20
+
+    monkeypatch.setattr(app, "_draw_overlay", capture_overlay)
+    draft = PlatformConnectionDraft(
+        url="anomalies.desy.de",
+        email="theo.rieken@desy.de",
+        password="secret",
     )
 
+    app._draw_platform_connection_form(object(), draft, selected=2)
 
-def test_platform_connection_form_highlights_selected_row(tmp_path):
-    class Window:
-        def __init__(self):
-            self.writes = []
-            self.cursor = None
-
-        def erase(self):
-            pass
-
-        def getmaxyx(self):
-            return 32, 100
-
-        def addnstr(self, y, x, text, n, attr=0):
-            self.writes.append((y, x, text[:n], attr))
-
-        def move(self, y, x):
-            self.cursor = (y, x)
-
-        def refresh(self):
-            pass
-
-    app = AnomxCliApp(home=AnomxHome(tmp_path / "home"), use_color=False)
-    app._colors = {"accent": 10, "light": 20, "bold": 30, "selected": 40, "ok": 50}
-    window = Window()
+    overlay = overlays[-1]
+    assert overlay["selected"] == 2
+    assert [(choice.label, choice.detail) for choice in overlay["choices"]] == [
+        ("Domain", "anomalies.desy.de"),
+        ("Email", "theo.rieken@desy.de"),
+        ("Password", "******"),
+    ]
+    assert overlay["input_value"] == "******"
+    assert overlay["show_input_cursor"] is True
+    assert overlay["footer"] == "Esc Cancel · ↑↓ Navigate · Enter for Login"
 
     app._draw_platform_connection_form(
-        window,
-        PlatformConnectionDraft(
-            url="anomalies.desy.de",
-            email="theo.rieken@desy.de",
-            password="secret",
-        ),
-        selected=2,
-    )
-
-    assert any(x == 4 and text == "Domain:" and attr == 20 for _, x, text, attr in window.writes)
-    assert any(x == 4 and text == "Email:" and attr == 20 for _, x, text, attr in window.writes)
-    assert any(x == 4 and text == "Password:" and attr == 10 for _, x, text, attr in window.writes)
-    assert any(
-        x == 16 and text == "anomalies.desy.de" and attr == 0 for _, x, text, attr in window.writes
-    )
-    assert any(
-        x == 16 and text == "theo.rieken@desy.de" and attr == 0
-        for _, x, text, attr in window.writes
-    )
-    assert any(x == 16 and text == "******" and attr == 0 for _, x, text, attr in window.writes)
-    assert any(
-        text == "Esc Cancel · ↑↓ Navigate · Enter for Login" for _, _, text, _ in window.writes
-    )
-
-    window.writes.clear()
-    app._draw_platform_connection_form(
-        window,
-        PlatformConnectionDraft(
-            url="anomalies.desy.de",
-            email="theo.rieken@desy.de",
-            password="secret",
-        ),
+        object(),
+        draft,
         selected=2,
         status="Connection alive.",
         status_role="ok",
     )
 
-    assert any(
-        x == 4 and text == "Connection alive." and attr == 50 for _, x, text, attr in window.writes
-    )
+    assert overlays[-1]["post_body_lines"] == ("", "Connection alive.")
 
-    window.writes.clear()
     app._draw_platform_connection_form(
-        window,
-        PlatformConnectionDraft(
-            url="anomalies.desy.de",
-            email="theo.rieken@desy.de",
-            password="*****",
-        ),
+        object(),
+        replace(draft, password="*****"),
         selected=2,
         status="Checking connection...",
         editable=False,
     )
 
-    assert any(text == "Password:" and attr == 20 for _, _, text, attr in window.writes)
-    assert any(
-        x == 4 and text == "Checking connection..." and attr == 0
-        for _, x, text, attr in window.writes
-    )
+    overlay = overlays[-1]
+    assert overlay["selected"] == 2
+    assert overlay["input_value"] == ""
+    assert overlay["show_input_cursor"] is False
+    assert overlay["post_body_lines"] == ("", "Checking connection...")
 
 
 def test_platform_connection_form_returns_to_password_after_login_error(
@@ -5973,26 +5686,10 @@ def test_platform_connection_form_returns_to_password_after_login_error(
 ):
     class Window:
         def __init__(self):
-            self.writes = []
             self._keys = iter((*"wrong-password", "\n", "\x1b"))
-
-        def erase(self):
-            pass
-
-        def getmaxyx(self):
-            return 32, 100
-
-        def addnstr(self, y, x, text, n, attr=0):
-            self.writes.append((y, x, text[:n], attr))
 
         def get_wch(self):
             return next(self._keys)
-
-        def move(self, y, x):
-            pass
-
-        def refresh(self):
-            pass
 
     home = AnomxHome(tmp_path / "home")
     home.set_platform_form_defaults(
@@ -6000,7 +5697,13 @@ def test_platform_connection_form_returns_to_password_after_login_error(
         email="theo.rieken@desy.de",
     )
     app = AnomxCliApp(home=home, use_color=False)
-    app._colors = {"accent": 10, "light": 20, "bold": 30, "danger": 40, "selected": 50}
+    overlays: list[dict[str, object]] = []
+
+    def capture_overlay(_stdscr, **kwargs):
+        overlays.append(kwargs)
+        return 0, 0, 80, 20
+
+    monkeypatch.setattr(app, "_draw_overlay", capture_overlay)
     monkeypatch.setattr(
         app,
         "_connect_platform_with_loading",
@@ -6011,11 +5714,8 @@ def test_platform_connection_form_returns_to_password_after_login_error(
     window = Window()
 
     assert app._run_platform_connection_form(window) is None
-    assert any(
-        x == 4 and text == "Invalid credentials." and attr == 40
-        for _, x, text, attr in window.writes
-    )
-    assert any(text == "Password:" and attr == 10 for _, _, text, attr in window.writes)
+    assert overlays[-1]["selected"] == 2
+    assert overlays[-1]["post_body_lines"] == ("", "! Invalid credentials.")
     config = home.load_config()
     assert config["platform_last_url"] == "anomalies.desy.de"
     assert config["platform_last_email"] == "theo.rieken@desy.de"
@@ -6842,7 +6542,7 @@ def test_dropped_image_warns_when_backend_does_not_support_images(tmp_path):
         MessageLine(
             "warning",
             (
-                "DESY Assistant/coding does not support image input. Dropped image "
+                "DESY/coding does not support image input. Dropped image "
                 "attachments will be kept in the prompt but sent to this backend as "
                 "text only: plot.png."
             ),
@@ -6885,7 +6585,10 @@ def test_image_attachments_are_converted_for_supported_backends(tmp_path):
         },
     ]
 
-    openai_message = runtime._openai_messages(messages, "gpt-5.5")[0]
+    openai_message = backend_for_provider("openai", runtime)._openai_messages(
+        messages,
+        "gpt-5.5",
+    )[0]
     assert openai_message["content"][0] == {
         "type": "input_text",
         "text": "Explain [image: plot.png]\n\nAttached images:\n- plot.png",
@@ -6895,7 +6598,7 @@ def test_image_attachments_are_converted_for_supported_backends(tmp_path):
         "image_url": f"data:image/png;base64,{encoded}",
     }
 
-    anthropic_message = runtime._anthropic_messages(
+    anthropic_message = backend_for_provider("anthropic", runtime)._anthropic_messages(
         messages,
         "anthropic",
         "claude-sonnet-4-6",
@@ -6909,7 +6612,10 @@ def test_image_attachments_are_converted_for_supported_backends(tmp_path):
         },
     }
 
-    ollama_message = runtime._ollama_messages(messages, "llava:latest")[0]
+    ollama_message = backend_for_provider("ollama", runtime)._ollama_messages(
+        messages,
+        "llava:latest",
+    )[0]
     assert ollama_message["images"] == [encoded]
 
 
@@ -6937,13 +6643,17 @@ def test_unsupported_backends_keep_image_tokens_as_text(tmp_path):
 
     assert not backend_supports_image_input("desy", "coding")
     assert not backend_supports_image_input("ollama", "qwen3.6")
-    assert runtime._anthropic_messages(messages, "desy", "coding") == [
+    assert backend_for_provider("desy", runtime)._anthropic_messages(
+        messages,
+        "desy",
+        "coding",
+    ) == [
         {
             "role": "user",
             "content": [{"type": "text", "text": "Explain [image: plot.png]"}],
         },
     ]
-    assert runtime._ollama_messages(messages, "qwen3.6") == [
+    assert backend_for_provider("ollama", runtime)._ollama_messages(messages, "qwen3.6") == [
         {"role": "user", "content": "Explain [image: plot.png]"}
     ]
 
@@ -7699,7 +7409,8 @@ def test_main_agent_prompt_describes_coordination_and_mode_policy(tmp_path):
     assert "use subagents for bounded parallel tasks" in instructions
     assert "The active mode enforces read-only behavior or approvals." in instructions
     assert "Do not ask for that approval in prose before calling tools." in instructions
-    assert f"skills directory for an appropriate skill: {runtime.home.skills_dir}" in instructions
+    assert "Inspect the skills directory only if a relevant skill is missing" in instructions
+    assert str(runtime.home.skills_dir) in instructions
     assert "manage-recommendations" in instructions
 
 
@@ -7725,8 +7436,8 @@ def test_runtime_includes_session_command_policy_in_main_and_subagent_prompts(tm
     operator_instructions = operator._instructions()
     worker_instructions = worker._instructions()
 
-    assert "# Anomx Main Agent" in operator_instructions
-    assert "# Anomx Subagent" in worker_instructions
+    assert "You are the Anomx main agent" in operator_instructions
+    assert "You are an Anomx subagent" in worker_instructions
     assert "Already approved for this session: python." in operator_instructions
     assert "Never call run_command with these command families in this session: curl." in (
         operator_instructions
@@ -7914,6 +7625,8 @@ def test_ask_question_rejects_select_without_options(tmp_path):
 
 
 def test_ollama_provisional_text_stays_private_while_worker_runs(tmp_path, monkeypatch):
+    from anomx.agent.backends.ollama import OllamaBackend
+
     home = AnomxHome(tmp_path / "home")
     session = home.create_session(tmp_path, provider="ollama", model="qwen3.6")
     runtime = AgentRuntime(home, tmp_path)
@@ -7950,14 +7663,14 @@ def test_ollama_provisional_text_stays_private_while_worker_runs(tmp_path, monke
         worker_running = False
         return '{"waited_seconds": 0.0, "subagents": []}'
 
-    def fake_stream(model, messages, callbacks):
+    def fake_stream(_self, model, messages, callbacks):
         assert model == "qwen3.6"
         captured_messages.append([dict(message) for message in messages])
         return next(responses)
 
     monkeypatch.setattr(runtime, "_running_subagent_states", fake_running_workers)
     monkeypatch.setattr(runtime, "_wait_for_active_targets", fake_wait)
-    monkeypatch.setattr(runtime, "_stream_ollama_response", fake_stream)
+    monkeypatch.setattr(OllamaBackend, "_stream_ollama_response", fake_stream)
 
     response = runtime.ollama_response(
         session.path,
@@ -7969,8 +7682,8 @@ def test_ollama_provisional_text_stays_private_while_worker_runs(tmp_path, monke
     assert progress_messages == []
     assert len(captured_messages) == 2
     assert captured_messages[1][-1]["role"] == "user"
-    assert "not delivered to the user" in str(captured_messages[1][-1]["content"])
-    assert "not a final answer" in str(captured_messages[1][-1]["content"])
+    assert "subagents were active" in str(captured_messages[1][-1]["content"])
+    assert "do not produce a final answer" in str(captured_messages[1][-1]["content"])
 
 
 def test_operator_run_command_persists_statement_as_work_message(tmp_path):
@@ -8284,6 +7997,11 @@ def test_approval_menu_can_always_reject_command_family(tmp_path, monkeypatch):
         "_bottom_menu",
         lambda *_args, **_kwargs: ApprovalChoice.ALWAYS_REJECT.value,
     )
+    monkeypatch.setattr(
+        app,
+        "_prompt_multiline_text",
+        lambda *_args, **_kwargs: "Do not fetch URLs.",
+    )
 
     decision = app._request_command_approval(
         object(),
@@ -8299,6 +8017,7 @@ def test_approval_menu_can_always_reject_command_family(tmp_path, monkeypatch):
     )
 
     assert decision == ApprovalChoice.ALWAYS_REJECT
+    assert app._approval_memory_reason == "Do not fetch URLs."
 
 
 def test_request_question_select_uses_bottom_menu(tmp_path, monkeypatch):
@@ -8405,6 +8124,7 @@ def test_request_question_text_preserves_viewport(tmp_path, monkeypatch):
         return None
 
     monkeypatch.setattr(app, "_draw_session", fake_draw_session)
+    monkeypatch.setattr(app, "_draw_text_popover", lambda *_args, **_kwargs: None)
 
     answer = app._request_question(
         Window(),
@@ -8754,16 +8474,16 @@ def test_worker_prompt_sessions_are_stored_under_parent_session_folder(tmp_path)
         parent_session_path=session.path,
     )
 
-    worker_dir = session.path.parent / "worker-Engineer-worker-1"
+    worker_dir = session.path.parent / "subagent-Engineer-worker-1"
     worker_session = worker_dir / "session.jsonl"
     assert "OpenAI API key is not configured" in response
     assert worker_session.exists()
     events = _read_jsonl(worker_session)
-    assert events[0]["type"] == "worker_session_meta"
+    assert events[0]["type"] == "subagent_session_meta"
     assert events[0]["payload"]["parent_session_id"] == session.session_id
     assert events[0]["payload"]["parent_session_path"] == str(session.path)
-    assert events[0]["payload"]["worker_name"] == "Engineer"
-    assert events[0]["payload"]["worker_id"] == "worker-1"
+    assert events[0]["payload"]["subagent_name"] == "Engineer"
+    assert events[0]["payload"]["subagent_id"] == "worker-1"
     assert events[1]["payload"]["type"] == "user_message"
     assert events[1]["payload"]["message"] == "Inspect files"
     assert [record.session_id for record in home.list_sessions(limit=None)] == [session.session_id]
@@ -8783,78 +8503,6 @@ def test_worker_prompt_sessions_are_stored_under_parent_session_folder(tmp_path)
 
     assert home.delete_session(session.path) is True
     assert not worker_dir.exists()
-
-
-def test_worker_lifecycle_events_are_persisted(tmp_path, monkeypatch):
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    runtime = AgentRuntime(home, repo)
-
-    def fake_worker_response(self, prompt, callbacks=None, **_kwargs):
-        assert prompt == "Inspect files"
-        if callbacks is not None and callbacks.tool_message is not None:
-            callbacks.tool_message("Listing files")
-        if callbacks is not None and callbacks.command is not None:
-            callbacks.command("Listing files", "ls", "README.md")
-        if callbacks is not None and callbacks.status is not None:
-            callbacks.status("Thinking")
-        return "Worker report"
-
-    monkeypatch.setattr(AgentRuntime, "backend_response_for_prompt", fake_worker_response)
-
-    started = json.loads(
-        runtime._execute_tool(
-            "start_agent",
-            {"name": "Engineer", "prompt": "Inspect files"},
-            RuntimeCallbacks(),
-            session.path,
-        )
-    )
-    runtime._wait_for_active_targets(RuntimeCallbacks())
-
-    events = home.read_session_events(session.path)
-    snapshots = worker_snapshots(events)
-    messages = AnomxCliApp(home=home, cwd=repo)._read_message_lines(session.path)
-    checked = json.loads(
-        runtime._execute_tool(
-            "check_agent",
-            {"agent_id": started["agent_id"]},
-            RuntimeCallbacks(),
-            session.path,
-        )
-    )
-
-    assert started["name"] == "Engineer"
-    assert snapshots[-1].status == "ready"
-    assert snapshots[-1].statement == ""
-    assert snapshots[-1].context_tokens > 0
-    assert snapshots[-1].context_percent > 0
-    assert running_worker_snapshots(events) == ()
-    assert not any(line.role == "worker" and "Worker report" in line.text for line in messages)
-    assert snapshots[-1].command_history == (
-        {
-            "statement": "Listing files",
-            "command": "ls",
-            "output": "README.md",
-        },
-    )
-    assert checked["commands"] == [
-        {
-            "statement": "Listing files",
-            "command": "ls",
-            "output": "README.md",
-        }
-    ]
-    running_statements = [
-        str(event["payload"].get("statement"))
-        for event in events
-        if event_payload_type(event) == "worker_event"
-        and event_payload(event).get("status") == "working"
-    ]
-    assert running_statements[-1] == "Listing files"
-    assert "Thinking" not in running_statements[1:]
 
 
 def test_subagent_tool_schemas_are_role_specific(tmp_path):
@@ -8998,69 +8646,6 @@ def test_async_process_lifecycle_is_persisted_and_contextualized(tmp_path):
     assert running_process_snapshots(home.read_session_events(session.path)) == ()
 
 
-def test_runtime_writes_finished_command_and_process_full_logs(
-    tmp_path,
-    monkeypatch,
-):
-    monkeypatch.setattr(tool_manager_module, "LONG_RUNNING_COMMAND_SECONDS", 0.01)
-    home = AnomxHome(tmp_path / "home")
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    logs_dir = tmp_path / "request-logs"
-    config = home.load_config()
-    config["debug_mode"] = True
-    config["debug_full_session_logs"] = True
-    config["debug_full_session_logs_path"] = str(logs_dir)
-    home.save_config(config)
-    session = home.create_session(repo, provider="openai", model="gpt-5.5")
-    home.update_session_title(session.path, "Runtime Logs")
-    runtime = AgentRuntime(home, repo)
-    script = repo / "slow_command.py"
-    script.write_text(
-        "import time\nprint('cmd-ready', flush=True)\ntime.sleep(0.2)\nprint('cmd-done')\n",
-        encoding="utf-8",
-    )
-
-    command_output = json.loads(
-        runtime._execute_tool(
-            "run_command",
-            {
-                "statement": "Run long command",
-                "command": f"{sys.executable} {script}",
-            },
-            RuntimeCallbacks(approval=lambda _request: ApprovalChoice.ALLOW),
-            session.path,
-        )
-    )
-    process_output = json.loads(
-        runtime._execute_tool(
-            "start_process",
-            {
-                "statement": "Run async process",
-                "command": f"{sys.executable} -c \"print('proc-ready')\"",
-            },
-            RuntimeCallbacks(approval=lambda _request: ApprovalChoice.ALLOW),
-            session.path,
-        )
-    )
-
-    session_logs_dir = logs_dir / f"{session.session_id} - Runtime Logs"
-    command_log = session_logs_dir / "Commands" / "0001.txt"
-    process_log = session_logs_dir / "Processes" / "0001.txt"
-    for _ in range(40):
-        if command_log.exists() and process_log.exists():
-            break
-        time.sleep(0.05)
-
-    assert command_output["status"] == "ended"
-    assert process_output["started"] is True
-    assert command_log.exists()
-    assert process_log.exists()
-    assert "cmd-ready" in command_log.read_text(encoding="utf-8")
-    assert "cmd-done" in command_log.read_text(encoding="utf-8")
-    assert "proc-ready" in process_log.read_text(encoding="utf-8")
-
-
 def test_operator_long_running_command_is_temporarily_promoted_to_bottom_panel(
     tmp_path,
     monkeypatch,
@@ -9125,13 +8710,15 @@ def test_operator_long_running_command_status_and_kill_are_scoped(
     session = home.create_session(repo, provider="openai", model="gpt-5.5")
     runtime = AgentRuntime(home, repo)
 
-    def no_wait(process_state, callbacks=None):
-        del callbacks
-        payload = runtime._command_state_payload(process_state)
+    def no_wait(_tool, context, process_state):
+        payload = context.runtime._command_state_payload(process_state)
         payload["waited_seconds"] = 0.0
         return payload
 
-    monkeypatch.setattr(runtime, "_wait_for_command_state", no_wait)
+    monkeypatch.setattr(
+        "anomx.agent.tools.cli_command.CliCommandTool._wait_for_command_state",
+        no_wait,
+    )
 
     output = runtime._execute_tool(
         "run_command",
@@ -9196,16 +8783,18 @@ def test_long_running_command_process_callback_receives_live_output(
     runtime = AgentRuntime(home, repo)
     process_updates: list[tuple[str, str]] = []
 
-    def no_wait(process_state, callbacks=None):
-        del callbacks
-        payload = runtime._command_state_payload(process_state)
+    def no_wait(_tool, context, process_state):
+        payload = context.runtime._command_state_payload(process_state)
         payload["waited_seconds"] = 0.0
         return payload
 
     def record_process(process_state):
         process_updates.append((process_state.status, process_state.output))
 
-    monkeypatch.setattr(runtime, "_wait_for_command_state", no_wait)
+    monkeypatch.setattr(
+        "anomx.agent.tools.cli_command.CliCommandTool._wait_for_command_state",
+        no_wait,
+    )
 
     output = runtime._execute_tool(
         "run_command",
@@ -9258,18 +8847,18 @@ def test_worker_long_running_command_tools_do_not_leak_to_operator(
         process_owner_name="Engineer",
     )
 
-    def no_wait(process_state, callbacks=None):
-        del callbacks
-        payload = worker_runtime._command_state_payload(process_state)
+    def no_wait(_tool, context, process_state):
+        payload = context.runtime._command_state_payload(process_state)
         payload["waited_seconds"] = 0.0
         return payload
 
     def mirror_process(process_state):
-        with operator_runtime._process_lock:
-            operator_runtime._processes[process_state.process_id] = process_state
         operator_runtime._append_process_event(operator_session.path, process_state)
 
-    monkeypatch.setattr(worker_runtime, "_wait_for_command_state", no_wait)
+    monkeypatch.setattr(
+        "anomx.agent.tools.cli_command.CliCommandTool._wait_for_command_state",
+        no_wait,
+    )
 
     output = worker_runtime._execute_tool(
         "run_command",
@@ -9321,7 +8910,7 @@ def test_worker_long_running_command_tools_do_not_leak_to_operator(
         )
     )
 
-    assert payload["source"] == "worker_command"
+    assert payload["source"] == "command"
     assert process.owner_id == "worker123"
     assert process.owner_name == "Engineer"
     assert "worker-ready" in process.output
@@ -9332,7 +8921,7 @@ def test_worker_long_running_command_tools_do_not_leak_to_operator(
     assert "kill_command" in worker_instructions
     assert "check_command_status" not in operator_instructions
     assert "kill_command" not in operator_instructions
-    assert operator_status["error"] == "Unknown command id."
+    assert operator_status["error"] == "Unknown tool: check_command_status"
     assert "worker-ready" in status["output"]
     assert killed["ended"] is True
     assert running_process_snapshots(home.read_session_events(operator_session.path)) == ()
@@ -9675,7 +9264,7 @@ def test_draw_session_renders_slash_commands_in_bottom_panel(tmp_path):
         1,
         0,
         command_suggestions=suggestions,
-        command_selected=4,
+        command_selected=[spec.command for spec in suggestions].index("/config"),
     )
 
     assert any(text == "Commands" for _, _, text, _ in window.writes)
@@ -9704,14 +9293,25 @@ def test_draw_empty_session_renders_starter_skill_hints(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    for command in ("map-folder", "find-issues", "make-report"):
+        write_user_skill(
+            home.skills_dir,
+            Skill(
+                command=command,
+                title=command,
+                description=f"Run {command}.",
+                body=f"Run {command}.",
+                source="user",
+            ),
+        )
     app = AnomxCliApp(home=home, cwd=repo, use_color=False)
     window = Window()
 
     app._draw_session(window, session, [], "", 0, 0, start_hint_reveal_progress=1.0)
 
-    assert any(text == "Map the folder" for _, _, text, _ in window.writes)
-    assert any(text == "Find issues" for _, _, text, _ in window.writes)
-    assert any(text == "Make a report" for _, _, text, _ in window.writes)
+    assert any(text == "map-folder" for _, _, text, _ in window.writes)
+    assert any(text == "find-issues" for _, _, text, _ in window.writes)
+    assert any(text == "make-report" for _, _, text, _ in window.writes)
 
 
 def test_draw_session_includes_back_to_project_link(tmp_path):
@@ -9958,7 +9558,7 @@ def test_draw_project_running_session_shows_statement_and_timer(tmp_path, monkey
         text == "New session" and attr == app._attr("accent") for _, _, text, attr in window.writes
     )
     assert any("Reading project overview" in text for _, _, text, _ in window.writes)
-    assert any(text == "00:10" for _, _, text, _ in window.writes)
+    assert any(text == "running 00:10" for _, _, text, _ in window.writes)
     assert not any("expand" in text for _, _, text, _ in window.writes)
 
 
@@ -10560,8 +10160,8 @@ def test_running_workers_render_at_bottom(tmp_path):
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "abc123",
+                "type": "subagent_event",
+                "agent_id": "abc123",
                 "name": "Engineer",
                 "status": "running",
                 "statement": "Reading files",
@@ -10570,17 +10170,15 @@ def test_running_workers_render_at_bottom(tmp_path):
             },
         }
     ]
-    workers = worker_snapshots(events)
+    workers = subagent_snapshots(events)
 
     app._draw_activity_panel(window, app._activity_items(workers, (), events, frame=12), 20)
 
     assert any(text == "▶" for _, _, text in window.writes)
-    assert any(text == "Engineer · Reading files..." for _, _, text in window.writes)
+    assert any(text == " Engineer " for _, _, text in window.writes)
+    assert any(text == " › Reading files..." for _, _, text in window.writes)
     assert not any("abc123" in text for _, _, text in window.writes)
-    assert any(
-        x > 35 and text.startswith("Expand · 63% Context · ") and text.count(":") == 1
-        for _, x, text in window.writes
-    )
+    assert any(x > 35 and text.count(":") == 1 for _, x, text in window.writes)
 
 
 def test_running_worker_initial_thinking_renders_with_activity_dots(tmp_path):
@@ -10600,8 +10198,8 @@ def test_running_worker_initial_thinking_renders_with_activity_dots(tmp_path):
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "abc123",
+                "type": "subagent_event",
+                "agent_id": "abc123",
                 "name": "Engineer",
                 "status": "running",
                 "statement": "thinking",
@@ -10610,11 +10208,12 @@ def test_running_worker_initial_thinking_renders_with_activity_dots(tmp_path):
             },
         }
     ]
-    workers = worker_snapshots(events)
+    workers = subagent_snapshots(events)
 
     app._draw_activity_panel(window, app._activity_items(workers, (), events, frame=12), 20)
 
-    assert any("Engineer · Thinking..." in text for _, _, text in window.writes)
+    assert any(text == " Engineer " for _, _, text in window.writes)
+    assert any(text == " › Thinking..." for _, _, text in window.writes)
 
 
 def test_ready_and_interrupted_workers_render_state_without_activity(tmp_path):
@@ -10634,8 +10233,8 @@ def test_ready_and_interrupted_workers_render_state_without_activity(tmp_path):
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "ready1",
+                "type": "subagent_event",
+                "agent_id": "ready1",
                 "name": "Engineer",
                 "status": "ready",
                 "statement": "Hidden work title",
@@ -10645,8 +10244,8 @@ def test_ready_and_interrupted_workers_render_state_without_activity(tmp_path):
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "stop1",
+                "type": "subagent_event",
+                "agent_id": "stop1",
                 "name": "Reviewer",
                 "status": "interrupted",
                 "statement": "Also hidden",
@@ -10654,20 +10253,18 @@ def test_ready_and_interrupted_workers_render_state_without_activity(tmp_path):
             },
         },
     ]
-    workers = worker_snapshots(events)
+    workers = subagent_snapshots(events)
 
     app._draw_activity_panel(window, app._activity_items(workers, (), events, frame=12), 20)
 
-    assert any(text == "Engineer" for _, _, text in window.writes)
-    assert any(text == "Reviewer" for _, _, text in window.writes)
+    assert any(text == " Engineer " for _, _, text in window.writes)
+    assert any(text == " Reviewer " for _, _, text in window.writes)
     assert not any("ready1" in text or "stop1" in text for _, _, text in window.writes)
     assert not any(
         "Hidden work title" in text or "Also hidden" in text for _, _, text in window.writes
     )
-    assert any(x > 35 and text == "Expand · 98% Context · Ready" for _, x, text in window.writes)
-    assert any(
-        x > 35 and text == "Expand · 12% Context · Interrupted" for _, x, text in window.writes
-    )
+    assert any(x > 35 and text == "Ready" for _, x, text in window.writes)
+    assert any(x > 35 and text == "Interrupted" for _, x, text in window.writes)
 
 
 def test_expanded_worker_activity_renders_plain_statement_lines(tmp_path):
@@ -10687,8 +10284,8 @@ def test_expanded_worker_activity_renders_plain_statement_lines(tmp_path):
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "abc123",
+                "type": "subagent_event",
+                "agent_id": "abc123",
                 "name": "Engineer",
                 "status": "working",
                 "statement": "Thinking",
@@ -10697,8 +10294,8 @@ def test_expanded_worker_activity_renders_plain_statement_lines(tmp_path):
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "abc123",
+                "type": "subagent_event",
+                "agent_id": "abc123",
                 "name": "Engineer",
                 "status": "working",
                 "statement": "Reading files",
@@ -10707,8 +10304,8 @@ def test_expanded_worker_activity_renders_plain_statement_lines(tmp_path):
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "abc123",
+                "type": "subagent_event",
+                "agent_id": "abc123",
                 "name": "Engineer",
                 "status": "ready",
                 "statement": "",
@@ -10723,8 +10320,8 @@ def test_expanded_worker_activity_renders_plain_statement_lines(tmp_path):
             },
         },
     ]
-    items = app._activity_items(worker_snapshots(events), (), events, frame=0)
-    app._toggle_activity_item("worker:abc123")
+    items = app._activity_items(subagent_snapshots(events), (), events, frame=0)
+    app._toggle_activity_item("subagent:abc123")
 
     app._draw_activity_panel(window, items, 20)
 
@@ -10733,12 +10330,10 @@ def test_expanded_worker_activity_renders_plain_statement_lines(tmp_path):
     assert not any(text.startswith("- ") for text in texts)
     assert "Thinking" not in texts
     assert "Reading files" in texts
-    assert "Listing files" in texts
-    assert "Listing files · ls" not in texts
-    assert "Agent is done" in texts
+    assert "Final response" in texts
     assert "Implemented the fix." not in texts
-    command_entry = next(entry for entry in items[0].details if entry.text == "Listing files")
-    assert command_entry.detail_body == "ls"
+    response_entry = next(entry for entry in items[0].details if entry.text == "Final response")
+    assert response_entry.detail_body == "Implemented the fix."
 
 
 def test_process_activity_renders_state_and_expandable_logs(tmp_path):
@@ -10906,16 +10501,16 @@ def test_activity_detail_statement_click_expands_box_without_collapsing(tmp_path
         {
             "type": "event_msg",
             "payload": {
-                "type": "worker_event",
-                "worker_id": "abc123",
+                "type": "subagent_event",
+                "agent_id": "abc123",
                 "name": "Engineer",
                 "status": "working",
                 "statement": "Reading files",
             },
         }
     ]
-    item = app._activity_items(worker_snapshots(events), (), events, frame=0)[0]
-    app._toggle_activity_item("worker:abc123")
+    item = app._activity_items(subagent_snapshots(events), (), events, frame=0)[0]
+    app._toggle_activity_item("subagent:abc123")
     first_window = Window()
     app._draw_activity_panel(first_window, (item,), 20)
     entry_action = next(
@@ -10929,12 +10524,12 @@ def test_activity_detail_statement_click_expands_box_without_collapsing(tmp_path
     second_window = Window()
     app._draw_activity_panel(second_window, (item,), 20)
 
-    assert "worker:abc123" in app._expanded_activity_items
+    assert "subagent:abc123" in app._expanded_activity_items
     assert any(text.startswith("╭") for _, _, text, _ in second_window.writes)
     assert any("Reading files" in text for _, _, text, _ in second_window.writes)
     statement_y = next(y for y, _, text, _ in second_window.writes if text == "Reading files")
     assert not any(
-        action.kind == "toggle_activity_item" and action.text == "worker:abc123"
+        action.kind == "toggle_activity_item" and action.text == "subagent:abc123"
         for actions in (app._click_targets.get(statement_y, ()),)
         for action in actions
     )

@@ -527,6 +527,7 @@ class AgentRuntime:
                     "pid": process.pid,
                 },
             )
+            processes_ended += 1
         for subagent in running_subagent_snapshots(events):
             subagents_removed += 1
             self.home.append_session_event(
