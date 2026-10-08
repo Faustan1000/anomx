@@ -11,12 +11,13 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from anomx.agent.cowork.agent import CoworkRuntime
 from anomx.agent.cowork.git import FollowResult, GitError, MergeResult, find_repo_root
 from anomx.agent.cowork.margo import MargoNote, find_margo_workspace, read_margo_notes
 from anomx.agent.cowork.runner import CoworkService
 from anomx.agent.cowork.tasks import CoworkTask, TaskStatus
 from anomx.agent.runtime import RuntimeCallbacks
-from anomx.agent.store import AnomxHome
+from anomx.agent.store import AnomxHome, SessionRecord
 
 NEW = "new"
 ORPHAN = "orphan"
@@ -135,16 +136,23 @@ class CoworkWorkspace:
         base = row.task.base_branch if row.task else ""
         if row.running:
             return [CoworkAction("stop", "Stop agent")]
+        has_chat = bool(row.task and row.task.session_path)
         if row.status in {NEW, TaskStatus.QUEUED.value}:
-            return [
+            actions = [
                 CoworkAction(
                     "start",
                     "Start agent",
-                    "Works in its own branch; your files stay untouched until you merge",
-                )
+                    "Makes the change in its own branch; your files stay untouched until you merge",
+                ),
+                CoworkAction(
+                    "chat" if has_chat else "discuss",
+                    "Open chat" if has_chat else "Discuss first",
+                    "The agent only talks until you ask for a change",
+                ),
             ]
+            return actions
         changes = row.task is not None and self._changed(row)
-        actions: list[CoworkAction] = []
+        actions = [CoworkAction("chat", "Open chat", "Talk to the agent about this note")]
         if changes:
             actions.append(CoworkAction("diff", "Show changes"))
             actions.append(CoworkAction("follow", "Show in editor", "Switches your working tree"))
@@ -223,6 +231,36 @@ class CoworkWorkspace:
             thread = self._threads.get(note_id)
         if thread is not None:
             thread.join(timeout)
+
+    def open_chat(
+        self, row: CoworkRow, *, discuss: bool
+    ) -> tuple[SessionRecord | None, str | None]:
+        """Chat session of a note (created on first use) or an error text."""
+
+        if row.repo_root is None:
+            return None, "The file is not inside a git repository."
+        if self.is_running(row.note_id):
+            return None, "The agent is working; stop it or wait before opening the chat."
+        service = self._service(row.repo_root)
+        try:
+            if row.note is not None:
+                _task, record = service.open_chat(row.note, self.margo_workspace, discuss=discuss)
+                return record, None
+            task = service.tasks.get(row.note_id)
+            record = self.home.session_record(Path(task.session_path)) if task else None
+            return (record, None) if record else (None, "This task has no chat yet.")
+        except GitError as error:
+            return None, str(error)
+
+    def runtime_for_session(self, session_path: Path) -> CoworkRuntime | None:
+        """Runtime for a session that is the chat of one of our tasks, else ``None``."""
+
+        self.rows()  # makes sure the services of all notes' repositories are loaded
+        for service in list(self._services.values()):
+            note_id = service.note_for_session(session_path)
+            if note_id is not None:
+                return service.runtime_for(note_id)
+        return None
 
     def diff_lines(self, row: CoworkRow) -> list[str]:
         if row.task is None or row.repo_root is None:

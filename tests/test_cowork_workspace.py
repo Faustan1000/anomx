@@ -87,10 +87,10 @@ def test_rows_list_open_notes_and_mark_files_outside_a_repository(panel):
     assert rows["n-2"].status == "no-repo" and panel.actions(rows["n-2"]) == []
 
 
-def test_a_new_note_offers_only_start(panel):
+def test_a_new_note_offers_start_or_discussing_first(panel):
     actions = panel.actions(_row(panel, "n-1"))
 
-    assert [a.value for a in actions] == ["start"]
+    assert [a.value for a in actions] == ["start", "discuss"]
 
 
 def test_start_runs_in_the_background_and_ends_ready_with_actions(panel, monkeypatch):
@@ -113,13 +113,14 @@ def test_start_runs_in_the_background_and_ends_ready_with_actions(panel, monkeyp
     assert ready.status == "ready" and not ready.running
     assert "attribute access" in ready.detail
     assert [a.value for a in panel.actions(ready)] == [
+        "chat",
         "diff",
         "follow",
         "merge",
         "start",
         "discard",
     ]
-    assert panel.actions(ready)[2].label == "Merge into main"
+    assert panel.actions(ready)[3].label == "Merge into main"
     assert any("+    return x.a" in line for line in panel.diff_lines(ready))
 
 
@@ -128,7 +129,7 @@ def test_ready_without_changes_offers_no_merge(panel, monkeypatch):
     panel.start(_row(panel, "n-1"))
     panel.wait("n-1")
 
-    assert [a.value for a in panel.actions(_row(panel, "n-1"))] == ["start", "discard"]
+    assert [a.value for a in panel.actions(_row(panel, "n-1"))] == ["chat", "start", "discard"]
 
 
 def test_preparation_errors_are_returned_not_raised(panel, workspace):

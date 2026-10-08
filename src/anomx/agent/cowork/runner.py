@@ -216,7 +216,7 @@ class CoworkService:
             worktree,
             str(config.get("provider", "")),
             str(config.get("model", "")),
-            agent_kind=AgentKind.SUB,
+            agent_kind=AgentKind.MAIN,  # the screen shows the regular agent; the runtime differs
         )
         self.home.update_session_title(session.path, task.title or "Cowork note")
         context = note_context(worktree, _note_view(task))

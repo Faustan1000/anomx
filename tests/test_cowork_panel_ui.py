@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from anomx.agent.app import AnomxCliApp
+from anomx.agent.cowork.agent import CoworkRuntime
 from anomx.agent.runtime import AgentRuntime
 from anomx.agent.store import AnomxHome
 from anomx.agent.ui.constants import PROJECT_COMMANDS, SLASH_COMMANDS
@@ -154,8 +155,8 @@ def test_diff_viewer_shows_the_agents_change(app, workspace, fake_agent):
     screen = Screen(app)
     _start_and_finish(app, workspace)
 
-    # open note -> "Show changes" (first action) -> close viewer -> close menu
-    app._run_cowork_panel(Keys([ENTER, ENTER, ESC, ESC]))
+    # open note -> "Show changes" (second action) -> close viewer -> close menu
+    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER, ESC, ESC]))
 
     viewer = next(o for o in screen.overlays if o["title"].startswith("Changes"))
     assert "+    return x.a" in viewer["body_lines"]
@@ -166,8 +167,8 @@ def test_follow_switches_the_tree_and_back_returns(app, workspace, fake_agent):
     _start_and_finish(app, workspace)
     data = workspace / "proj" / "src" / "data.py"
 
-    # open note -> "Show in editor" (second action) -> message -> close panel
-    app._run_cowork_panel(Keys([ENTER, DOWN, ENTER, ESC]))
+    # open note -> "Show in editor" (third action) -> message -> close panel
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ESC]))
     assert "x.a" in data.read_text("utf-8")
     assert any("agent's version" in text for _title, text in screen.messages)
 
@@ -184,12 +185,12 @@ def test_merge_needs_confirmation_and_then_updates_the_branch(app, workspace, fa
     _start_and_finish(app, workspace)
     data = workspace / "proj" / "src" / "data.py"
 
-    # open note -> "Merge into main" (third action) -> confirm menu: Cancel
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, ENTER, ESC]))
+    # open note -> "Merge into main" (fourth action) -> confirm menu: Cancel
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, ENTER, ENTER, ESC]))
     assert data.read_text("utf-8") == SOURCE  # cancelled: nothing merged
 
     # open note -> Merge -> confirm "Merge into main" (second entry)
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, ENTER, DOWN, ENTER, ESC]))
+    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, ENTER, DOWN, ENTER, ESC]))
 
     assert "x.a" in data.read_text("utf-8")
     assert ("Cowork", "Merged into main.") in screen.messages
@@ -203,8 +204,8 @@ def test_discard_asks_first_and_frees_the_note(app, workspace, fake_agent):
     screen = Screen(app)
     _start_and_finish(app, workspace)
 
-    # open note -> actions: diff, follow, merge, run again, discard (index 4) -> confirm
-    app._run_cowork_panel(Keys([ENTER, DOWN, DOWN, DOWN, DOWN, ENTER, DOWN, ENTER, ESC]))
+    # open note -> actions: chat, diff, follow, merge, run again, discard (index 5) -> confirm
+    app._run_cowork_panel(Keys([ENTER, *[DOWN] * 5, ENTER, DOWN, ENTER, ESC]))
 
     app._run_cowork_panel(Keys([ESC]))
     assert screen.last_choices()[0][1] == "[new]"
@@ -218,3 +219,77 @@ def test_start_error_is_shown_instead_of_crashing(app, workspace, fake_agent):
 
     assert screen.messages and screen.messages[0][0] == "Cannot start"
     assert "uncommitted" in screen.messages[0][1]
+
+
+# -- chat per note --------------------------------------------------------------------
+
+
+def test_discuss_first_returns_the_chat_session_for_the_screen_to_switch_to(app, workspace):
+    Screen(app)
+
+    # open note -> "Discuss first" (second action)
+    record = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+
+    assert record is not None and record.title == "make dataclass"
+    panel = _panel(app, workspace)
+    task = next(row.task for row in panel.rows() if row.note_id == "n-1")
+    assert Path(record.cwd) == Path(task.worktree).resolve()
+    assert task.session_path == str(record.path)
+
+
+def test_the_slash_command_hands_the_chat_to_the_session_switcher(app):
+    Screen(app)
+
+    result = app._handle_command(Keys([ENTER, DOWN, ENTER]), "/cowork", object())
+
+    assert result is not None and result.title == "make dataclass"
+
+
+def test_only_chats_of_notes_get_the_cowork_runtime(app, workspace):
+    Screen(app)
+    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+    ordinary = app.home.create_session(workspace / "proj", "openai", "gpt-5.5")
+
+    assert isinstance(app._cowork_runtime_for(chat), CoworkRuntime)
+    assert app._cowork_runtime_for(ordinary) is None
+
+
+def test_a_chat_turn_runs_in_the_worktree_and_is_committed(app, workspace, monkeypatch):
+    Screen(app)
+    chat = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+    seen: dict[str, object] = {}
+
+    def backend_response(self, session_path, callbacks=None, **_kwargs):
+        seen["cwd"] = self.cwd
+        self._execute_tool(
+            "edit_file",
+            {"statement": "s", "path": "src/data.py", "old_text": "x['a']", "new_text": "x.a"},
+            callbacks,
+            session_path,
+        )
+        return "Done."
+
+    monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
+
+    turn = app._start_session_turn(chat)
+    turn.worker.join(10)
+
+    assert isinstance(turn.runtime, CoworkRuntime)
+    row = next(r for r in _panel(app, workspace).rows() if r.note_id == "n-1")
+    assert seen["cwd"] == Path(row.task.worktree).resolve()
+    assert row.status == "ready" and "x.a" in "\n".join(_panel(app, workspace).diff_lines(row))
+    assert (workspace / "proj" / "src" / "data.py").read_text("utf-8") == SOURCE  # user tree intact
+
+
+def test_open_chat_resumes_the_same_session_and_is_refused_while_the_agent_runs(
+    app, workspace, fake_agent
+):
+    Screen(app)
+    first = app._run_cowork_panel(Keys([ENTER, DOWN, ENTER]))
+    panel = _panel(app, workspace)
+    row = next(r for r in panel.rows() if r.note_id == "n-1")
+
+    again, problem = panel.open_chat(row, discuss=False)
+
+    assert problem is None and again is not None and again.path == first.path
+    assert [a.value for a in panel.actions(row)][:2] == ["start", "chat"]

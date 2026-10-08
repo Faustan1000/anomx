@@ -1127,8 +1127,7 @@ class AnomxCliApp(
                 )
             return None
         if command == "/cowork":
-            self._run_cowork_panel(stdscr)
-            return None
+            return self._run_cowork_panel(stdscr)
         if command == "/feedback":
             current_session = (
                 self._project_command_session(sessions, selected) or self._ephemeral_session()
@@ -2300,8 +2299,7 @@ class AnomxCliApp(
         if command == "/new":
             return self._create_session()
         if command == "/cowork":
-            self._run_cowork_panel(stdscr)
-            return None
+            return self._run_cowork_panel(stdscr)
         skill = self._skill_for_command(command)
         if skill is not None:
             return self._invoke_skill(stdscr, current_session, skill, submitted or command)
@@ -2552,6 +2550,14 @@ class AnomxCliApp(
             f"The platform returned status {result.get('status_code', 0)}.",
         )
 
+    def _cowork_runtime_for(self, session: SessionRecord) -> AgentRuntime | None:
+        """Runtime of a cowork chat (a session living in a task worktree), else ``None``."""
+
+        if (self.home.root / "cowork") not in Path(session.cwd).parents:
+            return None
+        panel = self._cowork_workspace()
+        return panel.runtime_for_session(session.path) if panel is not None else None
+
     def _start_session_turn(
         self,
         session: SessionRecord,
@@ -2568,7 +2574,9 @@ class AnomxCliApp(
         self._activate_agent(session.agent_kind)
         turn_mode = self.agent_mode
         turn_agent_kind = self.active_agent.kind
-        turn_runtime = runtime or self._new_session_runtime(turn_mode)
+        turn_runtime = (
+            runtime or self._cowork_runtime_for(session) or self._new_session_runtime(turn_mode)
+        )
         if not isinstance(turn_runtime, RuntimeProcessClient):
             turn_runtime.set_agent(turn_agent_kind)
             turn_runtime.set_mode(turn_mode)

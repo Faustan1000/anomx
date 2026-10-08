@@ -13,6 +13,7 @@ import subprocess
 from contextlib import suppress
 
 from anomx.agent.cowork import CoworkAction, CoworkRow, CoworkWorkspace
+from anomx.agent.store import SessionRecord
 from anomx.agent.ui.models import CursesWindow, MenuChoice
 
 BACK_VALUE = "__back__"
@@ -51,11 +52,13 @@ class CoworkViewMixin:
         # Reuse the object of an earlier visit so background runs keep their progress.
         return known.setdefault(found.margo_workspace, found)
 
-    def _run_cowork_panel(self, stdscr: CursesWindow) -> None:
+    def _run_cowork_panel(self, stdscr: CursesWindow) -> SessionRecord | None:
+        """Show the panel; returns the chat session to switch to when one was opened."""
+
         panel = self._cowork_workspace()
         if panel is None:
             self._message(stdscr, "Cowork", NO_MARGO_TEXT)
-            return
+            return None
 
         def refresh() -> tuple[str, tuple[MenuChoice, ...]]:
             rows = panel.rows()
@@ -79,7 +82,7 @@ class CoworkViewMixin:
             _subtitle, choices = refresh()
             if not choices:
                 self._message(stdscr, "Cowork", "There are no open notes.")
-                return
+                return None
             selected = self._run_overlay_menu(
                 stdscr,
                 "Cowork",
@@ -88,30 +91,33 @@ class CoworkViewMixin:
                 refresh=refresh,
             )
             if selected is None:
-                return
+                return None
             if selected == BACK_VALUE:
                 self._cowork_back(stdscr, panel)
                 continue
             row = next((item for item in panel.rows() if item.note_id == selected), None)
             if row is not None:
-                self._cowork_note_menu(stdscr, panel, row)
+                chat = self._cowork_note_menu(stdscr, panel, row)
+                if chat is not None:
+                    return chat
 
     def _cowork_note_menu(
         self, stdscr: CursesWindow, panel: CoworkWorkspace, row: CoworkRow
-    ) -> None:
+    ) -> SessionRecord | None:
         actions = panel.actions(row)
         subtitle = f"{row.label}\n{row.detail}".strip()
         if not actions:
             self._message(stdscr, "Cowork", f"{row.label}\n\n{row.detail or row.status}")
-            return
+            return None
         choice = self._menu(
             stdscr,
             "Cowork",
             subtitle,
             tuple(MenuChoice(item.label, item.value, item.detail) for item in actions),
         )
-        if choice is not None:
-            self._cowork_apply(stdscr, panel, row, next(a for a in actions if a.value == choice))
+        if choice is None:
+            return None
+        return self._cowork_apply(stdscr, panel, row, next(a for a in actions if a.value == choice))
 
     def _cowork_apply(
         self,
@@ -119,8 +125,13 @@ class CoworkViewMixin:
         panel: CoworkWorkspace,
         row: CoworkRow,
         action: CoworkAction,
-    ) -> None:
+    ) -> SessionRecord | None:
         message = self._message
+        if action.value in {"chat", "discuss"}:
+            record, problem = panel.open_chat(row, discuss=action.value == "discuss")
+            if problem:
+                message(stdscr, "Cannot open chat", problem)
+            return record
         if action.value == "start":
             problem = panel.start(row)
             if problem:
@@ -146,6 +157,7 @@ class CoworkViewMixin:
         elif action.value == "discard":
             if self._cowork_confirm(stdscr, "Discard this task and its branch?", "Discard"):
                 panel.discard(row)
+        return None
 
     def _cowork_merge(
         self, stdscr: CursesWindow, panel: CoworkWorkspace, row: CoworkRow
