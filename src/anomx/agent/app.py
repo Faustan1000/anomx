@@ -171,6 +171,8 @@ class AnomxCliApp(
         self.agent_mode = AgentMode.AUTOMATIC
         self.runtime = self._create_runtime(self.agent_mode)
         self._runtime_processes: list[RuntimeProcessClient] = []
+        self._next_runtime_reap = 0.0
+        self._next_stale_activity_check = 0.0
         if isinstance(self.runtime, RuntimeProcessClient):
             self._runtime_processes.append(self.runtime)
         self.state = AgentState.ONBOARDING
@@ -604,6 +606,7 @@ class AnomxCliApp(
                 exit_confirm_deadline = 0.0
                 prompt_notice = ""
             self._drain_active_session_turns(stdscr)
+            self._reap_idle_runtimes()
             sessions = self._project_sessions(project.path)
             selected = max(0, min(selected, len(sessions) - 1)) if sessions else 0
             if delete_pending_index is not None and delete_pending_index >= len(sessions):
@@ -1375,12 +1378,15 @@ class AnomxCliApp(
                 exit_confirm_deadline = 0.0
                 exit_notice = ""
             current_session = self._process_title_events(stdscr, current_session)
+            self._reap_idle_runtimes()
             active_turn = self._active_turn_for_session(current_session)
             active_turn_running = (
                 active_turn is not None
                 and active_turn.worker is not None
                 and active_turn.worker.is_alive()
             )
+            if not active_turn_running:
+                self._reconcile_stale_activity(current_session.path)
             if active_turn_running and active_turn is not None:
                 pinned_anchor = self._active_turn_anchor_line(
                     stdscr,
@@ -1418,6 +1424,8 @@ class AnomxCliApp(
                 running_notice_role = "light"
                 running_abort_key = ""
                 running_abort_deadline = 0.0
+                pinned_anchor = None
+                scroll = 0
             messages = self._read_message_lines(current_session.path)
             command_token = self._active_command_token(input_text, cursor)
             command_suggestions = (
@@ -2791,6 +2799,48 @@ class AnomxCliApp(
         if isinstance(runtime, RuntimeProcessClient):
             self._runtime_processes.append(runtime)
         return runtime
+
+    def _reconcile_stale_activity(self, session_path: Path) -> None:
+        """Mark transcript processes/subagents as ended when no runtime owns them.
+
+        A subagent whose worker died (or whose runtime was closed) without writing a
+        final event stays "running" in the transcript forever, which keeps the
+        activity animation and the "working" banner alive with nothing behind them.
+        """
+
+        now = time.monotonic()
+        if now < self._next_stale_activity_check:
+            return
+        self._next_stale_activity_check = now + 10.0
+        if not self._has_running_session_activity(session_path):
+            return
+        runtimes = [self.runtime, *self._runtime_processes]
+        if any(runtime.has_live_children() for runtime in runtimes):
+            return
+        with suppress(Exception):
+            self.runtime.cleanup_session_runtime_state(session_path)
+
+    def _reap_idle_runtimes(self) -> None:
+        """Close per-turn runtime processes that finished and hold nothing alive.
+
+        Every turn that does not use the foreground runtime gets its own child
+        process; without this they pile up until the CLI exits. A runtime is kept
+        while a turn uses it or while it still has a background process/subagent.
+        """
+
+        now = time.monotonic()
+        if now < self._next_runtime_reap:
+            return
+        self._next_runtime_reap = now + 10.0
+        in_use = {id(turn.runtime) for turn in self._active_session_turns.values()}
+        keep: list[RuntimeProcessClient] = []
+        for runtime in self._runtime_processes:
+            if runtime is self.runtime or id(runtime) in in_use or runtime.has_live_children():
+                keep.append(runtime)
+                continue
+            with suppress(Exception):
+                runtime.close()
+        self._runtime_processes = keep
 
     def _foreground_session_runtime(
         self,

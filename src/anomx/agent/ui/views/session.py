@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from anomx.agent.context_management import effective_context_limit
 from anomx.agent.helpers.state import (
@@ -52,6 +53,21 @@ from anomx.agent.ui.models import (
 
 
 class SessionViewMixin:
+    def _activity_snapshots(self, events: list[dict[str, Any]]) -> tuple[tuple, tuple]:
+        """Process/subagent snapshots for ``events``, recomputed only when they change.
+
+        ``_session_events`` returns the same list object until the transcript file
+        changes, so the O(events) replay runs once per change instead of every frame.
+        """
+
+        cached = getattr(self, "_activity_snapshot_cache", None)
+        if cached is not None and cached[0] is events and cached[1] == len(events):
+            return cached[2], cached[3]
+        processes = running_process_snapshots(events)
+        subagents = active_subagent_snapshots(events)
+        self._activity_snapshot_cache = (events, len(events), processes, subagents)
+        return processes, subagents
+
     """Conversation session view."""
 
     def _draw_continue_session_prompt(
@@ -199,8 +215,10 @@ class SessionViewMixin:
             )
         )
         plan_expanded = bool(plan_steps and session.path in self._expanded_plan_sessions)
-        processes = running_process_snapshots(session_events) if bottom_panel is None else ()
-        subagents = active_subagent_snapshots(session_events) if bottom_panel is None else ()
+        if bottom_panel is None:
+            processes, subagents = self._activity_snapshots(session_events)
+        else:
+            processes, subagents = (), ()
         working_text = self._effective_session_working_text(working_text, subagents)
         header_lines = self._session_header_lines(session, model)
         self._click_targets = {}

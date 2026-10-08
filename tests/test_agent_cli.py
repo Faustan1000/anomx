@@ -1277,6 +1277,89 @@ def test_new_turn_resets_scroll_to_follow_the_growing_reply(tmp_path, monkeypatc
     assert captured[-1] == (0, True)
 
 
+def test_turn_completion_resets_pinned_anchor_so_view_stays_at_the_bottom(
+    tmp_path, monkeypatch
+):
+    class StopCapture(Exception):
+        pass
+
+    class Viewport:
+        def __init__(self, scroll):
+            self.scroll = scroll
+
+    class Window:
+        def getmaxyx(self):
+            return 24, 80
+
+        def nodelay(self, _flag):
+            pass
+
+        def get_wch(self):
+            raise curses.error
+
+    class FakeWorker:
+        def __init__(self):
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+
+        def join(self, timeout=None):
+            del timeout
+
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    app = AnomxCliApp(home=home, cwd=repo, use_color=False)
+
+    worker = FakeWorker()
+    turn = ui_module.ActiveSessionTurn(
+        session=session,
+        runtime=app.runtime,
+        events=queue.SimpleQueue(),
+        result={"response": "Final answer"},
+        turn_id="turn-1",
+        started_at=time.monotonic(),
+        worker=worker,
+        mode=AgentMode.STANDARD,
+    )
+    app._active_session_turns[app._session_turn_key(session)] = turn
+
+    # Simulate the anchor having been pinned to the user's message while the
+    # reply was streaming (as happens mid-turn).
+    monkeypatch.setattr(app, "_active_turn_anchor_line", lambda *a, **k: 3)
+
+    captured: list[tuple[int | None, int, bool]] = []
+
+    def fake_draw_session(_stdscr, _session, _messages, _input_text, _cursor, scroll, *_a, **kwargs):
+        if "sticky_anchor" not in kwargs:
+            return Viewport(scroll)
+        running = app._active_turn_for_session(session) is not None
+        captured.append((kwargs.get("anchor_line"), scroll, running))
+        if not running:
+            raise StopCapture
+        # Turn completes right after the first (still-running) render.
+        worker.alive = False
+        return Viewport(scroll)
+
+    monkeypatch.setattr(app, "_draw_session", fake_draw_session)
+    monkeypatch.setattr(app, "_read_prompt_key", lambda *_a, **_k: None)
+
+    window = Window()
+    try:
+        app._run_session(window, session)
+    except StopCapture:
+        pass
+
+    assert captured[0] == (3, 0, True)
+    # Once the turn has fully completed (popped from active turns), the stale
+    # pinned anchor must not carry over to the next render -- otherwise the
+    # view jumps to the anchored user message near the top of the
+    # conversation instead of staying at the bottom.
+    assert captured[-1] == (None, 0, False)
+
+
 def test_requeue_during_running_turn_resets_scroll_to_follow_the_growing_reply(
     tmp_path, monkeypatch
 ):

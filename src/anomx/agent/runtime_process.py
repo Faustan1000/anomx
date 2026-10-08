@@ -27,6 +27,8 @@ from anomx.agent.helpers.mode import AgentMode
 from anomx.agent.helpers.utils import AgentKind
 from anomx.agent.store import AnomxHome
 
+CONTROL_CALL_TIMEOUT_SECONDS = 5.0
+
 if TYPE_CHECKING:
     from anomx.agent.base.interactions import QuestionResponse
     from anomx.agent.helpers.tool_manager import (
@@ -147,10 +149,32 @@ class RuntimeProcessClient:
         self._call("set_agent", kind)
 
     def abort_current_turn(self, session_path: Path | None = None) -> None:
-        self._call("abort_current_turn", session_path)
+        # Bounded: this runs on the UI thread, which must never hang on a stuck child.
+        self._call("abort_current_turn", session_path, _timeout=CONTROL_CALL_TIMEOUT_SECONDS)
+
+    def has_live_children(self) -> bool:
+        """Whether the child runtime still has a background process or subagent.
+
+        Unreachable or closed runtimes count as live so callers never reap on doubt.
+        """
+
+        try:
+            return bool(
+                self._call("has_live_children", _timeout=2.0)
+            )
+        except RuntimeProcessError:
+            return True
 
     def shutdown(self, session_path: Path | None = None) -> RuntimeCleanupResult:
-        result = cast("RuntimeCleanupResult", self._call("shutdown", session_path))
+        try:
+            result = cast(
+                "RuntimeCleanupResult",
+                self._call("shutdown", session_path, _timeout=CONTROL_CALL_TIMEOUT_SECONDS),
+            )
+        except RuntimeProcessError:
+            if session_path is None:
+                self.close()
+            raise
         if session_path is None:
             self.close()
         return result
@@ -335,6 +359,7 @@ class RuntimeProcessClient:
         method: str,
         *args: Any,
         _callbacks: Mapping[str, Callback] | None = None,
+        _timeout: float | None = None,
         **kwargs: Any,
     ) -> Any:
         self._ensure_started()
@@ -356,7 +381,12 @@ class RuntimeProcessClient:
                     "callback_names": tuple(callback_map),
                 }
             )
-            ok, value = response.get()
+            try:
+                ok, value = response.get(timeout=_timeout)
+            except queue.Empty:
+                raise RuntimeProcessError(
+                    f"The runtime process did not answer {method!r} within {_timeout:g}s."
+                ) from None
         finally:
             with self._pending_lock:
                 self._pending.pop(request_id, None)
