@@ -1204,6 +1204,8 @@ def test_new_turn_resets_scroll_to_follow_the_growing_reply(tmp_path, monkeypatc
         pass
 
     class Viewport:
+        max_scroll = 0
+
         def __init__(self, scroll):
             self.scroll = scroll
 
@@ -1287,6 +1289,8 @@ def test_turn_completion_resets_pinned_anchor_so_view_stays_at_the_bottom(
         pass
 
     class Viewport:
+        max_scroll = 0
+
         def __init__(self, scroll):
             self.scroll = scroll
 
@@ -1370,6 +1374,8 @@ def test_requeue_during_running_turn_resets_scroll_to_follow_the_growing_reply(
         pass
 
     class Viewport:
+        max_scroll = 0
+
         def __init__(self, scroll):
             self.scroll = scroll
 
@@ -1471,6 +1477,8 @@ def test_requeue_refused_while_old_worker_runs_keeps_the_typed_message(tmp_path,
         pass
 
     class Viewport:
+        max_scroll = 0
+
         def __init__(self, scroll):
             self.scroll = scroll
 

@@ -262,6 +262,7 @@ class SessionViewMixin:
         )
         rendered_line_count = len(rendered)
         visible_rows: list[tuple[int, MessageLine]]
+        max_scroll = self._session_scroll_bounds(rendered_line_count, body_height)[1]
         if anchor_line is None:
             scroll = self._clamp_session_scroll(scroll, rendered_line_count, body_height)
             start = self._session_view_start(scroll, rendered_line_count, body_height)
@@ -270,6 +271,7 @@ class SessionViewMixin:
                 for offset, line in enumerate(rendered[start : start + body_height])
             ]
         elif sticky_anchor and rendered_line_count:
+            max_scroll = 0
             start = max(0, min(anchor_line, self._session_max_start(rendered_line_count)))
             pinned_rows, anchor_extent = self._sticky_anchor_rows(
                 session,
@@ -286,6 +288,7 @@ class SessionViewMixin:
             tail_height = max(0, body_height - pinned_height)
             if tail_height:
                 tail_count = max(0, rendered_line_count - tail_start)
+                max_scroll = self._session_scroll_bounds(tail_count, tail_height)[1]
                 scroll = self._clamp_session_scroll(scroll, tail_count, tail_height)
                 relative_start = self._session_view_start(scroll, tail_count, tail_height)
                 visible_rows.extend(
@@ -414,7 +417,9 @@ class SessionViewMixin:
                 pasted_spans=pasted_spans,
             )
         stdscr.refresh()
-        return SessionViewportState(start, scroll, body_height, rendered_line_count)
+        return SessionViewportState(
+            start, scroll, body_height, rendered_line_count, max_scroll=max_scroll
+        )
 
     def _sticky_anchor_rows(
         self,

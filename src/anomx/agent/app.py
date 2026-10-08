@@ -111,6 +111,7 @@ from anomx.agent.ui.models import (
     SessionMouseAction,
     SessionTextRow,
     SessionTextSelection,
+    SessionViewportState,
     SessionViewState,
     StartupPreparation,
 )
@@ -1392,14 +1393,16 @@ class AnomxCliApp(
                 and active_turn.worker.is_alive()
             )
             if not active_turn_running:
+                view.anchor_released = False
                 self._reconcile_stale_activity(current_session.path)
             if active_turn_running and active_turn is not None:
-                view.pinned_anchor = self._active_turn_anchor_line(
-                    stdscr,
-                    current_session,
-                    active_turn,
-                    view.pinned_anchor,
-                )
+                if not view.anchor_released:
+                    view.pinned_anchor = self._active_turn_anchor_line(
+                        stdscr,
+                        current_session,
+                        active_turn,
+                        view.pinned_anchor,
+                    )
                 self._drain_session_turn_events(
                     stdscr,
                     active_turn,
@@ -1540,7 +1543,7 @@ class AnomxCliApp(
                 if key_result.clear_anchor and not key_result.scroll_delta:
                     view.pinned_anchor = None
                 if key_result.scroll_delta:
-                    view.scroll += key_result.scroll_delta
+                    self._apply_running_scroll(view, key_result.scroll_delta, viewport)
                 if key_result.command:
                     with suppress(curses.error):
                         stdscr.nodelay(False)
@@ -2561,6 +2564,31 @@ class AnomxCliApp(
             "Feedback failed",
             f"The platform returned status {result.get('status_code', 0)}.",
         )
+
+    @staticmethod
+    def _apply_running_scroll(
+        view: SessionViewState, delta: int, viewport: SessionViewportState | None
+    ) -> None:
+        """Scroll while an answer is pending.
+
+        The user's message is pinned at the top and only the answer below it scrolls. When
+        there is nothing left to scroll up there, the pin is released so the earlier chat
+        can be reached; scrolling back down to the bottom pins the message again.
+        """
+
+        at_top = viewport is None or view.scroll >= viewport.max_scroll
+        if view.pinned_anchor is not None and not view.anchor_released:
+            if delta > 0 and at_top:
+                view.anchor_released = True
+                view.pinned_anchor = None
+                view.scroll = delta
+            else:
+                view.scroll += delta
+            return
+        view.scroll += delta
+        if view.anchor_released and view.scroll <= 0:
+            view.anchor_released = False  # back at the bottom: pin the message again
+            view.scroll = 0
 
     def _cowork_follow_step(
         self,

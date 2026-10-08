@@ -239,6 +239,8 @@ class SessionViewState:
     running_abort_deadline: float = 0.0
     notice: str = ""
     notice_deadline: float = 0.0
+    anchor_released: bool = False
+    """The user scrolled above the pinned message while an answer is still pending."""
 
     def show_notice(self, text: str, *, now: float, seconds: float = 6.0) -> None:
         """Show a transient hint in the prompt bar (separate from the exit confirmation)."""
@@ -256,6 +258,7 @@ class SessionViewState:
 
         self.scroll = 0
         self.pinned_anchor = None
+        self.anchor_released = False
 
     def reset_running_notice(self, notice: str) -> None:
         """Show the default running hint and forget any pending abort confirmation."""
@@ -313,6 +316,8 @@ class SessionViewportState:
     scroll: int
     body_height: int
     rendered_line_count: int
+    max_scroll: int = 0
+    """Largest scroll offset the shown region allows (further up is not possible)."""
 
 
 @dataclass(frozen=True)
