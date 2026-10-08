@@ -49,6 +49,27 @@ class MergeResult:
     reason: str = ""
 
 
+def find_repo_root(path: Path) -> Path | None:
+    """Git repository that contains ``path`` (a file or folder), if any.
+
+    A VS Code workspace often spans several repositories, so each note is resolved to the
+    repository of its own file instead of assuming one repository per workspace.
+    """
+
+    folder = path if path.is_dir() else path.parent
+    while not folder.exists() and folder != folder.parent:
+        folder = folder.parent
+    result = subprocess.run(  # noqa: S603 - fixed git binary, no shell
+        ["git", "-C", str(folder), "rev-parse", "--show-toplevel"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "LC_ALL": "C"},
+    )
+    top = result.stdout.strip()
+    return Path(top) if result.returncode == 0 and top else None
+
+
 def branch_for(note_id: str) -> str:
     """Branch name for a note; Margo ids are already close to valid ref names."""
 

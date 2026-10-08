@@ -14,6 +14,9 @@ from anomx.agent.cowork import (
     GitError,
     TaskStatus,
     TaskStore,
+    find_margo_workspace,
+    find_repo_root,
+    normalize_note_path,
     note_context,
     read_margo_notes,
 )
@@ -290,3 +293,73 @@ def test_a_detached_head_cannot_host_tasks(repo, tmp_path):
 
     with pytest.raises(GitError, match="Check out a branch"):
         CoworkGit(repo).create_task("n1", tmp_path / "wt" / "n1")
+
+
+# -- real-world layout: workspace folder above one or more repositories ----------------
+
+# Verbatim shape of a vault written by Margo 0.1.0 (keys carry a leading "./").
+REAL_VAULT = {
+    "./anomx/examples/baseline_detection.py": [
+        {
+            "id": "1791449926580-x93ibwz6i",
+            "line": 2,
+            "title": "this is a comment",
+            "text": "",
+            "timestamp": 1791449926580,
+            "author": "ultrasat",
+            "priority": "medium",
+            "category": "note",
+            "status": "open",
+            "vault": "local",
+        }
+    ]
+}
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> Path:
+    """A VS Code workspace folder that contains a git repository (like app_project/anomx)."""
+
+    root = tmp_path / "workspace"
+    project = root / "anomx"
+    (project / "examples").mkdir(parents=True)
+    run(project, "init", "-b", "main")
+    run(project, "config", "user.name", "Dev")
+    run(project, "config", "user.email", "dev@example.com")
+    source = '"""Doc."""\n\nfrom anomx import (\n    A,\n)\n'
+    (project / "examples" / "baseline_detection.py").write_text(source, encoding="utf-8")
+    run(project, "add", "-A")
+    run(project, "commit", "-m", "initial")
+    (root / ".margo").mkdir()
+    (root / ".margo" / "local.notes.json").write_text(json.dumps(REAL_VAULT), encoding="utf-8")
+    return root
+
+
+def test_vault_in_a_parent_folder_is_found_from_inside_the_repo(workspace):
+    assert find_margo_workspace(workspace / "anomx" / "examples") == workspace
+    assert find_margo_workspace(workspace.parent.parent / "nowhere") is None
+
+
+def test_real_vault_keys_lose_the_leading_dot_slash(workspace):
+    (note,) = read_margo_notes(workspace)
+
+    assert note.file == "anomx/examples/baseline_detection.py"
+    assert normalize_note_path("././a\\b.py") == "a/b.py"
+    assert note.line_number == 3
+
+
+def test_note_is_resolved_to_the_repository_of_its_own_file(workspace):
+    (note,) = read_margo_notes(workspace)
+    target = workspace / note.file
+
+    repo_root = find_repo_root(target)
+
+    assert repo_root == workspace / "anomx"
+    assert target.relative_to(repo_root).as_posix() == "examples/baseline_detection.py"
+    context = note_context(workspace, note, radius=0)
+    assert context.anchor_text == "from anomx import ("
+    assert find_repo_root(workspace.parent) is None  # not inside any repository
+
+
+def test_missing_files_still_resolve_to_a_repository(workspace):
+    assert find_repo_root(workspace / "anomx" / "deleted" / "gone.py") == workspace / "anomx"

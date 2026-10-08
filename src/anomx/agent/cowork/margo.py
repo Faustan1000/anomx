@@ -5,15 +5,18 @@ Margo keeps notes as plain JSON in the workspace::
     .margo/local.notes.json   private vault (Margo gitignores it)
     .notes.json               team vault (shared in the repository)
 
-Both files map a workspace-relative file path to a list of notes::
+Both files map a workspace-relative file path to a list of notes. The keys carry a
+leading ``./`` (checked against a real vault)::
 
-    {"src/auth.ts": [{"id": "...", "line": 41, "title": "...", "text": "...",
-                      "status": "open", "category": "todo", "priority": "high", ...}]}
+    {"./anomx/src/auth.ts": [{"id": "1791449926580-x93ibwz6i", "line": 2,
+        "title": "...", "text": "", "timestamp": 1791449926580, "author": "...",
+        "priority": "medium", "category": "note", "status": "open", "vault": "local"}]}
 
-The format is Margo's, not ours, so this module only *reads* it, tolerates unknown or
-missing fields and never writes. The field list comes from Margo's published source and
-has not been checked against a real vault file yet; ``MARGO_LINE_BASE`` is the one place
-to correct if lines turn out to be stored differently.
+The workspace is whatever folder VS Code has open. That is often a parent folder holding
+several git repositories, so the vault is looked up from the current directory upwards
+(``find_margo_workspace``) and every note is resolved to its own repository by the git
+layer. The format is Margo's, not ours: this module only *reads* it, tolerates unknown or
+missing fields and never writes.
 """
 
 from __future__ import annotations
@@ -29,6 +32,25 @@ TEAM_VAULT = Path(".notes.json")
 # Margo builds its comment ranges straight from ``note.line``, i.e. the stored value is
 # 0-based (the first line of a file is 0). Display and prompts use 1-based numbers.
 MARGO_LINE_BASE = 0
+
+
+def find_margo_workspace(start: Path) -> Path | None:
+    """Nearest folder at or above ``start`` that holds a Margo vault file."""
+
+    start = start.resolve()
+    for folder in (start, *start.parents):
+        if (folder / LOCAL_VAULT).is_file() or (folder / TEAM_VAULT).is_file():
+            return folder
+    return None
+
+
+def normalize_note_path(path: str) -> str:
+    """Workspace-relative POSIX path without Margo's leading ``./``."""
+
+    cleaned = path.replace("\\", "/")
+    while cleaned.startswith("./"):
+        cleaned = cleaned[2:]
+    return cleaned
 
 
 @dataclass(frozen=True)
@@ -122,7 +144,7 @@ def _parse_note(file_path: str, entry: Any, default_vault: str) -> MargoNote | N
         timestamp = 0
     return MargoNote(
         id=note_id,
-        file=file_path.replace("\\", "/"),
+        file=normalize_note_path(file_path),
         line=line,
         title=str(entry.get("title") or ""),
         text=str(entry.get("text") or ""),
