@@ -7,6 +7,14 @@ touching each other's files; the user merges a branch back only after approving 
 
 from __future__ import annotations
 
+from anomx.agent.cowork.editor import (
+    EditorContext,
+    context_path,
+    note_near_cursor,
+    notes_in_view,
+    read_editor_context,
+)
+from anomx.agent.cowork.extension import build_vsix, install_command
 from anomx.agent.cowork.git import (
     CoworkGit,
     FollowResult,
@@ -30,6 +38,7 @@ __all__ = [
     "MARGO_LINE_BASE",
     "CoworkGit",
     "CoworkTask",
+    "EditorContext",
     "FollowResult",
     "GitError",
     "MargoNote",
@@ -38,9 +47,15 @@ __all__ = [
     "TaskStatus",
     "TaskStore",
     "TaskWorkspace",
+    "build_vsix",
+    "context_path",
     "find_margo_workspace",
     "find_repo_root",
     "note_context",
+    "install_command",
     "normalize_note_path",
+    "note_near_cursor",
+    "notes_in_view",
+    "read_editor_context",
     "read_margo_notes",
 ]

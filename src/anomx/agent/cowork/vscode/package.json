@@ -1,0 +1,37 @@
+{
+  "name": "anomx-editor-context",
+  "displayName": "Anomx Editor Context",
+  "description": "Writes the active file, cursor, selection and visible lines to a local JSON file so the Anomx CLI agent knows what you are looking at.",
+  "version": "0.1.0",
+  "publisher": "anomx-local",
+  "license": "Apache-2.0",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "extensionKind": ["workspace"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Writes editor state to a file outside the workspace."
+    },
+    "virtualWorkspaces": false
+  },
+  "contributes": {
+    "configuration": {
+      "title": "Anomx Editor Context",
+      "properties": {
+        "anomxEditorContext.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Write the editor context file."
+        },
+        "anomxEditorContext.path": {
+          "type": "string",
+          "default": "",
+          "description": "Override the output path. Default: $ANOMX_HOME/editor-context.json or ~/.anomx/editor-context.json."
+        }
+      }
+    }
+  }
+}
