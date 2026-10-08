@@ -15,6 +15,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
 
+import anomx.agent.app as app_module
 import anomx.agent.base.backends as backends_module
 import anomx.agent.helpers.platform_client as platform_client_module
 import anomx.agent.helpers.tool_manager as tool_manager_module
@@ -1386,11 +1387,14 @@ def test_requeue_during_running_turn_resets_scroll_to_follow_the_growing_reply(
             return 24, 80
 
     class FakeWorker:
+        alive = True
+
         def is_alive(self):
-            return True
+            return self.alive
 
         def join(self, timeout=None):
             del timeout
+            self.alive = False  # the aborted worker stops once it is joined
 
     home = AnomxHome(tmp_path / "home")
     repo = tmp_path / "repo"
@@ -1421,8 +1425,10 @@ def test_requeue_during_running_turn_resets_scroll_to_follow_the_growing_reply(
         mode=AgentMode.STANDARD,
     )
 
-    def fake_start_session_turn(target_session, runtime=None):
+    def fake_start_session_turn(target_session, runtime=None, *, turn_id=None):
         del runtime
+        if turn_id:
+            replacement_turn.turn_id = turn_id
         app._active_session_turns[app._session_turn_key(target_session)] = replacement_turn
         return replacement_turn
 
@@ -1458,6 +1464,79 @@ def test_requeue_during_running_turn_resets_scroll_to_follow_the_growing_reply(
     # The first draw for the requeued turn must be back at scroll 0, not carrying
     # over the offset left by reading earlier output while the prior turn ran.
     assert captured[-1] == (0, True)
+
+
+def test_requeue_refused_while_old_worker_runs_keeps_the_typed_message(tmp_path, monkeypatch):
+    class StopCapture(Exception):
+        pass
+
+    class Viewport:
+        def __init__(self, scroll):
+            self.scroll = scroll
+
+    class Window:
+        def __init__(self, keys):
+            self._keys = iter(keys)
+
+        def get_wch(self):
+            return next(self._keys)
+
+        def nodelay(self, _flag):
+            pass
+
+        def getmaxyx(self):
+            return 24, 80
+
+    class StuckWorker:
+        def is_alive(self):
+            return True
+
+        def join(self, timeout=None):
+            del timeout
+
+    home = AnomxHome(tmp_path / "home")
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session = home.create_session(repo, provider="openai", model="gpt-5.5")
+    app = AnomxCliApp(home=home, cwd=repo, use_color=False)
+    turn = ui_module.ActiveSessionTurn(
+        session=session,
+        runtime=app.runtime,
+        events=queue.SimpleQueue(),
+        result={},
+        turn_id="turn-1",
+        started_at=time.monotonic(),
+        worker=StuckWorker(),
+        mode=AgentMode.STANDARD,
+    )
+    app._active_session_turns[app._session_turn_key(session)] = turn
+    started: list[object] = []
+    monkeypatch.setattr(app, "_start_session_turn", lambda *a, **k: started.append(a))
+    monkeypatch.setattr(app.runtime, "abort_current_turn", lambda _path: None)
+    monkeypatch.setattr(app, "_drain_session_turn_events", lambda *_a, **_kw: None)
+    monkeypatch.setattr(app_module, "REQUEUE_STOP_GRACE_SECONDS", 0.01)
+
+    frames: list[tuple[str, str]] = []
+
+    def fake_draw_session(
+        _stdscr, _session, _messages, input_text, _cursor, scroll, *_a, **kwargs
+    ):
+        if "sticky_anchor" in kwargs:
+            frames.append((input_text, kwargs.get("prompt_notice", "")))
+            if len(frames) >= 5:
+                raise StopCapture
+        return Viewport(scroll)
+
+    monkeypatch.setattr(app, "_draw_session", fake_draw_session)
+
+    try:
+        app._run_session(Window(["h", "i", "\n", "x"]), session)
+    except StopCapture:
+        pass
+
+    assert started == []  # no second worker next to the one that is still stopping
+    assert app_module.REQUEUE_BUSY_NOTICE in [notice for _text, notice in frames]
+    assert any(text == "hi" for text, _notice in frames[-3:])  # message kept, not cleared
 
 
 def test_running_enter_submits_plain_message(tmp_path):
@@ -1524,8 +1603,10 @@ def test_interrupt_requeue_appends_user_after_draining_old_events(tmp_path, monk
     )
     started = []
 
-    def fake_start_session_turn(next_session):
+    def fake_start_session_turn(next_session, *, turn_id=None):
         started.append(next_session)
+        if turn_id:
+            replacement_turn.turn_id = turn_id
         return replacement_turn
 
     monkeypatch.setattr(

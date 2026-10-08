@@ -183,9 +183,18 @@ class ActiveSessionTurn:
     work_summary_appended: bool = False
     streamed_final_displayed: bool = False
     completed: bool = False
+    aborting: bool = False
     agent_symbol: str = ""
     anchor_expansion_key: str = ""
     pending_events: list[RuntimeUiEvent] = dataclass_field(default_factory=list)
+
+    @property
+    def state(self) -> str:
+        """Lifecycle state: ``running``, ``aborting`` (stop requested) or ``done``."""
+
+        if self.completed:
+            return "done"
+        return "aborting" if self.aborting else "running"
 
 
 @dataclass

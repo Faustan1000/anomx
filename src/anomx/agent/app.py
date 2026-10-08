@@ -12,7 +12,7 @@ import re
 import shlex
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -124,6 +124,9 @@ from anomx.agent.ui.views.subagent import SubagentViewMixin
 
 # Idle screens wake up this often so background work becomes visible without a key press.
 IDLE_POLL_MILLISECONDS = 500
+# How long a requeue waits for the aborted worker before it keeps the new message.
+REQUEUE_STOP_GRACE_SECONDS = 1.5
+REQUEUE_BUSY_NOTICE = "Still stopping the previous run · press Enter again in a moment"
 
 
 class AnomxCliApp(
@@ -1580,7 +1583,7 @@ class AnomxCliApp(
                     # turn is still running leaves the new streaming reply stuck
                     # off-screen, same as the idle-submit case above.
                     view.scroll = 0
-                    self._interrupt_and_requeue_session_turn(
+                    requeued = self._interrupt_and_requeue_session_turn(
                         stdscr,
                         active_turn,
                         current_session,
@@ -1588,8 +1591,15 @@ class AnomxCliApp(
                         anchor_line=view.pinned_anchor,
                         scroll=view.scroll,
                     )
-                    prompt.clear()
-                    view.reset_running_notice(RUNNING_NOTICE)
+                    if requeued:
+                        prompt.clear()
+                        view.reset_running_notice(RUNNING_NOTICE)
+                    else:
+                        # The old run is still stopping; keep the message to send again.
+                        prompt.input_text = key_result.submitted_message
+                        prompt.cursor = len(prompt.input_text)
+                        view.running_notice = REQUEUE_BUSY_NOTICE
+                        view.running_notice_role = "light"
                     continue
                 continue
 
@@ -2535,6 +2545,8 @@ class AnomxCliApp(
         self,
         session: SessionRecord,
         runtime: AgentRuntime | RuntimeProcessClient | None = None,
+        *,
+        turn_id: str | None = None,
     ) -> ActiveSessionTurn:
         existing = self._active_turn_for_session(session)
         if existing is not None:
@@ -2549,8 +2561,9 @@ class AnomxCliApp(
         if not isinstance(turn_runtime, RuntimeProcessClient):
             turn_runtime.set_agent(turn_agent_kind)
             turn_runtime.set_mode(turn_mode)
-        turn_id = uuid4().hex
+        turn_id = turn_id or uuid4().hex
         started_at = time.monotonic()
+        holder: list[ActiveSessionTurn] = []
 
         def status_callback(message: str) -> None:
             events.put(RuntimeUiEvent("status", message))
@@ -2618,10 +2631,18 @@ class AnomxCliApp(
         def finish_callback(final_text: str) -> None:
             events.put(RuntimeUiEvent("finish", final_text))
 
+        def superseded() -> bool:
+            # A turn that was aborted/requeued must not overwrite the successor's numbers.
+            return bool(holder) and holder[0].completed
+
         def usage_callback(snapshot: UsageSnapshot) -> None:
+            if superseded():
+                return
             self._session_usage_snapshots[session.path] = snapshot
 
         def context_activity_callback(payload: dict[str, Any]) -> None:
+            if superseded():
+                return
             events.put(RuntimeUiEvent("context_activity", json.dumps(payload)))
             if payload.get("changed") and payload.get("context_tokens_after") is not None:
                 previous = self._session_usage_snapshots.get(session.path)
@@ -2680,6 +2701,7 @@ class AnomxCliApp(
             agent_symbol=self.active_agent.symbol,
             anchor_expansion_key=self._latest_root_user_expansion_key(session.path),
         )
+        holder.append(turn)
         self._active_session_turns[self._session_turn_key(session)] = turn
         worker.start()
         return turn
@@ -2905,6 +2927,35 @@ class AnomxCliApp(
         self._active_session_turns.pop(self._session_turn_key(turn.session), None)
         return response
 
+    def _abort_turn(self, turn: ActiveSessionTurn, *, shutdown: bool) -> None:
+        """Ask a running turn to stop and unblock anything its worker waits on.
+
+        Failures are reported in the session instead of being swallowed, so a runtime
+        that does not react to the abort is visible to the user.
+        """
+
+        turn.aborting = True
+        steps: list[tuple[str, Callable[[], object]]] = [
+            ("abort", lambda: turn.runtime.abort_current_turn(turn.session.path))
+        ]
+        if shutdown:
+            steps.append(("shutdown", lambda: turn.runtime.shutdown(turn.session.path)))
+        for name, step in steps:
+            try:
+                step()
+            except Exception as error:  # noqa: BLE001 - report and keep stopping the turn
+                with suppress(OSError, TypeError, ValueError):
+                    self.home.write_crash_log(
+                        error,
+                        context={"while": f"turn {name}", "session_path": str(turn.session.path)},
+                    )
+                self._append_system_message(
+                    turn.session,
+                    "system",
+                    f"Could not {name} the running agent cleanly: {type(error).__name__}: {error}",
+                )
+        self._release_blocked_turn_callbacks(turn)
+
     @staticmethod
     def _release_blocked_turn_callbacks(turn: ActiveSessionTurn) -> None:
         """Answer approval/question requests an aborted turn is still waiting on.
@@ -2943,11 +2994,7 @@ class AnomxCliApp(
         cursor: int = 0,
         pasted_spans: Sequence[PromptPasteSpan] | None = None,
     ) -> None:
-        with suppress(Exception):
-            turn.runtime.abort_current_turn(turn.session.path)
-        with suppress(Exception):
-            turn.runtime.shutdown(turn.session.path)
-        self._release_blocked_turn_callbacks(turn)
+        self._abort_turn(turn, shutdown=True)
         self._drain_session_turn_events(
             stdscr,
             turn,
@@ -2983,13 +3030,19 @@ class AnomxCliApp(
         *,
         anchor_line: int | None = None,
         scroll: int = 0,
-    ) -> None:
+    ) -> bool:
         """Abort the current turn and immediately start a new one with an
-        appended user message. Leaves running processes/subagents alive."""
+        appended user message. Leaves running processes/subagents alive.
 
-        turn.runtime.abort_current_turn(session.path)
-        self._release_blocked_turn_callbacks(turn)
-        turn.worker.join(timeout=5)
+        Returns ``False`` without starting anything when the old worker has not
+        stopped within ``REQUEUE_STOP_GRACE_SECONDS``: a second worker on the same
+        transcript would interleave with it, so the caller keeps the message.
+        """
+
+        self._abort_turn(turn, shutdown=False)
+        turn.worker.join(timeout=REQUEUE_STOP_GRACE_SECONDS)
+        if turn.worker.is_alive():
+            return False
         self._drain_session_turn_events(
             stdscr,
             turn,
@@ -3012,9 +3065,8 @@ class AnomxCliApp(
                 "intermediate": True,
             },
         )
-        replacement_turn = self._start_session_turn(session)
-        if replacement_turn is not None:
-            replacement_turn.turn_id = turn.turn_id
+        self._start_session_turn(session, turn_id=turn.turn_id)
+        return True
 
     def _shutdown_active_session_turns(self) -> None:
         for turn in list(self._active_session_turns.values()):
