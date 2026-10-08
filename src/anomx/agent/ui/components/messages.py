@@ -18,8 +18,13 @@ from anomx.agent.base.backends import strip_thinking_tags
 from anomx.agent.helpers.terminal import (
     CODE_END,
     CODE_START,
+    cell_width,
     markdown_to_terminal_rendered_lines,
+    pad_cells,
+    split_overwide_lines,
+    strip_code_markers,
     terminal_cell_spans,
+    truncate_cells,
 )
 from anomx.agent.helpers.terminal_colors import (
     blend_color,
@@ -273,7 +278,7 @@ class MessagesComponentMixin:
                 wave_attr = attr ^ curses.A_DIM
             else:
                 continue
-            self._add(stdscr, y, x + column, glyph, len(glyph), wave_attr)
+            self._add(stdscr, y, x + column, glyph, cells, wave_attr)
 
     def _configure_activity_wave_colors(self, default_fg: int, default_bg: int) -> None:
         """Allocate shades without changing the terminal's color definitions."""
@@ -318,7 +323,7 @@ class MessagesComponentMixin:
         width: int,
         role: str = "work_box",
     ) -> None:
-        self._add(stdscr, y, x, text.ljust(max(0, width)), width, self._line_attr(role))
+        self._add(stdscr, y, x, pad_cells(text, max(0, width)), width, self._line_attr(role))
 
     def _draw_user_box_line(
         self,
@@ -330,10 +335,12 @@ class MessagesComponentMixin:
     ) -> None:
         border_attr = self._attr("bold")
         content_attr = curses.A_NORMAL
-        self._add(stdscr, y, x, text.ljust(max(0, width)), width, content_attr)
-        for offset, character in enumerate(text[:width]):
+        self._add(stdscr, y, x, pad_cells(text, max(0, width)), width, content_attr)
+        offset = 0
+        for character in truncate_cells(text, width):
             if character in {"╭", "╮", "╰", "╯", "│", "─"}:
                 self._add(stdscr, y, x + offset, character, 1, border_attr)
+            offset += cell_width(character)
 
     def _draw_table_line(
         self,
@@ -384,7 +391,7 @@ class MessagesComponentMixin:
                 break
             attr = self._attr("accent") if i % 2 == 1 else default_attr
             self._add(stdscr, y, cursor, part, remaining, attr)
-            cursor += len(part)
+            cursor += cell_width(part)
 
     def _draw_session_selection(
         self,
@@ -395,19 +402,21 @@ class MessagesComponentMixin:
         text: str,
         width: int,
     ) -> None:
+        text = strip_code_markers(text)
         span = self._selection_span_for_line(line_index, len(text))
         if span is None:
             return
         start, end = span
         if end <= start:
             return
-        selected_width = min(end, width) - start
+        start_cell = cell_width(text[:start])
+        selected_width = min(cell_width(text[:end]), width) - start_cell
         if selected_width <= 0:
             return
         self._add(
             stdscr,
             y,
-            x + start,
+            x + start_cell,
             text[start:end],
             selected_width,
             self._attr("selected"),
@@ -470,7 +479,15 @@ class MessagesComponentMixin:
         row: SessionTextRow,
         x: int,
     ) -> SessionSelectionPoint:
-        column = max(0, min(len(row.text), x - row.x))
+        target = max(0, x - row.x)
+        column = 0
+        used = 0
+        for character in row.text:
+            cells = cell_width(character)
+            if used + cells > target:
+                break
+            used += cells
+            column += 1
         return SessionSelectionPoint(row.line_index, column)
 
     def _selected_session_text(self) -> str:
@@ -920,7 +937,7 @@ class MessagesComponentMixin:
         return [
             MessageLine(
                 "user",
-                f"{collapsed_text.ljust(available)}{toggle_text}",
+                f"{pad_cells(collapsed_text, available)}{toggle_text}",
                 message.meta,
                 expansion_key,
                 message.detail_title,
@@ -948,7 +965,7 @@ class MessagesComponentMixin:
             )
         ]
         for content_line in self._work_box_content_lines(message.text, inner_width):
-            content = content_line[:inner_width].ljust(inner_width)
+            content = pad_cells(content_line, inner_width)
             lines.append(MessageLine("user_box", f"│ {content} │", message.meta, expansion_key))
         border = "─" * max(1, safe_width - 2)
         lines.append(MessageLine("user_box", f"╰{border}╯", message.meta, expansion_key))
@@ -993,11 +1010,11 @@ class MessagesComponentMixin:
 
     def _ellipsized_statement_text(self, text: str, width: int) -> str:
         safe_width = max(1, width)
-        if len(text) <= safe_width:
+        if cell_width(text) <= safe_width:
             return text
         if safe_width <= 3:
             return "." * safe_width
-        return f"{text[: safe_width - 3].rstrip()}..."
+        return f"{truncate_cells(text, safe_width - 3).rstrip()}..."
 
     def _expanded_work_box_lines(
         self,
@@ -1010,16 +1027,16 @@ class MessagesComponentMixin:
         border = "─" * max(1, safe_width - 2)
         lines = [MessageLine("work_box", f"╭{border}╮", message.meta, expansion_key)]
         for title_line in self._work_box_content_lines(message.text, inner_width):
-            title = title_line[:inner_width].ljust(inner_width)
+            title = pad_cells(title_line, inner_width)
             lines.append(MessageLine("work_box", f"│ {title} │", message.meta, expansion_key))
         if message.detail_title:
             for title_line in self._work_box_content_lines(message.detail_title, inner_width):
-                title = title_line[:inner_width].ljust(inner_width)
+                title = pad_cells(title_line, inner_width)
                 lines.append(MessageLine("work_box", f"│ {title} │", message.meta, expansion_key))
         if message.detail_body:
             lines.append(self._empty_work_box_line(inner_width, message.meta, expansion_key))
             for content_line in self._work_box_content_lines(message.detail_body, inner_width):
-                content = content_line[:inner_width].ljust(inner_width)
+                content = pad_cells(content_line, inner_width)
                 lines.append(MessageLine("work_box", f"│ {content} │", message.meta, expansion_key))
         lines.append(MessageLine("work_box", f"╰{border}╯", message.meta, expansion_key))
         return lines
@@ -1046,13 +1063,16 @@ class MessagesComponentMixin:
                 lines.append("")
                 continue
             lines.extend(
-                textwrap.wrap(
-                    line,
-                    width=safe_width,
-                    replace_whitespace=False,
-                    drop_whitespace=False,
-                    break_long_words=True,
-                    break_on_hyphens=False,
+                split_overwide_lines(
+                    textwrap.wrap(
+                        line,
+                        width=safe_width,
+                        replace_whitespace=False,
+                        drop_whitespace=False,
+                        break_long_words=True,
+                        break_on_hyphens=False,
+                    ),
+                    safe_width,
                 )
                 or [""]
             )

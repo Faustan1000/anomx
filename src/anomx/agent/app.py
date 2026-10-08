@@ -30,6 +30,7 @@ from anomx.agent.helpers.state import (
     running_process_snapshots,
     running_subagent_snapshots,
 )
+from anomx.agent.helpers.terminal import truncate_cells
 from anomx.agent.helpers.tool_manager import (
     ApprovalChoice,
     CommandApprovalRequest,
@@ -208,7 +209,10 @@ class AnomxCliApp(
                 dict[str, list[MessageLine]],
             ],
         ] = {}
-        self._streaming_base_cache: dict[Path, tuple[Any, tuple[Any, ...], list[MessageLine], str | None]] = {}
+        self._streaming_base_cache: dict[
+            Path,
+            tuple[Any, tuple[Any, ...], list[MessageLine], str | None],
+        ] = {}
         self._context_status_cache: dict[Path, tuple[int, int, str, str, int]] = {}
         self._session_usage_snapshots: dict[Path, UsageSnapshot] = {}
         self._config_cache: tuple[int, int, dict[str, Any]] | None = None
@@ -6087,8 +6091,11 @@ class AnomxCliApp(
         safe_width = max(0, min(width, max_width - x))
         if safe_width <= 0:
             return
+        clipped = truncate_cells(text, safe_width)
+        if not clipped:
+            return
         with suppress(curses.error):
-            stdscr.addnstr(y, x, text, safe_width, attr)
+            stdscr.addnstr(y, x, clipped, len(clipped), attr)
 
     def _attr(self, name: str) -> int:
         if name == "accent" and self._accent_attr_name != "accent":

@@ -12,6 +12,7 @@ from anomx.agent.helpers.state import (
     running_process_snapshots,
     running_subagent_snapshots,
 )
+from anomx.agent.helpers.terminal import cell_width
 from anomx.agent.store import (
     ProjectRecord,
     SessionRecord,
@@ -219,7 +220,9 @@ class ProjectViewMixin:
             if session.unread and not running and not delete_pending and selected:
                 prefix = right_text.removesuffix("•")
                 if prefix:
-                    self._add(stdscr, y, right_x, prefix, len(prefix), self._attr("selected"))
+                    self._add(
+                        stdscr, y, right_x, prefix, cell_width(prefix), self._attr("selected")
+                    )
                 self._add(
                     stdscr,
                     y,
@@ -230,10 +233,10 @@ class ProjectViewMixin:
                 )
             elif session.unread and not running and not delete_pending:
                 right_attr = active_attr if not selected else self._attr("selected")
-                self._add(stdscr, y, right_x, right_text, len(right_text), right_attr)
+                self._add(stdscr, y, right_x, right_text, cell_width(right_text), right_attr)
             else:
                 right_attr = self._attr("selected") if selected else quiet_attr
-                self._add(stdscr, y, right_x, right_text, len(right_text), right_attr)
+                self._add(stdscr, y, right_x, right_text, cell_width(right_text), right_attr)
         self._add_click_target(
             y,
             SessionMouseAction(

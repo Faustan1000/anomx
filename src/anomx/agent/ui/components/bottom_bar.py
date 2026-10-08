@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from anomx.agent.helpers.state import (
     AsyncProcessSnapshot,
 )
+from anomx.agent.helpers.terminal import cell_width, pad_cells
 from anomx.agent.ui.constants import (
     ACTIVITY_DETAIL_MAX_LINES,
 )
@@ -120,7 +121,7 @@ class BottomBarComponentMixin:
         bullet_attr = self._attr(item.accent) if item.accent != "light" else self._attr("light")
         title_attr = self._attr("bold") if expanded else self._attr("light")
         right_attr = self._attr("bold") if expanded else self._attr("light")
-        self._add(stdscr, y, 4, item.marker, 1, bullet_attr)
+        self._add(stdscr, y, 4, item.marker, max(1, cell_width(item.marker)), bullet_attr)
         right_text = self._activity_title_right_text(item, expanded)
         right_x = max(8, width - len(right_text) - 4) if right_text else width
         title_width = max(1, right_x - 7)
@@ -141,7 +142,7 @@ class BottomBarComponentMixin:
         else:
             self._add(stdscr, y, 6, item.title, title_width, title_attr)
         if right_text:
-            self._add(stdscr, y, right_x, right_text, len(right_text), right_attr)
+            self._add(stdscr, y, right_x, right_text, cell_width(right_text), right_attr)
 
     def _activity_title_right_text(self, item: ActivityItem, expanded: bool) -> str:
         if item.kind == "subagent":
@@ -216,7 +217,7 @@ class BottomBarComponentMixin:
         rows = [ActivityDetailRow(f"╭{border}╮", "work_box", entry.key)]
         body = entry.detail_body.strip() or entry.text
         for line in self._work_box_content_lines(body, inner_width):
-            content = line[:inner_width].ljust(inner_width)
+            content = pad_cells(line, inner_width)
             rows.append(ActivityDetailRow(f"│ {content} │", "work_box", entry.key))
         rows.append(ActivityDetailRow(f"╰{border}╯", "work_box", entry.key))
         return tuple(rows)

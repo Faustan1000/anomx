@@ -9,6 +9,7 @@ from anomx import __version__
 from anomx.agent.helpers.state import (
     PlanStep,
 )
+from anomx.agent.helpers.terminal import cell_width
 from anomx.agent.ui.constants import (
     AGENT_DESCRIPTOR,
     BRAND_DOT,
@@ -194,7 +195,7 @@ class InfoBoxComponentMixin:
                 selected_row = choice_index == selected
                 attr = self._attr("accent") if selected_row else curses.A_NORMAL
                 marker = "›" if selected_row else " "
-                self._add(stdscr, y, content_left, marker, 1, attr)
+                self._add(stdscr, y, content_left, marker, max(1, cell_width(marker)), attr)
                 self._add(stdscr, y, content_left + 2, choice.label, label_width, attr)
                 separator_attr = self._attr("accent") if selected_row else muted_attr
                 self._add(stdscr, y, content_left + label_width + 1, "│", 1, separator_attr)
@@ -391,7 +392,7 @@ class InfoBoxComponentMixin:
         """Overwrite one cell at (y, x + cursor) with the cursor attribute."""
         clamped = min(cursor, len(text))
         char = text[clamped] if clamped < len(text) else " "
-        self._add(stdscr, y, x + clamped, char, 1, self._attr("cursor"))
+        self._add(stdscr, y, x + clamped, char, max(1, cell_width(char)), self._attr("cursor"))
 
     def _draw_header_title(
         self,

@@ -14,7 +14,6 @@ from urllib.request import Request, urlopen
 from uuid import uuid4
 
 
-
 def call_api(
     method: str,
     path: str,

@@ -36,6 +36,60 @@ def terminal_cell_spans(text: str, width: int) -> list[tuple[int, str, int]]:
     return spans
 
 
+def _glyph_cells(character: str) -> int:
+    """Terminal cells one character occupies (0 for combining/control, 2 for wide)."""
+    if unicodedata.category(character) in {"Mn", "Me", "Cc", "Cf"}:
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in {"W", "F"} else 1
+
+
+def cell_width(text: str) -> int:
+    """Display width of ``text`` in terminal cells; inline-code markers take no space."""
+    if text.isascii() and text.isprintable():
+        return len(text)
+    return sum(_glyph_cells(character) for character in text)
+
+
+def truncate_cells(text: str, width: int) -> str:
+    """Longest prefix of ``text`` that fits in ``width`` cells."""
+    if width <= 0:
+        return ""
+    if text.isascii() and text.isprintable():
+        return text[:width]
+    used = 0
+    for index, character in enumerate(text):
+        cells = _glyph_cells(character)
+        if used + cells > width:
+            return text[:index]
+        used += cells
+    return text
+
+
+def pad_cells(text: str, width: int) -> str:
+    """Truncate or right-pad ``text`` with spaces to exactly ``width`` cells."""
+    clipped = truncate_cells(text, width)
+    return clipped + " " * max(0, width - cell_width(clipped))
+
+
+def strip_code_markers(text: str) -> str:
+    """Remove the inline-code markers used while rendering transcript lines."""
+    return text.replace(CODE_START, "").replace(CODE_END, "")
+
+
+def split_overwide_lines(lines: list[str], width: int) -> list[str]:
+    """Hard-split lines wider than ``width`` cells (``textwrap`` counts characters)."""
+    result: list[str] = []
+    for line in lines:
+        while cell_width(line) > width > 0:
+            head = truncate_cells(line, width)
+            if not head:
+                break
+            result.append(head)
+            line = line[len(head):]
+        result.append(line)
+    return result
+
+
 @dataclass(frozen=True)
 class TerminalLine:
     """A rendered terminal line with optional transcript styling metadata."""
@@ -210,7 +264,7 @@ def _render_table_fallback(table: _MarkdownTable, width: int) -> list[TerminalLi
 def _table_column_widths(rows: tuple[tuple[str, ...], ...], content_budget: int) -> list[int]:
     column_count = len(rows[0])
     desired = [
-        max(1, max(len(row[column]) for row in rows))
+        max(1, max(cell_width(row[column]) for row in rows))
         for column in range(column_count)
     ]
     if sum(desired) <= content_budget:
@@ -242,7 +296,7 @@ def _table_column_widths(rows: tuple[tuple[str, ...], ...], content_budget: int)
 def _longest_word_width(rows: tuple[tuple[str, ...], ...], column: int) -> int:
     return max(
         (
-            len(word)
+            cell_width(word)
             for row in rows
             for word in row[column].split()
         ),
@@ -283,11 +337,14 @@ def _table_row_lines(
     lines: list[TerminalLine] = []
     for line_index in range(row_height):
         cells = [
-            (
-                wrapped_cells[column][line_index]
-                if line_index < len(wrapped_cells[column])
-                else ""
-            ).ljust(widths[column])
+            pad_cells(
+                (
+                    wrapped_cells[column][line_index]
+                    if line_index < len(wrapped_cells[column])
+                    else ""
+                ),
+                widths[column],
+            )
             for column in range(len(widths))
         ]
         lines.append(TerminalLine(f"│ {' │ '.join(cells)} │", style))
@@ -297,13 +354,16 @@ def _table_row_lines(
 def _wrap_table_cell(cell: str, width: int) -> list[str]:
     if not cell:
         return [""]
-    return textwrap.wrap(
-        cell,
-        width=max(1, width),
-        replace_whitespace=False,
-        drop_whitespace=True,
-        break_long_words=True,
-        break_on_hyphens=False,
+    return split_overwide_lines(
+        textwrap.wrap(
+            cell,
+            width=max(1, width),
+            replace_whitespace=False,
+            drop_whitespace=True,
+            break_long_words=True,
+            break_on_hyphens=False,
+        ),
+        max(1, width),
     ) or [""]
 
 
@@ -321,14 +381,17 @@ def _wrap_preserving_indent(line: str, width: int) -> list[str]:
     content = line.lstrip()
     bullet_prefix = _bullet_prefix(content)
     subsequent_indent = indent + (" " * len(bullet_prefix) if bullet_prefix else "")
-    return textwrap.wrap(
-        indent + content,
-        width=width,
-        subsequent_indent=subsequent_indent,
-        replace_whitespace=False,
-        drop_whitespace=True,
-        break_long_words=False,
-        break_on_hyphens=False,
+    return split_overwide_lines(
+        textwrap.wrap(
+            indent + content,
+            width=width,
+            subsequent_indent=subsequent_indent,
+            replace_whitespace=False,
+            drop_whitespace=True,
+            break_long_words=False,
+            break_on_hyphens=False,
+        ),
+        width,
     ) or [indent]
 
 

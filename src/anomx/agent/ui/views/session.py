@@ -21,6 +21,7 @@ from anomx.agent.helpers.state import (
     latest_plan_steps,
     running_process_snapshots,
 )
+from anomx.agent.helpers.terminal import cell_width, strip_code_markers, truncate_cells
 from anomx.agent.runtime import (
     format_token_count,
 )
@@ -153,10 +154,10 @@ class SessionViewMixin:
             return
         y = 3
         x = max(4, width - len(text) - 5)
-        self._add(stdscr, y, x, text, len(text), self._attr("bold"))
+        self._add(stdscr, y, x, text, cell_width(text), self._attr("bold"))
         esc_text = "esc"
         esc_x = max(4, width - len(esc_text) - 5)
-        self._add(stdscr, y + 1, esc_x, esc_text, len(esc_text), self._attr("light"))
+        self._add(stdscr, y + 1, esc_x, esc_text, cell_width(esc_text), self._attr("light"))
         self._add_click_target(
             y,
             SessionMouseAction(
@@ -329,7 +330,7 @@ class SessionViewMixin:
                 y=y,
                 x=4,
                 width=width - 8,
-                text=line.text,
+                text=strip_code_markers(line.text),
             )
             if line.role in {"user", "pinned_user", "user_box"} and line.expansion_key:
                 self._add_click_target(
@@ -710,8 +711,10 @@ class SessionViewMixin:
             self._add(stdscr, y, x, text, width, attr)
             return
         char_rng = random.Random((frame + 1) * 262_147 + y * 97 + x * 31)
-        for offset, character in enumerate(text[:width]):
+        offset = 0
+        for character in truncate_cells(text, width):
             cell_x = x + offset
+            offset += max(1, cell_width(character))
             if self._start_hint_cell_hidden(
                 cell_x,
                 y,
@@ -724,7 +727,9 @@ class SessionViewMixin:
                 if reveal_progress < 1.0 and character.strip()
                 else character
             )
-            self._add(stdscr, y, cell_x, visible_character, 1, attr)
+            self._add(
+                stdscr, y, cell_x, visible_character, cell_width(visible_character) or 1, attr
+            )
 
     def _start_hint_cell_hidden(
         self,

@@ -6,6 +6,7 @@ import curses
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
 
+from anomx.agent.helpers.terminal import cell_width
 from anomx.agent.ui.constants import (
     RAW_MOUSE_RE,
     RUNNING_NOTICE,
@@ -68,7 +69,7 @@ class PromptBarComponentMixin:
         for offset in range(layout.prompt_height):
             y = layout.prompt_line + offset
             marker = "›" if offset == 0 else " "
-            self._add(stdscr, y, 4, marker, 1, self._attr("accent"))
+            self._add(stdscr, y, 4, marker, max(1, cell_width(marker)), self._attr("accent"))
             line = visible_lines[offset] if offset < len(visible_lines) else ""
             if input_text and (file_references or pasted_display_spans):
                 line_start = (view_start + offset) * layout.input_width
@@ -167,7 +168,14 @@ class PromptBarComponentMixin:
             visible_lines[visible_cursor_line] if visible_cursor_line < len(visible_lines) else ""
         )
         character = line[cursor_column] if cursor_column < len(line) and input_text else " "
-        self._add(stdscr, cursor_y, cursor_x, character, 1, self._attr("cursor"))
+        self._add(
+            stdscr,
+            cursor_y,
+            cursor_x,
+            character,
+            max(1, cell_width(character)),
+            self._attr("cursor"),
+        )
 
     def _draw_prompt_text_line(
         self,

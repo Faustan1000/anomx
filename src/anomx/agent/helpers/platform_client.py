@@ -11,8 +11,8 @@ from urllib.parse import urlparse, urlunparse
 from urllib.request import Request, urlopen
 
 from anomx import __version__
-from anomx.agent.store import AnomxHome
 from anomx.agent.skills import sync_platform_skills
+from anomx.agent.store import AnomxHome
 
 DEFAULT_TIMEOUT_SECONDS = 10
 

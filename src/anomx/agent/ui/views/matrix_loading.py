@@ -13,6 +13,7 @@ from contextlib import suppress
 from anomx.agent.helpers.platform_client import (
     heartbeat_platform_connection,
 )
+from anomx.agent.helpers.terminal import cell_width
 from anomx.agent.ui.constants import (
     STARTUP_ANOMX_GLYPH,
     STARTUP_BRAND_REVEAL_SECONDS,
@@ -200,7 +201,7 @@ class MatrixLoadingViewMixin:
         if activity_text:
             x = max(0, (width - len(activity_text)) // 2)
             y = max(0, height - 2)
-            self._add(stdscr, y, x, activity_text, len(activity_text), self._attr("accent"))
+            self._add(stdscr, y, x, activity_text, cell_width(activity_text), self._attr("accent"))
         stdscr.refresh()
 
     def _run_startup_wipe(self, stdscr: CursesWindow, frame: int) -> int:
