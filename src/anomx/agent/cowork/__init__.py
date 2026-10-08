@@ -15,6 +15,7 @@ from anomx.agent.cowork.editor import (
     read_editor_context,
 )
 from anomx.agent.cowork.extension import build_vsix, install_command
+from anomx.agent.cowork.follow import Activation, CoworkFollower
 from anomx.agent.cowork.git import (
     CoworkGit,
     FollowResult,
@@ -39,7 +40,9 @@ from anomx.agent.cowork.workspace import CoworkAction, CoworkRow, CoworkWorkspac
 __all__ = [
     "MARGO_LINE_BASE",
     "CoworkGit",
+    "Activation",
     "CoworkAction",
+    "CoworkFollower",
     "CoworkRow",
     "CoworkService",
     "CoworkTask",

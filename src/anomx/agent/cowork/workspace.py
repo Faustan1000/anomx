@@ -247,8 +247,8 @@ class CoworkWorkspace:
                 _task, record = service.open_chat(row.note, self.margo_workspace, discuss=discuss)
                 return record, None
             task = service.tasks.get(row.note_id)
-            record = self.home.session_record(Path(task.session_path)) if task else None
-            return (record, None) if record else (None, "This task has no chat yet.")
+            existing = self.home.session_record(Path(task.session_path)) if task else None
+            return (existing, None) if existing else (None, "This task has no chat yet.")
         except GitError as error:
             return None, str(error)
 
@@ -291,6 +291,37 @@ class CoworkWorkspace:
             if git.current_branch() is None and git.head() == git.tip(row.task.branch):
                 return row
         return None
+
+    def sync_tree(self, row: CoworkRow, *, editor_dirty: bool) -> str:
+        """Make the user's working tree show the state of ``row``'s task.
+
+        Returns a short notice for the user, or an empty string when nothing needs saying.
+        A tree that is already right, has uncommitted changes or belongs to an editor with
+        unsaved text is never touched.
+        """
+
+        if row.repo_root is None:
+            return ""
+        git = self._service(row.repo_root).git
+        task = row.task
+        shows_task = task is not None and task.is_active
+        if shows_task and task is not None and self._has_changes(row):
+            if git.current_branch() is None and git.head() == git.tip(task.branch):
+                return ""
+            if editor_dirty:
+                return "Unsaved changes in the editor, so your working tree was not switched."
+            result = git.follow(task.branch)
+            return "" if result.ok else result.reason
+        following = self.following()
+        if following is None or following.repo_root != row.repo_root:
+            return ""
+        if editor_dirty:
+            return "Unsaved changes in the editor, so your working tree was not switched back."
+        back = self.return_to_base(following)
+        return "" if back.ok else back.reason
+
+    def _has_changes(self, row: CoworkRow) -> bool:
+        return row.task is not None and row.repo_root is not None and self._changed(row)
 
     def return_to_base(self, row: CoworkRow) -> FollowResult:
         if row.repo_root is None:
