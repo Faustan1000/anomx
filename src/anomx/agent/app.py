@@ -937,7 +937,7 @@ class AnomxCliApp(
                     continue
                 submitted = input_text.strip()
                 if submitted:
-                    if submitted.startswith("/"):
+                    if self._is_slash_command(submitted):
                         command = self._submitted_command(
                             submitted,
                             command_suggestions,
@@ -1089,11 +1089,14 @@ class AnomxCliApp(
         if command == "/new":
             return self._create_session()
         if not self._project_command_allowed(command):
-            self._message(
-                stdscr,
-                "Unavailable Command",
-                f"{command} is available from inside a session.",
-            )
+            if any(spec.command == command for spec in self._command_specs()):
+                self._message(
+                    stdscr,
+                    "Unavailable Command",
+                    f"{command} is available from inside a session.",
+                )
+            else:
+                self._message(stdscr, "Unknown Command", command)
             return None
         if command == "/model":
             self._run_project_model_panel(
@@ -2054,7 +2057,7 @@ class AnomxCliApp(
                     command_selected = 0
                     file_selected = 0
                     continue
-                if submitted.startswith("/"):
+                if self._is_slash_command(submitted):
                     input_text = ""
                     cursor = 0
                     pasted_spans = []
@@ -3532,7 +3535,7 @@ class AnomxCliApp(
                     abort_deadline,
                     command_selected,
                 )
-            if submitted.startswith("/"):
+            if self._is_slash_command(submitted):
                 command = self._submitted_running_command(
                     submitted,
                     suggestions,
@@ -5034,10 +5037,9 @@ class AnomxCliApp(
             character.isspace() for character in input_text[token_start:bounded_cursor]
         ):
             return None
-        fragment_start = token_start
-        while fragment_start > 0 and not input_text[fragment_start - 1].isspace():
-            fragment_start -= 1
-        if input_text[fragment_start:token_start].startswith("@"):
+        # Only a "/" that begins a word is a command; "src/foo", "a/b" and "@path/x"
+        # are path-like text and must not open the command suggestions.
+        if token_start > 0 and not input_text[token_start - 1].isspace():
             return None
         token_end = bounded_cursor
         while token_end < len(input_text) and not input_text[token_end].isspace():
@@ -6023,6 +6025,19 @@ class AnomxCliApp(
     def _file_reference_label_pattern(self, label: str) -> re.Pattern[str]:
         escaped = re.escape(label)
         return re.compile(rf"(?<![\w./-]){escaped}(?=$|\s|[,.!?;:)\]}}])")
+
+    @staticmethod
+    def _is_slash_command(submitted: str) -> bool:
+        """Whether a submitted prompt is a slash command rather than a message.
+
+        A leading file path such as ``/tmp/data.csv analyse this`` also starts with
+        ``/`` but its first token contains further separators; it is a normal message.
+        """
+
+        if not submitted.startswith("/"):
+            return False
+        first_token = submitted.split(maxsplit=1)[0]
+        return "/" not in first_token[1:]
 
     def _submitted_command(
         self,
