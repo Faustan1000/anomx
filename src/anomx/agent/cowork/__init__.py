@@ -34,12 +34,16 @@ from anomx.agent.cowork.margo import (
 )
 from anomx.agent.cowork.runner import CoworkService, RunResult, build_task_prompt
 from anomx.agent.cowork.tasks import CoworkTask, TaskStatus, TaskStore
+from anomx.agent.cowork.workspace import CoworkAction, CoworkRow, CoworkWorkspace
 
 __all__ = [
     "MARGO_LINE_BASE",
     "CoworkGit",
+    "CoworkAction",
+    "CoworkRow",
     "CoworkService",
     "CoworkTask",
+    "CoworkWorkspace",
     "EditorContext",
     "FollowResult",
     "GitError",

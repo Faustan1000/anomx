@@ -100,6 +100,12 @@ class CoworkGit:
 
         return not self._git("status", "--porcelain", "--untracked-files=no").stdout.strip()
 
+    def tip(self, branch: str) -> str:
+        """Commit a branch currently points to (empty string if it does not exist)."""
+
+        result = self._git("rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False)
+        return result.stdout.strip() if result.returncode == 0 else ""
+
     def is_file_committed(self, relative: str) -> bool:
         """The file is tracked and has no uncommitted changes (what an agent would see)."""
 
