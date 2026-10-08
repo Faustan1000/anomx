@@ -2055,8 +2055,14 @@ class AnomxHome:
     def _read_toml_object(self, path: Path) -> dict[str, Any]:
         if not path.exists():
             return {}
-        with path.open("rb") as handle:
-            return tomllib.load(handle)
+        try:
+            with path.open("rb") as handle:
+                return tomllib.load(handle)
+        except tomllib.TOMLDecodeError:
+            # A hand-edited or truncated file must not make every menu crash. Keep the
+            # broken file for recovery and fall back to defaults.
+            path.replace(path.with_suffix(f"{path.suffix}.bak"))
+            return {}
 
     def _write_config_toml(self, path: Path, config: Mapping[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2066,6 +2072,10 @@ class AnomxHome:
             if value is None:
                 continue
             lines.append(f"{field} = {self._format_toml_value(value)}")
+
+        connected = config.get("connected_backends")
+        if isinstance(connected, list) and connected:
+            lines.append(f"connected_backends = {json.dumps(connected)}")
 
         global_allowed = config.get("global_allowed_commands")
         if isinstance(global_allowed, list) and global_allowed:

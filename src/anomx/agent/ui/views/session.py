@@ -53,6 +53,8 @@ from anomx.agent.ui.models import (
 
 
 class SessionViewMixin:
+    """Conversation session view."""
+
     def _activity_snapshots(self, events: list[dict[str, Any]]) -> tuple[tuple, tuple]:
         """Process/subagent snapshots for ``events``, recomputed only when they change.
 
@@ -67,8 +69,6 @@ class SessionViewMixin:
         subagents = active_subagent_snapshots(events)
         self._activity_snapshot_cache = (events, len(events), processes, subagents)
         return processes, subagents
-
-    """Conversation session view."""
 
     def _draw_continue_session_prompt(
         self,
@@ -861,7 +861,7 @@ class SessionViewMixin:
     def _context_status(self, session: SessionRecord, model: str) -> str:
         maximum = effective_context_limit(
             int(
-                self.home.load_config().get("maximum_context_tokens")
+                self._load_config_cached().get("maximum_context_tokens")
                 or DEFAULT_MAXIMUM_CONTEXT_TOKENS
             ),
             model,
