@@ -21,10 +21,11 @@ import json
 import os
 import re
 import shutil
+import threading
 import tomllib
 import traceback
-from collections.abc import Mapping
-from contextlib import suppress
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -748,6 +749,49 @@ class AnomxHome:
     def __init__(self, root: Path | None = None) -> None:
         self.root = resolve_anomx_home() if root is None else root.expanduser()
         self._session_record_cache: dict[Path, tuple[int, int, SessionRecord]] = {}
+        self._config_thread_lock = threading.RLock()
+        self._config_lock_depth = 0
+
+    @contextmanager
+    def _config_lock(self) -> Iterator[None]:
+        """Serialise read-modify-write cycles on the config, across threads and processes.
+
+        Worker threads (approvals), the platform heartbeat and the UI all update the
+        same file; without this, an update that loaded the config earlier overwrites
+        changes saved in between. Re-entrant, so ``save_config`` can be called inside.
+        """
+
+        with self._config_thread_lock:
+            handle = None
+            if self._config_lock_depth == 0:
+                with suppress(OSError, ImportError):
+                    import fcntl
+
+                    self.root.mkdir(parents=True, exist_ok=True)
+                    handle = (self.root / "config.toml.lock").open("a")
+                    fcntl.flock(handle, fcntl.LOCK_EX)
+            self._config_lock_depth += 1
+            try:
+                yield
+            finally:
+                self._config_lock_depth -= 1
+                if handle is not None:
+                    handle.close()
+
+    def update_config(self, changes: Mapping[str, Any]) -> dict[str, Any]:
+        """Apply ``changes`` to a freshly loaded config and save it atomically.
+
+        Prefer this over ``load_config()`` followed by ``save_config()`` whenever a
+        modal or other slow step sits between the two: only the given keys are written,
+        so concurrent updates to other keys survive. Returns the saved config.
+        """
+
+        with self._config_lock():
+            with self._config_lock():
+                config = self.load_config()
+                config.update(changes)
+                self.save_config(config)
+            return config
 
     @property
     def config_path(self) -> Path:
@@ -883,6 +927,10 @@ class AnomxHome:
     def save_config(self, config: Mapping[str, Any]) -> None:
         """Save the CLI config."""
 
+        with self._config_lock():
+            self._save_config_locked(config)
+
+    def _save_config_locked(self, config: Mapping[str, Any]) -> None:
         self.ensure()
         merged = default_config()
         merged.update(dict(config))
@@ -1088,19 +1136,20 @@ class AnomxHome:
         disconnected by removing it; this only tracks the explicit toggle.
         """
 
-        config = self.load_config()
-        current = config.get("connected_backends", [])
-        keys = (
-            [str(entry).strip() for entry in current if str(entry).strip()]
-            if isinstance(current, list)
-            else []
-        )
-        if connected and provider not in keys:
-            keys.append(provider)
-        elif not connected and provider in keys:
-            keys = [key for key in keys if key != provider]
-        config["connected_backends"] = keys
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            current = config.get("connected_backends", [])
+            keys = (
+                [str(entry).strip() for entry in current if str(entry).strip()]
+                if isinstance(current, list)
+                else []
+            )
+            if connected and provider not in keys:
+                keys.append(provider)
+            elif not connected and provider in keys:
+                keys = [key for key in keys if key != provider]
+            config["connected_backends"] = keys
+            self.save_config(config)
 
     def set_platform_connection(
         self,
@@ -1113,9 +1162,10 @@ class AnomxHome:
     ) -> None:
         """Store the connected Anomx Platform endpoint and bearer token."""
 
-        config = self.load_config()
-        config["platform_url"] = url
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            config["platform_url"] = url
+            self.save_config(config)
 
         auth = self.load_auth()
         auth["platform"] = {
@@ -1129,17 +1179,19 @@ class AnomxHome:
     def set_platform_form_defaults(self, *, url: str, email: str) -> None:
         """Persist the non-secret platform connection form defaults."""
 
-        config = self.load_config()
-        config["platform_last_url"] = url
-        config["platform_last_email"] = email
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            config["platform_last_url"] = url
+            config["platform_last_email"] = email
+            self.save_config(config)
 
     def clear_platform_connection(self) -> None:
         """Remove the connected Anomx Platform endpoint and bearer token."""
 
-        config = self.load_config()
-        config["platform_url"] = None
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            config["platform_url"] = None
+            self.save_config(config)
 
         auth = self.load_auth()
         auth["platform"] = {}
@@ -1184,39 +1236,43 @@ class AnomxHome:
 
     def add_global_allowed_command(self, allowance_key: str) -> None:
         """Persist a globally allowed command allowance key."""
-        config = self.load_config()
-        allowed = self.load_global_allowed_commands()
-        if allowance_key not in allowed:
-            allowed.append(allowance_key)
-        config["global_allowed_commands"] = allowed
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            allowed = self.load_global_allowed_commands()
+            if allowance_key not in allowed:
+                allowed.append(allowance_key)
+            config["global_allowed_commands"] = allowed
+            self.save_config(config)
 
     def add_global_rejected_command(self, allowance_key: str) -> None:
         """Persist a globally rejected command allowance key."""
-        config = self.load_config()
-        rejected = self.load_global_rejected_commands()
-        if allowance_key not in rejected:
-            rejected.append(allowance_key)
-        config["global_rejected_commands"] = rejected
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            rejected = self.load_global_rejected_commands()
+            if allowance_key not in rejected:
+                rejected.append(allowance_key)
+            config["global_rejected_commands"] = rejected
+            self.save_config(config)
 
     def remove_global_allowed_command(self, allowance_key: str) -> None:
         """Remove a globally allowed command allowance key."""
-        config = self.load_config()
-        allowed = self.load_global_allowed_commands()
-        if allowance_key in allowed:
-            allowed.remove(allowance_key)
-        config["global_allowed_commands"] = allowed
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            allowed = self.load_global_allowed_commands()
+            if allowance_key in allowed:
+                allowed.remove(allowance_key)
+            config["global_allowed_commands"] = allowed
+            self.save_config(config)
 
     def remove_global_rejected_command(self, allowance_key: str) -> None:
         """Remove a globally rejected command allowance key."""
-        config = self.load_config()
-        rejected = self.load_global_rejected_commands()
-        if allowance_key in rejected:
-            rejected.remove(allowance_key)
-        config["global_rejected_commands"] = rejected
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            rejected = self.load_global_rejected_commands()
+            if allowance_key in rejected:
+                rejected.remove(allowance_key)
+            config["global_rejected_commands"] = rejected
+            self.save_config(config)
 
     def clear_sessions(self, keep_session_path: Path | None = None) -> None:
         """Delete stored session history and rebuild session metadata."""
@@ -1247,9 +1303,12 @@ class AnomxHome:
         for record in reversed(remaining_records):
             self._append_session_index(record)
 
-        config = self.load_config()
-        config["last_session_id"] = remaining_records[0].session_id if remaining_records else None
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            config["last_session_id"] = (
+                remaining_records[0].session_id if remaining_records else None
+            )
+            self.save_config(config)
 
     def delete_session(self, session_path: Path) -> bool:
         """Delete a single stored session and rebuild session metadata."""
@@ -1285,12 +1344,13 @@ class AnomxHome:
             self._append_session_index(record)
 
         remaining_session_ids = {record.session_id for record in remaining_records}
-        config = self.load_config()
-        if config.get("last_session_id") not in remaining_session_ids:
-            config["last_session_id"] = (
-                remaining_records[0].session_id if remaining_records else None
-            )
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            if config.get("last_session_id") not in remaining_session_ids:
+                config["last_session_id"] = (
+                    remaining_records[0].session_id if remaining_records else None
+                )
+            self.save_config(config)
         return True
 
     def is_repo_trusted(self, repo_path: Path) -> bool:
@@ -1308,15 +1368,16 @@ class AnomxHome:
         """Mark a repository path as trusted."""
 
         self.ensure()
-        config = self.load_config()
-        projects = cast(dict[str, Any], config["projects"])
-        repo_key = self._repo_key(repo_path)
-        existing = projects.get(repo_key)
-        repo_entry = existing.copy() if isinstance(existing, dict) else {}
-        repo_entry["trust_level"] = "trusted"
-        repo_entry["trusted_at"] = utc_now_iso()
-        projects[repo_key] = repo_entry
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            projects = cast(dict[str, Any], config["projects"])
+            repo_key = self._repo_key(repo_path)
+            existing = projects.get(repo_key)
+            repo_entry = existing.copy() if isinstance(existing, dict) else {}
+            repo_entry["trust_level"] = "trusted"
+            repo_entry["trusted_at"] = utc_now_iso()
+            projects[repo_key] = repo_entry
+            self.save_config(config)
 
     def project_for_path(self, project_path: Path) -> ProjectRecord | None:
         """Return stored project metadata for a folder, if present."""
@@ -1342,20 +1403,21 @@ class AnomxHome:
         """Persist local project metadata without changing trust settings."""
 
         self.ensure()
-        config = self.load_config()
-        projects = cast(dict[str, Any], config["projects"])
-        project_key = self._repo_key(project_path)
-        existing = projects.get(project_key)
-        project_entry = existing.copy() if isinstance(existing, dict) else {}
-        now = utc_now_iso()
-        project_entry.setdefault("created_at", now)
-        project_entry["updated_at"] = now
-        project_entry["name"] = name.strip() or Path(project_key).name or "Anomx Project"
-        project_entry["path"] = project_key
-        if not project_entry.get("sandbox_hash"):
-            project_entry["sandbox_hash"] = self._sandbox_hash(project_path)
-        projects[project_key] = project_entry
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            projects = cast(dict[str, Any], config["projects"])
+            project_key = self._repo_key(project_path)
+            existing = projects.get(project_key)
+            project_entry = existing.copy() if isinstance(existing, dict) else {}
+            now = utc_now_iso()
+            project_entry.setdefault("created_at", now)
+            project_entry["updated_at"] = now
+            project_entry["name"] = name.strip() or Path(project_key).name or "Anomx Project"
+            project_entry["path"] = project_key
+            if not project_entry.get("sandbox_hash"):
+                project_entry["sandbox_hash"] = self._sandbox_hash(project_path)
+            projects[project_key] = project_entry
+            self.save_config(config)
         return ProjectRecord(
             path=Path(project_key),
             name=str(project_entry["name"]),
@@ -1427,9 +1489,10 @@ class AnomxHome:
             {"timestamp": now, "type": "session_meta", "payload": metadata},
         )
         self._append_session_index(record)
-        config = self.load_config()
-        config["last_session_id"] = record.session_id
-        self.save_config(config)
+        with self._config_lock():
+            config = self.load_config()
+            config["last_session_id"] = record.session_id
+            self.save_config(config)
         return record
 
     def append_worker_session_prompt(
@@ -2095,8 +2158,11 @@ class AnomxHome:
                 for key, value in sorted(project.items()):
                     lines.append(f"{key} = {self._format_toml_value(value)}")
 
-        tmp_path = path.with_suffix(f"{path.suffix}.tmp")
-        tmp_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        with tmp_path.open("w", encoding="utf-8") as handle:
+            handle.write("\n".join(lines) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         tmp_path.replace(path)
 
     def _format_toml_value(self, value: object) -> str:

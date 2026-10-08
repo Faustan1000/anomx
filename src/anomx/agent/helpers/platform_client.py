@@ -182,10 +182,12 @@ def _try_platform_heartbeat(
 
 
 def _store_platform_context(home: AnomxHome, payload: dict[str, Any]) -> None:
-    config = home.load_config()
-    config["platform_instructions"] = str(payload.get("platform_instructions") or "").strip()
-    config["custom_instructions"] = str(payload.get("custom_instructions") or "").strip()
-    home.save_config(config)
+    home.update_config(
+        {
+            "platform_instructions": str(payload.get("platform_instructions") or "").strip(),
+            "custom_instructions": str(payload.get("custom_instructions") or "").strip(),
+        }
+    )
     sync_platform_skills(home.skills_dir, payload.get("skills"))
 
 

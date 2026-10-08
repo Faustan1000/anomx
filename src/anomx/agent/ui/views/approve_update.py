@@ -83,8 +83,7 @@ class ApproveUpdateViewMixin:
                     return True
                 else:
                     config = self.home.load_config()
-                    config["skipped_version"] = latest
-                    self.home.save_config(config)
+                    config = self.home.update_config({"skipped_version": latest})
                     return True
         return True
 

@@ -279,10 +279,13 @@ class AnomxCliApp(
         if not self._model_allowed(provider, selected_model):
             selected_model = provider.models[0]
 
-        config["onboarding_complete"] = True
-        config["provider"] = provider.key
-        config["model"] = selected_model
-        self.home.save_config(config)
+        config = self.home.update_config(
+            {
+                "onboarding_complete": True,
+                "provider": provider.key,
+                "model": selected_model,
+            }
+        )
 
     def _provider_with_discovered_models(
         self,
@@ -1338,9 +1341,7 @@ class AnomxCliApp(
         config = self.home.load_config()
         if str(config.get("provider", "")) == provider and str(config.get("model", "")) == model:
             return
-        config["provider"] = provider
-        config["model"] = model
-        self.home.save_config(config)
+        config = self.home.update_config({"provider": provider, "model": model})
 
     def _ephemeral_session(self) -> SessionRecord:
         """Return a non-persisted placeholder session for backdrop rendering."""
@@ -4689,10 +4690,12 @@ class AnomxCliApp(
         if session is not None:
             self.home.update_session_agent(session.path, AgentKind.MAIN, next_mode)
         else:
-            config = self.home.load_config()
-            config["agent_kind"] = AgentKind.MAIN.value
-            config["agent_mode"] = next_mode.value
-            self.home.save_config(config)
+            self.home.update_config(
+                {
+                    "agent_kind": AgentKind.MAIN.value,
+                    "agent_mode": next_mode.value,
+                }
+            )
         return next_mode
 
     def _mode_hint_attr_name(self) -> str:

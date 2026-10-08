@@ -772,9 +772,7 @@ class ConfigViewMixin:
                         ),
                     )
                     if selected_mode is not None:
-                        config = self.home.load_config()
-                        config["work_visualization"] = selected_mode
-                        self.home.save_config(config)
+                        self.home.update_config({"work_visualization": selected_mode})
                         self.work_visualization = selected_mode
                         self._message_line_cache.clear()
                         self._rendered_message_cache.clear()
@@ -797,9 +795,7 @@ class ConfigViewMixin:
                     continue
                 if selected_value is None:
                     continue
-                config = self.home.load_config()
-                config[selected_setting] = int(selected_value)
-                self.home.save_config(config)
+                self.home.update_config({selected_setting: int(selected_value)})
                 continue
             selected_model = self._menu(
                 stdscr,
@@ -837,10 +833,9 @@ class ConfigViewMixin:
                     )
                     if effort is None:
                         continue
-            config = self.home.load_config()
-            config[setting.config_key] = selected_model
-            config[setting.effort_key] = effort
-            self.home.save_config(config)
+            self.home.update_config(
+                {setting.config_key: selected_model, setting.effort_key: effort}
+            )
 
     def _resolve_model_choice(
         self,
@@ -919,12 +914,14 @@ class ConfigViewMixin:
         if thinking_intensity is None:
             self.state = AgentState.NEW_SESSION
             return False
-        config = self.home.load_config()
-        config["provider"] = provider.key
-        config["model"] = model
-        config["thinking_intensity"] = thinking_intensity
-        config["onboarding_complete"] = True
-        self.home.save_config(config)
+        self.home.update_config(
+            {
+                "provider": provider.key,
+                "model": model,
+                "thinking_intensity": thinking_intensity,
+                "onboarding_complete": True,
+            }
+        )
         if getattr(current_session, "session_id", ""):
             self.home.update_session_model(current_session.path, provider.key, model)
         self.state = AgentState.NEW_SESSION
@@ -1024,12 +1021,14 @@ class ConfigViewMixin:
         if thinking_intensity is None:
             self.state = AgentState.PROJECT
             return False
-        config = self.home.load_config()
-        config["provider"] = provider.key
-        config["model"] = model
-        config["thinking_intensity"] = thinking_intensity
-        config["onboarding_complete"] = True
-        self.home.save_config(config)
+        self.home.update_config(
+            {
+                "provider": provider.key,
+                "model": model,
+                "thinking_intensity": thinking_intensity,
+                "onboarding_complete": True,
+            }
+        )
         self.state = AgentState.PROJECT
         return True
 
@@ -1082,8 +1081,7 @@ class ConfigViewMixin:
             )
             return True
 
-        config["thinking_intensity"] = matched.value
-        self.home.save_config(config)
+        config = self.home.update_config({"thinking_intensity": matched.value})
         self._message(stdscr, "Effort", f"Reasoning effort for {model} set to {matched.label}.")
         return True
 
@@ -1117,8 +1115,7 @@ class ConfigViewMixin:
         if selected is None:
             self.state = AgentState.NEW_SESSION
             return False
-        config["thinking_intensity"] = selected
-        self.home.save_config(config)
+        config = self.home.update_config({"thinking_intensity": selected})
         self.state = AgentState.NEW_SESSION
         return True
 
@@ -1157,8 +1154,7 @@ class ConfigViewMixin:
         if selected is None:
             self.state = AgentState.PROJECT
             return False
-        config["thinking_intensity"] = selected
-        self.home.save_config(config)
+        config = self.home.update_config({"thinking_intensity": selected})
         self.state = AgentState.PROJECT
         return True
 
@@ -1431,8 +1427,7 @@ class ConfigViewMixin:
                 "Runtime Changed",
                 f"'{config['sandbox_system']}' not found. Using '{runtime}' instead.",
             )
-            config["sandbox_system"] = runtime
-            self.home.save_config(config)
+            config = self.home.update_config({"sandbox_system": runtime})
 
         if config.get("sandbox_method") != "copy":
             return True
@@ -1467,8 +1462,7 @@ class ConfigViewMixin:
         if picked is None:
             return False
         if picked == "mount":
-            config["sandbox_method"] = "mount"
-            self.home.save_config(config)
+            config = self.home.update_config({"sandbox_method": "mount"})
         return True
 
     def _evaluate_project_size(
@@ -1571,8 +1565,7 @@ class ConfigViewMixin:
                     if confirm != "confirm":
                         continue
                     self._remove_all_sandbox_containers()
-                config["sandbox_enabled"] = not currently_enabled
-                self.home.save_config(config)
+                config = self.home.update_config({"sandbox_enabled": not currently_enabled})
                 if not currently_enabled:
                     self._activate_agent_mode(self.agent_mode)
                 else:
@@ -1586,8 +1579,7 @@ class ConfigViewMixin:
                 )
                 picked = self._menu(stdscr, "Sandbox Runtime", "Choose runtime", system_choices)
                 if picked is not None:
-                    config["sandbox_system"] = picked
-                    self.home.save_config(config)
+                    config = self.home.update_config({"sandbox_system": picked})
                 continue
             if selected == "method":
                 method_choices = (
@@ -1609,8 +1601,7 @@ class ConfigViewMixin:
                     method_choices,
                 )
                 if picked is not None:
-                    config["sandbox_method"] = picked
-                    self.home.save_config(config)
+                    config = self.home.update_config({"sandbox_method": picked})
                 continue
             if selected == "limits":
                 self._configure_sandbox_limits(stdscr)
@@ -1635,8 +1626,7 @@ class ConfigViewMixin:
                     strategy_choices,
                 )
                 if picked is not None:
-                    config["sandbox_strategy"] = picked
-                    self.home.save_config(config)
+                    config = self.home.update_config({"sandbox_strategy": picked})
                 continue
 
     def _sandbox_menu_choices(self, config: Mapping[str, object]) -> tuple[MenuChoice, ...]:
@@ -1689,8 +1679,7 @@ class ConfigViewMixin:
                     optional=False,
                 )
                 if value is not None and value.strip():
-                    config["sandbox_cpu_limit"] = value.strip()
-                    self.home.save_config(config)
+                    config = self.home.update_config({"sandbox_cpu_limit": value.strip()})
                 continue
             if selected == "ram":
                 value = self._run_overlay_text(
@@ -1701,8 +1690,7 @@ class ConfigViewMixin:
                     optional=False,
                 )
                 if value is not None and value.strip():
-                    config["sandbox_ram_limit"] = value.strip()
-                    self.home.save_config(config)
+                    config = self.home.update_config({"sandbox_ram_limit": value.strip()})
                 continue
             if selected == "hd":
                 value = self._run_overlay_text(
@@ -1713,8 +1701,7 @@ class ConfigViewMixin:
                     optional=False,
                 )
                 if value is not None and value.strip():
-                    config["sandbox_hd_limit"] = value.strip()
-                    self.home.save_config(config)
+                    config = self.home.update_config({"sandbox_hd_limit": value.strip()})
                 continue
 
     def _sandbox_limits_choices(self, config: Mapping[str, object]) -> tuple[MenuChoice, ...]:
@@ -1741,12 +1728,14 @@ class ConfigViewMixin:
                 self.state = AgentState.CONFIG
                 return
             if selected == "debug_mode":
-                config["debug_mode"] = not bool(config.get("debug_mode"))
-                self.home.save_config(config)
+                config = self.home.update_config({"debug_mode": not bool(config.get("debug_mode"))})
                 continue
             if selected == "full_session_logs":
-                config["debug_full_session_logs"] = not bool(config.get("debug_full_session_logs"))
-                self.home.save_config(config)
+                config = self.home.update_config(
+                    {
+                        "debug_full_session_logs": not bool(config.get("debug_full_session_logs")),
+                    }
+                )
                 continue
             if selected == "full_session_logs_path":
                 current_path = str(self.home.debug_location(config))
@@ -1757,8 +1746,11 @@ class ConfigViewMixin:
                     default=current_path,
                 )
                 if value is not None:
-                    config["debug_full_session_logs_path"] = value.strip() or str(self.home.root)
-                    self.home.save_config(config)
+                    config = self.home.update_config(
+                        {
+                            "debug_full_session_logs_path": value.strip() or str(self.home.root),
+                        }
+                    )
 
     def _debug_menu_choices(
         self,
@@ -2110,10 +2102,13 @@ class ConfigViewMixin:
         enriched = self._provider_with_discovered_models(provider)
         if not enriched.models:
             return
-        config["provider"] = provider.key
-        config["model"] = enriched.models[0]
-        config["onboarding_complete"] = True
-        self.home.save_config(config)
+        config = self.home.update_config(
+            {
+                "provider": provider.key,
+                "model": enriched.models[0],
+                "onboarding_complete": True,
+            }
+        )
 
     def _reset_active_model_if_orphaned(self) -> None:
         config = self.home.load_config()
@@ -2127,9 +2122,7 @@ class ConfigViewMixin:
         enriched = self._provider_with_discovered_models(fallback)
         if not enriched.models:
             return
-        config["provider"] = fallback.key
-        config["model"] = enriched.models[0]
-        self.home.save_config(config)
+        config = self.home.update_config({"provider": fallback.key, "model": enriched.models[0]})
 
     def _configure_platform(
         self,

@@ -49,11 +49,13 @@ class OnboardingViewMixin:
         if not provider.requires_api_key:
             self.home.set_backend_connected(provider.key, True)
 
-        config = self.home.load_config()
-        config["onboarding_complete"] = True
-        config["provider"] = provider.key
-        config["model"] = model
-        config["thinking_intensity"] = thinking_intensity
-        config["user_name"] = user_name.strip()
-        self.home.save_config(config)
+        self.home.update_config(
+            {
+                "onboarding_complete": True,
+                "provider": provider.key,
+                "model": model,
+                "thinking_intensity": thinking_intensity,
+                "user_name": user_name.strip(),
+            }
+        )
         return True
