@@ -255,20 +255,30 @@ class PopupComponentMixin:
         choices: tuple[MenuChoice, ...] = (),
         footer: str = "Esc Back · ↑↓ Navigate · Enter Select",
         initial_value: str | None = None,
+        refresh: Callable[[], tuple[str, tuple[MenuChoice, ...]]] | None = None,
     ) -> str | None:
-        """Run an overlay menu loop."""
-        if not choices:
-            return None
-        selectable_indices = tuple(
-            index for index, choice in enumerate(choices) if choice.selectable
-        )
-        if not selectable_indices:
-            return None
-        selected = next(
-            (index for index in selectable_indices if choices[index].value == initial_value),
-            selectable_indices[0],
-        )
+        """Run an overlay menu loop.
+
+        With ``refresh`` the menu wakes up periodically and asks it for the current
+        subtitle and choices, so status shown in the menu stays live (for example while
+        background work runs). The selection is kept by value across refreshes.
+        """
+        selected_value = initial_value
         while True:
+            if refresh is not None:
+                subtitle, choices = refresh()
+            if not choices:
+                return None
+            selectable_indices = tuple(
+                index for index, choice in enumerate(choices) if choice.selectable
+            )
+            if not selectable_indices:
+                return None
+            selected = next(
+                (index for index in selectable_indices if choices[index].value == selected_value),
+                selectable_indices[0],
+            )
+            selected_value = choices[selected].value
             self._draw_overlay(
                 stdscr,
                 title=title,
@@ -277,22 +287,30 @@ class PopupComponentMixin:
                 selected=selected,
                 footer=footer,
             )
-            key = stdscr.get_wch()
+            key = (
+                self._read_prompt_key_idle(stdscr) if refresh is not None else stdscr.get_wch()
+            )
+            if key is None:
+                continue
             if self._is_escape(key) or self._is_ctrl_c(key):
                 return None
             if key == curses.KEY_UP:
-                selected = next(
+                selected_value = next(
                     (
-                        index
-                        for index in reversed(selectable_indices)
-                        if index < selected
+                        choice.value
+                        for index, choice in reversed(list(enumerate(choices)))
+                        if choice.selectable and index < selected
                     ),
-                    selected,
+                    selected_value,
                 )
             elif key == curses.KEY_DOWN:
-                selected = next(
-                    (index for index in selectable_indices if index > selected),
-                    selected,
+                selected_value = next(
+                    (
+                        choice.value
+                        for index, choice in enumerate(choices)
+                        if choice.selectable and index > selected
+                    ),
+                    selected_value,
                 )
             elif self._is_enter(key) and choices[selected].selectable:
                 return choices[selected].value

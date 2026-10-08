@@ -99,3 +99,66 @@ def test_bottom_menu_search_filters_choices(tmp_path):
 
     assert result == "g"
     assert [choice.value for choice in panels[-1].choices] == ["g"]
+
+
+class _IdleKeys:
+    """Window with timeout support: ``None`` in the key list is a read that times out."""
+
+    def __init__(self, keys):
+        self._keys = list(keys)
+
+    def timeout(self, milliseconds):
+        pass
+
+    def nodelay(self, flag):
+        pass
+
+    def get_wch(self):
+        key = self._keys.pop(0) if self._keys else None
+        if key is None:
+            raise curses.error("timeout")
+        return key
+
+
+def test_refreshing_menu_keeps_the_selection_by_value_when_rows_appear(tmp_path):
+    app = _app(tmp_path)
+    frames: list[tuple[str, ...]] = []
+    snapshots = [
+        (MenuChoice("Alpha", "a"), MenuChoice("Beta", "b")),
+        (MenuChoice("Alpha", "a"), MenuChoice("Beta", "b")),
+        (MenuChoice("New", "n"), MenuChoice("Alpha", "a"), MenuChoice("Beta", "b")),
+        (MenuChoice("New", "n"), MenuChoice("Alpha", "a"), MenuChoice("Beta", "b")),
+    ]
+    calls = iter(snapshots)
+
+    def refresh():
+        return "subtitle", next(calls)
+
+    app._draw_overlay = lambda _w, **kw: frames.append(
+        (kw["choices"][kw["selected"]].value, str(len(kw["choices"])))
+    )
+
+    result = app._run_overlay_menu(
+        _IdleKeys([curses.KEY_DOWN, None, "\n"]), "Cowork", refresh=refresh
+    )
+
+    # Selection moved to Beta, a row appeared above it, and Enter still returns Beta.
+    assert result == "b"
+    assert frames[-1] == ("b", "3")
+
+
+def test_refreshing_menu_idles_without_returning_and_ends_on_escape(tmp_path):
+    app = _app(tmp_path)
+    app._draw_overlay = lambda *a, **k: None
+    refreshes: list[int] = []
+
+    def refresh():
+        refreshes.append(1)
+        return "s", (MenuChoice("Only", "o"),)
+
+    assert app._run_overlay_menu(_IdleKeys([None, None, "\x1b"]), "T", refresh=refresh) is None
+    assert len(refreshes) >= 3  # refreshed on every wake-up
+
+
+def test_menu_without_refresh_is_unchanged_for_empty_choices(tmp_path):
+    assert _app(tmp_path)._run_overlay_menu(_Keys([]), "T", choices=()) is None
