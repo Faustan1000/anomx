@@ -10,8 +10,7 @@ from pathlib import Path
 import pytest
 
 from anomx.agent.cowork import CoworkWorkspace, TaskStatus
-from anomx.agent.cowork.agent import CoworkRuntime
-from anomx.agent.runtime import RuntimeCallbacks
+from anomx.agent.runtime import AgentRuntime, RuntimeCallbacks
 from anomx.agent.store import AnomxHome
 
 SOURCE = "def load():\n    return {'a': 1}\n\n\ndef show(x):\n    return x['a']\n"
@@ -73,7 +72,7 @@ def _fake_agent(monkeypatch, *, edit=True, release: threading.Event | None = Non
             )
         return "Switched to attribute access."
 
-    monkeypatch.setattr(CoworkRuntime, "backend_response", backend_response)
+    monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
 
 
 def test_locate_needs_a_margo_vault(tmp_path):
@@ -145,7 +144,7 @@ def test_a_crashing_agent_is_shown_as_failed_with_the_reason(panel, monkeypatch)
     def explode(self, *_a, **_k):
         raise RuntimeError("model unreachable")
 
-    monkeypatch.setattr(CoworkRuntime, "backend_response", explode)
+    monkeypatch.setattr(AgentRuntime, "backend_response", explode)
     panel.start(_row(panel, "n-1"))
     panel.wait("n-1")
 
@@ -163,7 +162,7 @@ def test_stop_asks_the_running_agent_to_end(panel, monkeypatch):
             threading.Event().wait(0.01)
         return ""
 
-    monkeypatch.setattr(CoworkRuntime, "backend_response", waits_for_abort)
+    monkeypatch.setattr(AgentRuntime, "backend_response", waits_for_abort)
     panel.start(_row(panel, "n-1"))
     started.wait(5)
 

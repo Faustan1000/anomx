@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from anomx.agent.app import AnomxCliApp
-from anomx.agent.cowork.agent import CoworkRuntime
+from anomx.agent.runtime import AgentRuntime
 from anomx.agent.store import AnomxHome
 from anomx.agent.ui.constants import PROJECT_COMMANDS, SLASH_COMMANDS
 
@@ -93,7 +93,7 @@ def fake_agent(monkeypatch):
         )
         return "Switched to attribute access."
 
-    monkeypatch.setattr(CoworkRuntime, "backend_response", backend_response)
+    monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
 
 
 def _panel(app: AnomxCliApp, workspace: Path):

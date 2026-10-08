@@ -21,7 +21,7 @@ from anomx.agent.cowork import (
 )
 from anomx.agent.cowork.agent import CoworkRuntime, EditError, apply_edit
 from anomx.agent.exceptions import BackendFailure
-from anomx.agent.runtime import RuntimeCallbacks
+from anomx.agent.runtime import AgentRuntime, RuntimeCallbacks
 from anomx.agent.store import AnomxHome
 
 SOURCE = (
@@ -216,7 +216,7 @@ def _fake_agent(monkeypatch, *, edits=(), reply="Changed the dict; callers updat
             )
         return reply
 
-    monkeypatch.setattr(CoworkRuntime, "backend_response", backend_response)
+    monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
     return seen
 
 
@@ -285,7 +285,7 @@ def test_backend_failure_marks_the_task_failed_and_it_can_run_again(
     service, workspace, monkeypatch
 ):
     monkeypatch.setattr(
-        CoworkRuntime, "backend_response", lambda self, *a, **k: BackendFailure("model down")
+        AgentRuntime, "backend_response", lambda self, *a, **k: BackendFailure("model down")
     )
     task = service.prepare(_note(workspace), workspace)
 
@@ -300,7 +300,7 @@ def test_an_exception_or_abort_is_recorded_instead_of_escaping(service, workspac
     def explode(self, *_a, **_k):
         raise RuntimeError("network lost")
 
-    monkeypatch.setattr(CoworkRuntime, "backend_response", explode)
+    monkeypatch.setattr(AgentRuntime, "backend_response", explode)
     task = service.prepare(_note(workspace), workspace)
     assert "network lost" in service.run(task.note_id).error
 
@@ -308,7 +308,7 @@ def test_an_exception_or_abort_is_recorded_instead_of_escaping(service, workspac
         self.abort_current_turn()
         return ""
 
-    monkeypatch.setattr(CoworkRuntime, "backend_response", aborted)
+    monkeypatch.setattr(AgentRuntime, "backend_response", aborted)
     result = service.run(task.note_id)
     assert result.task.status is TaskStatus.FAILED and "Stopped" in result.error
 
@@ -385,3 +385,120 @@ def test_prompt_contains_only_the_note_and_nearby_code(workspace):
     assert "make the dict a dataclass" in prompt and "    2      return {" in prompt
     assert "Make the change the note asks for" in prompt
     assert os.sep + "workspace" not in prompt  # no absolute paths leak into the prompt
+
+
+# -- chat per note --------------------------------------------------------------------
+
+
+def _messages(home: AnomxHome, session_path: Path) -> list[str]:
+    return [
+        event["payload"]["message"]
+        for event in home.read_session_events(session_path)
+        if event["type"] == "event_msg" and event["payload"].get("type") == "user_message"
+    ]
+
+
+def test_open_chat_creates_a_session_in_the_worktree_titled_after_the_note(
+    service, home, workspace
+):
+    task, record = service.open_chat(_note(workspace), workspace, discuss=True)
+
+    assert Path(record.cwd) == Path(task.worktree).resolve()
+    assert record.title == "make the dict a dataclass"
+    (first,) = _messages(home, record.path)
+    assert "talk this through first" in first and "Do not edit any file" in first
+    assert "make the dict a dataclass" in first and "def load():" in first
+    assert service.note_for_session(record.path) == "n-1"
+    assert service.note_for_session(Path("/somewhere/else.jsonl")) is None
+
+
+def test_open_chat_reuses_the_session_instead_of_creating_another(service, workspace):
+    _task, first = service.open_chat(_note(workspace), workspace, discuss=True)
+
+    _task, again = service.open_chat(_note(workspace), workspace)
+
+    assert again.path == first.path
+
+
+def test_chat_turns_are_committed_on_top_of_each_other(service, home, workspace, monkeypatch):
+    task, record = service.open_chat(_note(workspace), workspace)
+    replies = iter(
+        [
+            ([("item['name']", "item.name")], "First: attribute access."),
+            ([], "Option B would be a TypedDict; no edit."),
+            ([("'size': 1", "'size': 2")], "Second: bumped the size."),
+        ]
+    )
+
+    def turn(self, session_path, callbacks=None, **_kwargs):
+        edits, reply = next(replies)
+        for old, new in edits:
+            self._execute_tool(
+                "edit_file",
+                {"statement": "s", "path": "src/data.py", "old_text": old, "new_text": new},
+                callbacks or RuntimeCallbacks(),
+                session_path,
+            )
+        return reply
+
+    monkeypatch.setattr(AgentRuntime, "backend_response", turn)
+    runtime = service.runtime_for("n-1")
+
+    runtime.backend_response(record.path)
+    assert service.git.commits_ahead(task.branch, task.base_commit) == 1
+    runtime.backend_response(record.path)  # a discussion turn changes nothing
+    assert service.git.commits_ahead(task.branch, task.base_commit) == 1
+    assert service.tasks.get("n-1").summary.startswith("Option B")
+    runtime.backend_response(record.path)
+
+    assert service.git.commits_ahead(task.branch, task.base_commit) == 2
+    assert service.tasks.get("n-1").status is TaskStatus.READY
+    diff = service.diff("n-1")
+    assert "+    return item.name" in diff and "'size': 2" in diff
+
+
+def test_a_failed_chat_turn_marks_the_task_failed(service, workspace, monkeypatch):
+    task, record = service.open_chat(_note(workspace), workspace)
+    monkeypatch.setattr(
+        AgentRuntime, "backend_response", lambda self, *a, **k: BackendFailure("rate limited")
+    )
+
+    service.runtime_for("n-1").backend_response(record.path)
+
+    stored = service.tasks.get(task.note_id)
+    assert stored.status is TaskStatus.FAILED and stored.summary == "rate limited"
+
+
+def test_starting_the_agent_continues_an_existing_chat(service, home, workspace, monkeypatch):
+    _task, record = service.open_chat(_note(workspace), workspace, discuss=True)
+    seen: dict[str, str] = {}
+
+    def backend_response(self, session_path, callbacks=None, **_kwargs):
+        seen["session"] = str(session_path)
+        self._execute_tool(
+            "edit_file",
+            {
+                "statement": "s",
+                "path": "src/data.py",
+                "old_text": "item['name']",
+                "new_text": "item.name",
+            },
+            callbacks or RuntimeCallbacks(),
+            session_path,
+        )
+        return "Done."
+
+    monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
+
+    result = service.run("n-1")
+
+    assert seen["session"] == str(record.path)  # same conversation, no second session
+    assert _messages(home, record.path)[-1] == "Please make the change now."
+    assert result.committed and result.task.status is TaskStatus.READY
+
+
+def test_the_cowork_runtime_never_starts_a_sandbox(home, tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    assert CoworkRuntime(home, worktree).init_sandbox() is False

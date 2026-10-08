@@ -9,13 +9,15 @@ from __future__ import annotations
 
 import os
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from anomx.agent.base.agents import AgentKind, BaseAgent
 from anomx.agent.base.tools import BaseTool, ToolExecutionContext, object_schema, statement_property
-from anomx.agent.runtime import AgentRuntime
+from anomx.agent.exceptions import BackendFailure
+from anomx.agent.runtime import AgentRuntime, RuntimeCallbacks
 from anomx.agent.tools import SUBAGENT_STATEMENT_DESCRIPTION
 from anomx.agent.tools.glob import GlobTool
 from anomx.agent.tools.grep import GrepTool
@@ -36,6 +38,10 @@ COWORK_PROMPT = """\
 - You cannot ask questions and nobody answers while you work. When the note is ambiguous, take
   the most conservative reading and name the assumption in your summary. If no change is needed
   or possible, change nothing and say why.
+- The conversation can continue after your first answer. When the user asks a question,
+  wants options or talks a theory through, answer concisely and do not edit anything. Edit
+  only when the note itself is an instruction or the user asks for a change; then keep to the
+  minimal-diff rule again. Later requests build on your earlier edits in the same worktree.
 - You can read, list, glob, grep and edit files with `edit_file`. You cannot run commands, so
   say in your summary what you could not verify.
 - Finish with a plain summary of at most six lines: what you changed (files), the assumptions
@@ -214,14 +220,44 @@ class CoworkAgent(BaseAgent):
         )
 
 
+TurnHook = Callable[[str, bool, bool], None]
+"""Called after every model turn as ``hook(response, aborted, failed)``."""
+
+
 class CoworkRuntime(AgentRuntime):
-    """Runtime bound to one task worktree with the lean cowork prompt and tools."""
+    """Runtime bound to one task worktree with the lean cowork prompt and tools.
+
+    It is used both for the first run of a task and for every later chat turn, so the
+    ``after_turn`` hook is where results get committed in both cases.
+    """
 
     def __init__(self, home: Any, worktree: Path, **kwargs: Any) -> None:
         kwargs.setdefault("agent_kind", AgentKind.SUB)
         super().__init__(home, worktree, workspace_root=worktree, **kwargs)
         self.agent_spec = CoworkAgent()
         self.agent_kind = self.agent_spec.kind
+        self.after_turn: TurnHook | None = None
+
+    def init_sandbox(self, *_args: Any, **_kwargs: Any) -> bool:
+        """Cowork agents have no shell, so there is nothing to run in a sandbox."""
+
+        return False
+
+    def backend_response(
+        self,
+        session_path: Path,
+        callbacks: RuntimeCallbacks | None = None,
+        *,
+        debug_session_path: Path | None = None,
+    ) -> str:
+        response = super().backend_response(
+            session_path, callbacks, debug_session_path=debug_session_path
+        )
+        if self.after_turn is not None:
+            self.after_turn(
+                str(response), self._turn_aborted(), isinstance(response, BackendFailure)
+            )
+        return response
 
     def set_agent(self, kind: AgentKind | str) -> None:
         """The cowork role is fixed; callers cannot swap it for a general agent."""

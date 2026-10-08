@@ -1736,6 +1736,11 @@ class AnomxHome:
     def _trim_cli_usage(usage: Mapping[str, int], *, max_days: int = 371) -> dict[str, int]:
         return {key: int(usage[key]) for key in sorted(usage)[-max_days:] if int(usage[key]) > 0}
 
+    def session_record(self, session_path: Path) -> SessionRecord | None:
+        """Index entry of one session transcript, or ``None`` if it cannot be read."""
+
+        return self._read_session_record_cached(session_path)
+
     def update_session_title(self, session_path: Path, title: str) -> None:
         """Update the title stored in the session metadata event."""
 

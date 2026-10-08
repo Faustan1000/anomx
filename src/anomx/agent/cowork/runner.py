@@ -12,14 +12,14 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
+from anomx.agent.base.agents import AgentKind
 from anomx.agent.cowork.agent import CoworkRuntime
 from anomx.agent.cowork.git import CoworkGit, FollowResult, GitError, MergeResult, branch_for
 from anomx.agent.cowork.margo import MARGO_LINE_BASE, MargoNote, NoteContext, note_context
 from anomx.agent.cowork.tasks import CoworkTask, TaskStatus, TaskStore
-from anomx.agent.exceptions import BackendFailure
 from anomx.agent.helpers.mode import AgentMode
 from anomx.agent.runtime import RuntimeCallbacks
-from anomx.agent.store import AnomxHome
+from anomx.agent.store import AnomxHome, SessionRecord
 
 MAX_SUMMARY_CHARS = 2_000
 RUNNABLE = {TaskStatus.QUEUED, TaskStatus.FAILED}
@@ -35,8 +35,12 @@ class RunResult:
     error: str = ""
 
 
-def build_task_prompt(task: CoworkTask, context: NoteContext) -> str:
-    """The only thing the agent is told: this note and the code around it."""
+def build_task_prompt(task: CoworkTask, context: NoteContext, *, discuss: bool = False) -> str:
+    """The only thing the agent is told: this note and the code around it.
+
+    With ``discuss`` the user wants to talk the note through first, so the agent must not
+    edit anything until asked.
+    """
 
     lines = [
         "The user left this note in their editor:",
@@ -53,7 +57,14 @@ def build_task_prompt(task: CoworkTask, context: NoteContext) -> str:
             context.snippet,
             "",
         ]
-    lines.append("Make the change the note asks for, then give your short summary.")
+    if discuss:
+        lines.append(
+            "The user wants to talk this through first. Do not edit any file until they ask "
+            "you to make a change. Answer concisely, name the options and their trade-offs "
+            "and ask what they prefer."
+        )
+    else:
+        lines.append("Make the change the note asks for, then give your short summary.")
     return "\n".join(lines)
 
 
@@ -69,6 +80,7 @@ class CoworkService:
         self.tasks = TaskStore(self.state_dir / "tasks.json")
         self.worktrees = self.state_dir / "worktrees"
         self._running: dict[str, CoworkRuntime] = {}
+        self._outcomes: dict[str, tuple[str | None, str]] = {}
         self._lock = threading.Lock()
 
     # -- preparing --------------------------------------------------------------------
@@ -107,57 +119,134 @@ class CoworkService:
 
     # -- running ----------------------------------------------------------------------
 
-    def run(
-        self, note_id: str, callbacks: RuntimeCallbacks | None = None
-    ) -> RunResult:
-        """Run the agent for a prepared task and commit what it did. Blocks until done."""
+    def run(self, note_id: str, callbacks: RuntimeCallbacks | None = None) -> RunResult:
+        """Run the agent for a prepared task and commit what it did. Blocks until done.
+
+        When the task already has a chat (``open_chat``), the agent continues that
+        conversation; otherwise a new session with the note as its first message is made.
+        """
 
         task = self._require(note_id)
         if task.status not in RUNNABLE:
             raise GitError(f"Task is {task.status.value}; only queued or failed tasks can run.")
-        worktree = Path(task.worktree)
         self.tasks.update(note_id, status=TaskStatus.RUNNING, summary="")
 
+        session_path = self._existing_session(task)
+        if session_path is None:
+            session_path = self._create_session(task, discuss=False).path
+        else:
+            self.home.append_session_event(
+                session_path, "user_message", {"message": "Please make the change now."}
+            )
+        runtime = self.runtime_for(note_id)
+        with self._lock:
+            self._running[note_id] = runtime
+        self._outcomes.pop(note_id, None)
+
+        try:
+            runtime.backend_response(session_path, callbacks or RuntimeCallbacks())
+        except Exception as exc:  # noqa: BLE001 - the task must end in a recorded state
+            error = f"{type(exc).__name__}: {exc}"
+            self._finish(note_id, "", aborted=False, failed=True, error=error)
+        finally:
+            with self._lock:
+                self._running.pop(note_id, None)
+        updated = self._require(note_id)
+        commit, error = self._outcomes.pop(note_id, (None, ""))
+        return RunResult(updated, commit is not None, updated.summary if not error else "", error)
+
+    # -- chat -------------------------------------------------------------------------
+
+    def open_chat(
+        self, note: MargoNote, workspace: Path, *, discuss: bool = False
+    ) -> tuple[CoworkTask, SessionRecord]:
+        """Task and chat session of a note, created on first use.
+
+        The chat is an ordinary anomx session whose working directory is the task's
+        worktree; its first message is the note. ``discuss`` tells the agent to talk first
+        instead of editing.
+        """
+
+        task = self.tasks.get(note.id)
+        if task is None or not task.is_active:
+            task = self.prepare(note, workspace)
+        existing = self._existing_session(task)
+        if existing is not None:
+            record = self.home.session_record(existing)
+            if record is not None:
+                return task, record
+        record = self._create_session(task, discuss=discuss)
+        return self._require(note.id), record
+
+    def runtime_for(self, note_id: str) -> CoworkRuntime:
+        """A runtime for the task's worktree that commits after every model turn."""
+
+        task = self._require(note_id)
+        runtime = CoworkRuntime(self.home, Path(task.worktree), mode=AgentMode.STANDARD)
+
+        def after_turn(response: str, aborted: bool, failed: bool) -> None:
+            error = ""
+            if failed:
+                error = response or "The model request failed."
+            elif aborted:
+                error = "Stopped before the agent finished."
+            self._finish(note_id, response, aborted=aborted, failed=bool(error), error=error)
+
+        runtime.after_turn = after_turn
+        return runtime
+
+    def note_for_session(self, session_path: Path) -> str | None:
+        """Note whose chat is this session, if any."""
+
+        for task in self.tasks.list():
+            if task.session_path and Path(task.session_path) == session_path:
+                return task.note_id
+        return None
+
+    def _existing_session(self, task: CoworkTask) -> Path | None:
+        if not task.session_path:
+            return None
+        path = Path(task.session_path)
+        return path if path.exists() else None
+
+    def _create_session(self, task: CoworkTask, *, discuss: bool) -> SessionRecord:
+        worktree = Path(task.worktree)
         config = self.home.load_config()
-        runtime = CoworkRuntime(self.home, worktree, mode=AgentMode.STANDARD)
         session = self.home.create_session(
             worktree,
             str(config.get("provider", "")),
             str(config.get("model", "")),
-            agent_kind=runtime.agent_kind,
+            agent_kind=AgentKind.SUB,
         )
+        self.home.update_session_title(session.path, task.title or "Cowork note")
         context = note_context(worktree, _note_view(task))
         self.home.append_session_event(
             session.path,
             "user_message",
-            {"message": build_task_prompt(task, context)},
+            {"message": build_task_prompt(task, context, discuss=discuss)},
         )
-        self.tasks.update(note_id, session_path=str(session.path))
-        with self._lock:
-            self._running[note_id] = runtime
+        self.tasks.update(task.note_id, session_path=str(session.path))
+        return self.home.session_record(session.path) or session
 
-        error = ""
-        summary = ""
+    def _finish(
+        self, note_id: str, response: str, *, aborted: bool, failed: bool, error: str
+    ) -> None:
+        """Commit what a turn produced and record the outcome (also used for chat turns)."""
+
+        del aborted
+        task = self.tasks.get(note_id)
+        if task is None:
+            return
+        summary = response.strip()[:MAX_SUMMARY_CHARS]
         try:
-            response = runtime.backend_response(session.path, callbacks or RuntimeCallbacks())
-            if isinstance(response, BackendFailure):
-                error = str(response)
-            else:
-                summary = str(response).strip()[:MAX_SUMMARY_CHARS]
-        except Exception as exc:  # noqa: BLE001 - the task must end in a recorded state
-            error = f"{type(exc).__name__}: {exc}"
-        finally:
-            with self._lock:
-                self._running.pop(note_id, None)
-
-        aborted = runtime._turn_aborted()
-        if aborted and not error:
-            error = "Stopped before the agent finished."
-        commit = self.git.commit_all(worktree, _commit_message(task, summary or error))
-        status = TaskStatus.FAILED if error else TaskStatus.READY
-        updated = self.tasks.update(note_id, status=status, summary=summary or error)
-        assert updated is not None
-        return RunResult(updated, commit is not None, summary, error)
+            commit = self.git.commit_all(
+                Path(task.worktree), _commit_message(task, summary or error)
+            )
+        except GitError as exc:
+            commit, error, failed = None, error or str(exc), True
+        self._outcomes[note_id] = (commit, error if failed else "")
+        status = TaskStatus.FAILED if failed else TaskStatus.READY
+        self.tasks.update(note_id, status=status, summary=error if failed else summary)
 
     def abort(self, note_id: str) -> bool:
         """Ask a running agent to stop; ``run`` then records the task as failed."""
