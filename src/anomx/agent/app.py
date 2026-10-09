@@ -23,6 +23,7 @@ from uuid import uuid4
 
 from anomx.agent.base.agents import AgentKind, BaseAgent
 from anomx.agent.cowork import CoworkFollower, CoworkWorkspace
+from anomx.agent.cowork.extension import INSTALL_CLI_COMMAND, extension_needs_install
 from anomx.agent.file_reference_search import FileReferenceSearchClient
 from anomx.agent.helpers.anomx_api import call_anomx_api, connection_from_home
 from anomx.agent.helpers.mode import AgentMode, next_agent_mode
@@ -131,6 +132,7 @@ IDLE_POLL_MILLISECONDS = 500
 REQUEUE_STOP_GRACE_SECONDS = 1.5
 # How often the cowork follower looks at the editor context while a session is open.
 COWORK_POLL_SECONDS = 0.5
+VSCODE_HINT_DISMISSED_KEY = "vscode_extension_hint_dismissed"
 REQUEUE_BUSY_NOTICE = "Still stopping the previous run · press Enter again in a moment"
 
 
@@ -257,6 +259,8 @@ class AnomxCliApp(
         self._approval_memory_reason = ""
         self._cowork_panels: dict[Path, CoworkWorkspace] = {}
         self._cowork_follower: CoworkFollower | None = None
+        self._cowork_serving = False
+        self._next_cowork_dispatch = 0.0
         self._next_cowork_poll = 0.0
 
     def prepare_background_startup(self, *, wait_for_runtime: bool = False) -> None:
@@ -355,12 +359,51 @@ class AnomxCliApp(
             self._cleanup_stale_project_sessions(project)
             if not self._handle_sandbox_check(stdscr, project):
                 return 1
+            self._offer_vscode_extension(stdscr)
             try:
                 return self._run_project(stdscr, project)
             finally:
                 self._shutdown_active_session_turns()
                 self._shutdown_sandbox_containers()
                 self.runtime.shutdown()
+
+    def _offer_vscode_extension(self, stdscr: CursesWindow) -> None:
+        """Inside VS Code without the extension: show the one command that installs it."""
+
+        if self.home.load_config().get(VSCODE_HINT_DISMISSED_KEY):
+            return
+        reason = extension_needs_install(self.home.root)
+        if not reason:
+            return
+        subtitle = "Extension not installed" if reason == "missing" else "Extension is outdated"
+        while True:
+            choice = self._menu(
+                stdscr,
+                "VS Code extension",
+                subtitle,
+                (
+                    MenuChoice(
+                        INSTALL_CLI_COMMAND,
+                        "copy",
+                        "Enter copies it; run it, then reload VS Code",
+                    ),
+                    MenuChoice("Continue", "continue"),
+                    MenuChoice("Do not show this again", "dismiss"),
+                ),
+            )
+            if choice == "copy":
+                copied = self._copy_to_clipboard(INSTALL_CLI_COMMAND)
+                self._message(
+                    stdscr,
+                    "VS Code extension",
+                    "Copied. Paste it into a terminal."
+                    if copied
+                    else f"Could not copy. Type it yourself: {INSTALL_CLI_COMMAND}",
+                )
+                continue
+            if choice == "dismiss":
+                self.home.update_config({VSCODE_HINT_DISMISSED_KEY: True})
+            return
 
     def _poll_startup_tasks(self) -> None:
         if self._startup_tasks is not None:
@@ -1391,6 +1434,7 @@ class AnomxCliApp(
                 view.exit_notice = ""
             current_session = self._process_title_events(stdscr, current_session)
             view.expire_notice(time.monotonic())
+            self._cowork_serve_step()
             current_session = self._cowork_follow_step(stdscr, current_session, view)
             self._reap_idle_runtimes()
             active_turn = self._active_turn_for_session(current_session)
@@ -2597,6 +2641,22 @@ class AnomxCliApp(
             view.anchor_released = False  # back at the bottom: pin the message again
             view.scroll = 0
 
+    def _cowork_serve_step(self) -> None:
+        """Start agents for comments and questions the user just made in the editor.
+
+        Only while "Work on notes from VS Code" is on; polls twice a second like following.
+        """
+
+        if not self._cowork_serving:
+            return
+        now = time.monotonic()
+        if now < self._next_cowork_dispatch:
+            return
+        self._next_cowork_dispatch = now + COWORK_POLL_SECONDS
+        panel = self._cowork_workspace()
+        if panel is not None:
+            panel.dispatch()
+
     def _cowork_follow_step(
         self,
         stdscr: CursesWindow,
@@ -2626,8 +2686,8 @@ class AnomxCliApp(
         if row is None:
             return session
         notices = [f"Cowork · {row.title}"]
-        record, problem = (None, None) if panel.is_running(row.note_id) else panel.open_chat(
-            row, discuss=True
+        record, problem = (
+            (None, None) if panel.is_running(row.note_id) else panel.open_chat(row, discuss=True)
         )
         if problem:
             notices.append(problem)
@@ -2644,9 +2704,7 @@ class AnomxCliApp(
         view.jump_to_bottom()
         return record
 
-    def _drain_background_session_turns(
-        self, stdscr: CursesWindow, current: SessionRecord
-    ) -> None:
+    def _drain_background_session_turns(self, stdscr: CursesWindow, current: SessionRecord) -> None:
         """Process events and completion of running turns of sessions that are not on screen."""
 
         current_key = self._session_turn_key(current)
@@ -2783,7 +2841,9 @@ class AnomxCliApp(
                 previous = self._session_usage_snapshots.get(session.path)
                 if previous is not None:
                     self._session_usage_snapshots[session.path] = replace(
-                        previous, context_tokens=int(payload["context_tokens_after"]), latest=None,
+                        previous,
+                        context_tokens=int(payload["context_tokens_after"]),
+                        latest=None,
                     )
 
         def run_backend() -> None:
@@ -4502,7 +4562,8 @@ class AnomxCliApp(
                     self._append_question_context(session, question_request, answer)
             elif event.kind == "context_activity" and event.text:
                 self.home.append_session_event(
-                    session.path, "context_activity_display",
+                    session.path,
+                    "context_activity_display",
                     {**json.loads(event.text), "turn_id": turn_id},
                 )
             elif event.kind == "system_message" and event.text:

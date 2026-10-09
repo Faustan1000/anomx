@@ -7,6 +7,8 @@
 //   of the cursor line. It does not read other files, open ports, use the network, call
 //   other processes or send selected text. The Anomx CLI agent reads the file.
 //
+// Notes and questions (comments.js, notes.js) are described in README.md.
+//
 // The logic lives in plain functions (no `vscode` types) so it can be tested with Node.
 
 const fs = require('fs');
@@ -14,6 +16,7 @@ const os = require('os');
 const path = require('path');
 
 const SCHEMA = 1;
+const VERSION = require('./package.json').version;
 const DEBOUNCE_MS = 100;
 const MAX_LINE_TEXT = 300;
 
@@ -31,6 +34,7 @@ function oneBased(position) {
 function buildContext(snapshot, now = new Date(), pid = process.pid) {
   const base = {
     schema: SCHEMA,
+    extensionVersion: VERSION,
     updatedAt: now.toISOString(),
     pid,
     workspaceFolders: snapshot.workspaceFolders || [],
@@ -196,6 +200,14 @@ function activate(extensionContext) {
     },
   );
   schedule();
+
+  // Notes, questions and the sidebar (comments.js); a failure there must not stop the
+  // context writer above.
+  try {
+    require('./comments').activate(extensionContext, vscode);
+  } catch (error) {
+    console.error('anomx-editor-context: notes could not start', error);
+  }
 }
 
 function deactivate() {}

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from cowork_notes import note_entry, write_notes
 
 from anomx.agent.app import AnomxCliApp
 from anomx.agent.cowork.agent import CoworkRuntime
@@ -54,9 +55,8 @@ def workspace(tmp_path: Path) -> Path:
     (repo / "src" / "data.py").write_text(SOURCE, encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-m", "initial")
-    (root / ".margo").mkdir()
-    vault = {"./proj/src/data.py": [{"id": "n-1", "line": 0, "title": "make dataclass"}]}
-    (root / ".margo" / "local.notes.json").write_text(json.dumps(vault), encoding="utf-8")
+
+    write_notes(root, note_entry("n-1", "proj/src/data.py", 1, "make dataclass"))
     return root
 
 
@@ -129,13 +129,13 @@ def test_handle_command_opens_the_panel(app, monkeypatch):
     assert len(opened) == 1
 
 
-def test_without_a_margo_vault_the_panel_explains_what_to_do(tmp_path):
+def test_without_notes_the_panel_explains_what_to_do(tmp_path):
     lonely = AnomxCliApp(home=AnomxHome(tmp_path / "home"), cwd=tmp_path / "nowhere")
     screen = Screen(lonely)
 
     lonely._run_cowork_panel(Keys([]))
 
-    assert "No Margo notes found" in screen.messages[0][1]
+    assert "No notes found" in screen.messages[0][1]
 
 
 def test_panel_lists_notes_with_their_status(app):
@@ -144,7 +144,7 @@ def test_panel_lists_notes_with_their_status(app):
     app._run_cowork_panel(Keys([ESC]))
 
     assert screen.last_choices()[0] == ("proj/src/data.py:1  make dataclass", "[new]")
-    assert screen.last_choices()[-1][0] == "Follow my notes in the editor: off"
+    assert screen.last_choices()[-2][0] == "Follow my notes in the editor: off"
     assert screen.overlays[0]["subtitle"] == "1 notes"
 
 
@@ -355,12 +355,12 @@ def test_toggle_needs_the_extension_and_can_be_turned_off_again(app, workspace):
 
     app._run_cowork_panel(Keys([DOWN, ENTER, ESC]))  # no editor-context file yet
     assert app._cowork_follower is None
-    assert "Editor Context extension" in screen.messages[-1][1]
+    assert "anomx --install-vscode" in screen.messages[-1][1]
 
     _put_cursor(app, workspace, 1)
     app._run_cowork_panel(Keys([DOWN, ENTER, ESC]))
     assert app._cowork_follower is not None
-    assert screen.last_choices()[-1][0] == "Follow my notes in the editor: on"
+    assert screen.last_choices()[-2][0] == "Follow my notes in the editor: on"
 
     app._run_cowork_panel(Keys([DOWN, ENTER, ESC]))
     assert app._cowork_follower is None
@@ -611,7 +611,7 @@ def _fake_vscode(monkeypatch, *, code="/usr/bin/code", returncode=0):
 
 
 def workspace_path(panel) -> Path:
-    return panel.margo_workspace
+    return panel.notes_workspace
 
 
 def test_compare_opens_vscodes_diff_with_original_left_and_agent_right(

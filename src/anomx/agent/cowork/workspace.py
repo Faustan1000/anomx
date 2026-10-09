@@ -7,13 +7,19 @@ started in the background. The curses layer only draws rows and forwards the use
 
 from __future__ import annotations
 
+import functools
 import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from anomx.agent.cowork.agent import CoworkRuntime
+from anomx.agent.cowork.editor import context_path, read_editor_context
 from anomx.agent.cowork.git import FollowResult, GitError, MergeResult, find_repo_root
-from anomx.agent.cowork.margo import MargoNote, find_margo_workspace, read_margo_notes
+from anomx.agent.cowork.notes import Note, NoteMessage, find_notes_workspace, read_notes
+from anomx.agent.cowork.questions import QuestionService, question_repo
+from anomx.agent.cowork.replies import READY, WORKING, AgentReplies, find_locations
 from anomx.agent.cowork.runner import ComparisonFile, CoworkService
 from anomx.agent.cowork.tasks import CoworkTask, TaskStatus
 from anomx.agent.runtime import RuntimeCallbacks
@@ -22,7 +28,14 @@ from anomx.agent.store import AnomxHome, SessionRecord
 NEW = "new"
 ORPHAN = "orphan"
 NO_REPO = "no-repo"
+ANSWERED = "answered"
 MAX_PROGRESS_CHARS = 90
+PROGRESS_WRITE_SECONDS = 1.0
+TASK_STATUS_FOR_EDITOR = {
+    TaskStatus.MERGING: "merging",
+    TaskStatus.MERGED: "merged",
+    TaskStatus.DISCARDED: "discarded",
+}
 
 
 @dataclass(frozen=True)
@@ -35,13 +48,15 @@ class CoworkRow:
     line: int
     status: str
     detail: str
-    note: MargoNote | None = None
+    note: Note | None = None
     task: CoworkTask | None = None
     repo_root: Path | None = None
     running: bool = False
 
     @property
     def label(self) -> str:
+        if self.note is not None and self.note.is_question:
+            return f"? {self.title}"
         return f"{self.file}:{self.line}  {self.title}"
 
 
@@ -55,9 +70,13 @@ class CoworkAction:
 class CoworkWorkspace:
     """Notes of one VS Code workspace together with their cowork tasks."""
 
-    def __init__(self, home: AnomxHome, margo_workspace: Path) -> None:
+    def __init__(self, home: AnomxHome, notes_workspace: Path) -> None:
         self.home = home
-        self.margo_workspace = margo_workspace
+        self.notes_workspace = notes_workspace
+        self.replies = AgentReplies(notes_workspace)
+        self.questions = QuestionService(home, notes_workspace, self.replies)
+        self._progress_written: dict[str, float] = {}
+        self._answering: dict[str, str] = {}
         self._services: dict[Path, CoworkService] = {}
         self._threads: dict[str, threading.Thread] = {}
         self._progress: dict[str, str] = {}
@@ -66,9 +85,16 @@ class CoworkWorkspace:
 
     @classmethod
     def locate(cls, home: AnomxHome, start: Path) -> CoworkWorkspace | None:
-        """Workspace for the Margo vault found at or above ``start`` (``None`` if none)."""
+        """Workspace whose notes file is found at or above ``start`` (``None`` if none)."""
 
-        workspace = find_margo_workspace(start)
+        workspace = find_notes_workspace(start)
+        if workspace is None:
+            # anomx may be started elsewhere than the VS Code workspace that holds the notes.
+            context = read_editor_context(context_path(home.root))
+            for folder in context.workspace_folders if context is not None else ():
+                workspace = find_notes_workspace(folder)
+                if workspace is not None:
+                    break
         return cls(home, workspace) if workspace is not None else None
 
     # -- rows -------------------------------------------------------------------------
@@ -78,17 +104,18 @@ class CoworkWorkspace:
 
         rows: list[CoworkRow] = []
         seen: set[str] = set()
-        for note in read_margo_notes(self.margo_workspace):
+        for note in read_notes(self.notes_workspace):
             seen.add(note.id)
-            repo = find_repo_root(self.margo_workspace / note.file)
+            if note.is_question:
+                rows.append(self._question_row(note))
+                continue
+            repo = find_repo_root(self.notes_workspace / note.file)
             service = self._service(repo) if repo is not None else None
             task = service.tasks.get(note.id) if service is not None else None
             if service is not None and task is not None:
                 service.refresh_merge_state(note.id)  # the user may have committed or aborted
                 task = service.tasks.get(note.id)
-            rows.append(
-                self._row(note.id, note.title, note.file, note.line_number, note, task, repo)
-            )
+            rows.append(self._row(note.id, note.title, note.file, note.line, note, task, repo))
         for repo, service in list(self._services.items()):
             for task in service.tasks.list():
                 if task.note_id in seen or not task.is_active:
@@ -102,13 +129,38 @@ class CoworkWorkspace:
                 )
         return rows
 
+    def _question_row(self, note: Note) -> CoworkRow:
+        """A question: no file, no task; its state is what anomx reported to the editor."""
+
+        repo = question_repo(note, self.notes_workspace)
+        running = self.questions.is_running(note.id) or self.is_running(note.id)
+        entry = self.replies.get(note.id)
+        if repo is None:
+            status, detail = NO_REPO, "Cannot tell which repository the question is about."
+        elif running:
+            status, detail = TaskStatus.RUNNING.value, str(entry.get("detail") or "Starting…")
+        elif not self._pending_messages(note):
+            failed = self.replies.status(note.id) == "failed"
+            status = TaskStatus.FAILED.value if failed else ANSWERED
+            detail = str(entry.get("detail") or "") if failed else self._last_answer(entry)
+        else:
+            status, detail = NEW, "Waiting for the agent"
+        return CoworkRow(note.id, note.title, "", 0, status, detail, note, None, repo, running)
+
+    @staticmethod
+    def _last_answer(entry: dict[str, object]) -> str:
+        messages = entry.get("messages")
+        last = messages[-1] if isinstance(messages, list) and messages else {}
+        text = str(last.get("text", "")) if isinstance(last, dict) else ""
+        return " ".join(text.split())[: MAX_PROGRESS_CHARS * 2]
+
     def _row(
         self,
         note_id: str,
         title: str,
         file: str,
         line: int,
-        note: MargoNote | None,
+        note: Note | None,
         task: CoworkTask | None,
         repo: Path | None,
     ) -> CoworkRow:
@@ -135,12 +187,18 @@ class CoworkWorkspace:
             return progress or "Starting…"
         if task.status is TaskStatus.MERGING:
             return "Staged in your repository: review in Source Control, then commit there."
-        return error or " ".join(task.summary.split())[:MAX_PROGRESS_CHARS * 2]
+        return error or " ".join(task.summary.split())[: MAX_PROGRESS_CHARS * 2]
 
     # -- actions ----------------------------------------------------------------------
 
     def actions(self, row: CoworkRow) -> list[CoworkAction]:
         if row.status in {NO_REPO, TaskStatus.MERGED.value} or row.repo_root is None:
+            return []
+        if row.note is not None and row.note.is_question:
+            if row.running:
+                return [CoworkAction("stop", "Stop agent")]
+            if self._pending_messages(row.note):
+                return [CoworkAction("answer", "Answer now", "Read-only; the agent searches")]
             return []
         base = row.task.base_branch if row.task else ""
         if row.running:
@@ -215,6 +273,12 @@ class CoworkWorkspace:
         Returns an error text when preparation fails, ``None`` once the agent is running.
         """
 
+        if row.note is not None and row.note.is_question:
+            if row.repo_root is None:
+                return "Cannot tell which repository the question is about."
+            message = (self._pending_messages(row.note) or [row.note.messages[-1]])[0]
+            self._start_question(row.note, message)
+            return None
         if row.repo_root is None:
             return "The file is not inside a git repository."
         service = self._service(row.repo_root)
@@ -222,25 +286,50 @@ class CoworkWorkspace:
             if row.task is None or not row.task.is_active:  # merged or discarded: start fresh
                 if row.note is None:
                     return "The note no longer exists."
-                service.prepare(row.note, self.margo_workspace)
+                service.prepare(row.note, self.notes_workspace)
         except GitError as error:
             return str(error)
-        with self._lock:
-            self._errors.pop(row.note_id, None)
-            self._progress[row.note_id] = "Starting…"
-            thread = threading.Thread(
-                target=self._run, args=(service, row.note_id), daemon=True, name="anomx-cowork"
-            )
-            self._threads[row.note_id] = thread
-        thread.start()
+        if row.note is not None:
+            self.replies.pick_up(row.note_id, row.note.messages[0].id)
+        self._launch(row.note_id, lambda callbacks: service.run(row.note_id, callbacks), service)
         return None
 
-    def _run(self, service: CoworkService, note_id: str) -> None:
+    def _launch(
+        self,
+        note_id: str,
+        work: Callable[[RuntimeCallbacks], object],
+        service: CoworkService | None = None,
+    ) -> None:
+        with self._lock:
+            self._errors.pop(note_id, None)
+            self._progress[note_id] = "Starting…"
+            thread = threading.Thread(
+                target=self._run,
+                args=(note_id, work, service),
+                daemon=True,
+                name="anomx-cowork",
+            )
+            self._threads[note_id] = thread
+        thread.start()
+
+    def _run(
+        self,
+        note_id: str,
+        work: Callable[[RuntimeCallbacks], object],
+        service: CoworkService | None,
+    ) -> None:
         def progress(text: str) -> None:
             cleaned = " ".join(text.split())
-            if cleaned:
-                with self._lock:
-                    self._progress[note_id] = cleaned[:MAX_PROGRESS_CHARS]
+            if not cleaned:
+                return
+            with self._lock:
+                self._progress[note_id] = cleaned[:MAX_PROGRESS_CHARS]
+                due = time.monotonic() - self._progress_written.get(note_id, 0.0)
+                if due >= PROGRESS_WRITE_SECONDS:
+                    self._progress_written[note_id] = time.monotonic()
+                else:
+                    return
+            self.replies.update(note_id, status=WORKING, detail=cleaned[:MAX_PROGRESS_CHARS])
 
         callbacks = RuntimeCallbacks(
             status=progress,
@@ -248,13 +337,133 @@ class CoworkWorkspace:
             command=lambda statement, _command, _output: progress(statement),
         )
         try:
-            service.run(note_id, callbacks)
+            work(callbacks)
         except Exception as error:  # noqa: BLE001 - shown in the panel instead of crashing it
+            text = f"{type(error).__name__}: {error}"
             with self._lock:
-                self._errors[note_id] = f"{type(error).__name__}: {error}"
-            service.tasks.update(note_id, status=TaskStatus.FAILED, summary=str(error))
+                self._errors[note_id] = text
+            if service is not None:
+                service.tasks.update(note_id, status=TaskStatus.FAILED, summary=str(error))
+            if self.replies.status(note_id) == WORKING:  # nobody reported the failure yet
+                self.replies.add_answer(
+                    note_id, text, after_message=self._answering.pop(note_id, ""), failed=True
+                )
+
+    # -- messages from the editor -------------------------------------------------------
+
+    def _pending_messages(self, note: Note) -> list[NoteMessage]:
+        """What the user wrote that no agent has picked up yet, oldest first."""
+
+        picked = self.replies.picked_up(note.id)
+        return [message for message in note.messages if message.id not in picked]
+
+    def dispatch(self) -> int:
+        """Hand every new message of the editor's notes to an agent; returns how many started.
+
+        A note handles one message at a time. Messages stay pending while its agent works and
+        are picked up by a later call, so replies in a thread are answered in order.
+        """
+
+        started = 0
+        for note in read_notes(self.notes_workspace):
+            self._sync_editor_status(note)
+            if self.is_running(note.id):
+                continue
+            pending = self._pending_messages(note)
+            if pending and self._start_message(note, pending[0]):
+                started += 1
+        return started
+
+    def _start_message(self, note: Note, message: NoteMessage) -> bool:
+        if note.is_question:
+            if question_repo(note, self.notes_workspace) is None:
+                self._reject(note, message, "Cannot tell which repository the question is about.")
+                return False
+            self._start_question(note, message)
+            return True
+        repo = find_repo_root(self.notes_workspace / note.file)
+        if repo is None:
+            self._reject(note, message, "The file is not inside a git repository.")
+            return False
+        service = self._service(repo)
+        task = service.tasks.get(note.id)
+        active = task is not None and task.is_active
+        first = message.id == note.messages[0].id
+        runnable = task is not None and task.status in {TaskStatus.QUEUED, TaskStatus.FAILED}
+        try:
+            if first and (not active or runnable):
+                if not active:
+                    service.prepare(note, self.notes_workspace)
+                self._begin(note, message)
+                self._launch(note.id, lambda cb: service.run(note.id, cb), service)
+            elif active and task is not None and task.session_path:
+                self._begin(note, message)
+                self._launch(note.id, lambda cb: service.reply(note.id, message.text, cb), service)
+            else:
+                self._reject(
+                    note,
+                    message,
+                    "This note's task is already merged or discarded. Add a new comment "
+                    "for further changes.",
+                    failed=False,
+                )
+                return False
+        except GitError as error:
+            self._reject(note, message, str(error))
+            return False
+        return True
+
+    def _start_question(self, note: Note, message: NoteMessage) -> None:
+        self._begin(note, message)
+        self._launch(note.id, lambda cb: self.questions.answer(note, message.id, message.text, cb))
+
+    def _begin(self, note: Note, message: NoteMessage) -> None:
+        self._answering[note.id] = message.id
+        self.replies.pick_up(note.id, message.id)
+
+    def _reject(self, note: Note, message: NoteMessage, text: str, *, failed: bool = True) -> None:
+        self.replies.pick_up(note.id, message.id)
+        self.replies.add_answer(note.id, text, after_message=message.id, failed=failed)
+
+    def _report_turn(
+        self, repo_root: Path, note_id: str, response: str, failed: bool, error: str
+    ) -> None:
+        """Mirror a finished agent turn (from the editor or a terminal chat) into the thread."""
+
+        text = (error or response) if failed else response
+        locations = [] if failed else find_locations(response, repo_root, self.notes_workspace)
+        self.replies.add_answer(
+            note_id,
+            text,
+            after_message=self._answering.pop(note_id, ""),
+            locations=locations,
+            failed=failed,
+        )
+
+    def _sync_editor_status(self, note: Note) -> None:
+        """Tell the editor about merges the user did or aborted in the meantime."""
+
+        if note.is_question or self.is_running(note.id):
+            return
+        repo = find_repo_root(self.notes_workspace / note.file)
+        if repo is None:
+            return
+        service = self._service(repo)
+        task = service.tasks.get(note.id)
+        if task is None:
+            return
+        service.refresh_merge_state(note.id)
+        task = service.tasks.get(note.id) or task
+        current = self.replies.status(note.id)
+        desired = TASK_STATUS_FOR_EDITOR.get(task.status)
+        if desired is None and task.status is TaskStatus.READY and current == "merging":
+            desired = READY
+        if desired is not None and desired != current:
+            self.replies.update(note.id, status=desired, detail="")
 
     def stop(self, row: CoworkRow) -> bool:
+        if row.note is not None and row.note.is_question:
+            return self.questions.abort(row.note_id)
         return row.repo_root is not None and self._service(row.repo_root).abort(row.note_id)
 
     def is_running(self, note_id: str) -> bool:
@@ -282,7 +491,10 @@ class CoworkWorkspace:
         service = self._service(row.repo_root)
         try:
             if row.note is not None:
-                _task, record = service.open_chat(row.note, self.margo_workspace, discuss=discuss)
+                _task, record = service.open_chat(row.note, self.notes_workspace, discuss=discuss)
+                # The conversation now lives in the terminal; the editor must not start it again.
+                self.replies.pick_up(row.note_id, row.note.messages[0].id)
+                self.replies.update(row.note_id, status="idle", detail="")
                 return record, None
             task = service.tasks.get(row.note_id)
             existing = self.home.session_record(Path(task.session_path)) if task else None
@@ -392,5 +604,6 @@ class CoworkWorkspace:
             service = self._services.get(repo_root)
             if service is None:
                 service = CoworkService(self.home, repo_root)
+                service.on_turn = functools.partial(self._report_turn, repo_root)
                 self._services[repo_root] = service
             return service

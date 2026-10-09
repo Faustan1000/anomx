@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import curses
 import hashlib
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -537,7 +539,25 @@ class MessagesComponentMixin:
             except (OSError, subprocess.SubprocessError):
                 continue
             return True
-        return False
+        return self._copy_with_osc52(text)
+
+    @staticmethod
+    def _copy_with_osc52(text: str) -> bool:
+        """Ask the terminal itself to copy (OSC 52).
+
+        Works where no clipboard tool exists: over SSH, in VS Code's remote terminal and
+        in most modern terminals. The terminal does not confirm, so success is assumed.
+        """
+
+        sequence = f"\x1b]52;c;{base64.b64encode(text.encode('utf-8')).decode('ascii')}\x07"
+        if os.environ.get("TMUX"):  # tmux only forwards it wrapped in a passthrough
+            sequence = "\x1bPtmux;" + sequence.replace("\x1b", "\x1b\x1b") + "\x1b\\"
+        try:
+            with open("/dev/tty", "w", encoding="utf-8") as terminal:
+                terminal.write(sequence)
+        except OSError:
+            return False
+        return True
 
     def _read_message_lines(self, session_path: Path) -> list[MessageLine]:
         cache_key = self._session_cache_key(session_path)

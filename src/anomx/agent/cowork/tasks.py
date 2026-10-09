@@ -1,4 +1,4 @@
-"""Persistent state of cowork tasks (one per Margo note)."""
+"""Persistent state of cowork tasks (one per note)."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ class CoworkTask:
     worktree: str
     base_branch: str
     base_commit: str
+    end_line: int = 0
     anchor_text: str = ""
     anchor_kind: str = "source"
     """``source`` for a committed file, ``generated`` when the note sits on a file git does
@@ -64,7 +65,7 @@ class CoworkTask:
 class TaskStore:
     """JSON file with all tasks of one workspace, keyed by note id.
 
-    Margo's own files are never modified; everything anomx adds lives here.
+    The editor's note files are never modified; everything anomx adds lives here.
     """
 
     def __init__(self, path: Path) -> None:

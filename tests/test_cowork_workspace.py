@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 import pytest
+from cowork_notes import note_entry, write_notes
 
 from anomx.agent.cowork import CoworkWorkspace, TaskStatus
 from anomx.agent.runtime import AgentRuntime, RuntimeCallbacks
@@ -35,13 +36,12 @@ def workspace(tmp_path: Path) -> Path:
     git(repo, "add", "-A")
     git(repo, "commit", "-m", "initial")
     (root / "loose.py").write_text("print(1)\n", encoding="utf-8")  # not in any repository
-    (root / ".margo").mkdir()
-    vault = {
-        "./proj/src/data.py": [{"id": "n-1", "line": 0, "title": "make dataclass", "text": ""}],
-        "./loose.py": [{"id": "n-2", "line": 0, "title": "outside a repo", "text": ""}],
-        "./proj/plain.txt": [{"id": "n-3", "line": 0, "title": "resolved", "status": "resolved"}],
-    }
-    (root / ".margo" / "local.notes.json").write_text(json.dumps(vault), encoding="utf-8")
+    write_notes(
+        root,
+        note_entry("n-1", "proj/src/data.py", 1, "make dataclass"),
+        note_entry("n-2", "loose.py", 1, "outside a repo"),
+        note_entry("n-3", "proj/plain.txt", 1, "resolved", status="resolved"),
+    )
     return root
 
 
@@ -75,7 +75,7 @@ def _fake_agent(monkeypatch, *, edit=True, release: threading.Event | None = Non
     monkeypatch.setattr(AgentRuntime, "backend_response", backend_response)
 
 
-def test_locate_needs_a_margo_vault(tmp_path):
+def test_locate_needs_a_notes_file(tmp_path):
     assert CoworkWorkspace.locate(AnomxHome(tmp_path / "home"), tmp_path / "nowhere") is None
 
 
@@ -213,13 +213,32 @@ def test_a_task_whose_note_was_resolved_stays_visible_as_orphan(panel, workspace
     _fake_agent(monkeypatch)
     panel.start(_row(panel, "n-1"))
     panel.wait("n-1")
-    vault = workspace / ".margo" / "local.notes.json"
-    data = json.loads(vault.read_text(encoding="utf-8"))
-    data["./proj/src/data.py"][0]["status"] = "resolved"
-    vault.write_text(json.dumps(data), encoding="utf-8")
+    write_notes(workspace, note_entry("n-1", "proj/src/data.py", 1, "make dataclass", status="resolved"))
 
     orphan = _row(panel, "n-1")
 
     assert orphan.status == "orphan" and orphan.note is None and orphan.task is not None
     assert orphan.task.status is TaskStatus.READY
     assert "discard" in [a.value for a in panel.actions(orphan)]
+
+
+def test_locate_falls_back_to_the_vscode_workspace(tmp_path):
+    import json
+
+    vault_root = tmp_path / "vscode_ws"
+    write_notes(vault_root)
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "editor-context.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "updatedAt": "2026-10-08T10:00:00.000Z",
+                "workspaceFolders": [str(vault_root / "repo")],
+            }
+        ),
+        encoding="utf-8",
+    )
+    found = CoworkWorkspace.locate(AnomxHome(home), tmp_path / "elsewhere")
+    assert found is not None
+    assert found.notes_workspace == vault_root.resolve()

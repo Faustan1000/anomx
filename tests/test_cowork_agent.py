@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from cowork_notes import note_entry, write_notes
 
 from anomx.agent.cowork import (
     CoworkService,
@@ -17,7 +18,7 @@ from anomx.agent.cowork import (
     build_task_prompt,
     find_repo_root,
     note_context,
-    read_margo_notes,
+    read_notes,
 )
 from anomx.agent.cowork.agent import CoworkRuntime, EditError, apply_edit
 from anomx.agent.exceptions import BackendFailure
@@ -182,13 +183,10 @@ def workspace(tmp_path: Path) -> Path:
     (repo / "src" / "data.py").write_text(SOURCE, encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-m", "initial")
-    (root / ".margo").mkdir()
-    vault = {
-        "./proj/src/data.py": [
-            {"id": "n-1", "line": 0, "title": "make the dict a dataclass", "text": "and callers"}
-        ]
-    }
-    (root / ".margo" / "local.notes.json").write_text(json.dumps(vault), encoding="utf-8")
+    write_notes(
+        root,
+        note_entry("n-1", "proj/src/data.py", 1, "make the dict a dataclass\n\nand callers"),
+    )
     return root
 
 
@@ -221,7 +219,7 @@ def _fake_agent(monkeypatch, *, edits=(), reply="Changed the dict; callers updat
 
 
 def _note(workspace: Path):
-    (note,) = read_margo_notes(workspace)
+    (note,) = read_notes(workspace)
     return note
 
 
@@ -377,7 +375,7 @@ def test_prompt_contains_only_the_note_and_nearby_code(workspace):
     assert repo == workspace / "proj"
 
     class _Task:
-        file, line, request, anchor_kind = "src/data.py", 1, note.request, "source"
+        file, line, end_line, request, anchor_kind = "src/data.py", 1, 1, note.request, "source"
 
     prompt = build_task_prompt(_Task(), context)  # type: ignore[arg-type]
 
@@ -544,13 +542,10 @@ def generated_note(workspace):
     git(repo, "commit", "-m", "ignore dist")
     (repo / "dist").mkdir()
     (repo / "dist" / "bundle.mjs").write_text("var a=1;" * 50, encoding="utf-8")
-    vault = {
-        "./proj/dist/bundle.mjs": [
-            {"id": "g-1", "line": 0, "title": "show languages as a dropdown", "text": ""}
-        ]
-    }
-    (workspace / ".margo" / "local.notes.json").write_text(json.dumps(vault), encoding="utf-8")
-    return next(n for n in read_margo_notes(workspace) if n.id == "g-1")
+    write_notes(
+        workspace, note_entry("g-1", "proj/dist/bundle.mjs", 1, "show languages as a dropdown")
+    )
+    return next(n for n in read_notes(workspace) if n.id == "g-1")
 
 
 def test_a_note_on_ignored_build_output_can_still_start(service, workspace, generated_note):

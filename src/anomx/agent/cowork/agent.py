@@ -48,6 +48,22 @@ COWORK_PROMPT = """\
   you made and anything the user should check.
 """
 
+QUESTION_PROMPT = """\
+- You are the Anomx cowork agent. A user asks a question about the code of their repository, for
+  example "where is the GUI built?" or "how does a request reach the detector?". You can only
+  read: list, glob, grep and read files. You cannot edit anything and nobody answers while you
+  work, so search until you can answer and then answer.
+- Start broad (grep for names, glob for likely files), then read the few files that matter.
+  Do not read the whole repository.
+- Answer in the user's language, concisely: the answer first, then the places that matter.
+  Name every place as `path/to/file.py:LINE` (or `file.py:FIRST-LAST`) with paths relative to the
+  repository root and a few words on what happens there. The editor turns these references into
+  links, so only name lines you have actually seen, and never invent a path.
+- When the question is ambiguous or the code does not contain the answer, say so and name the
+  closest places you found instead of guessing.
+- The conversation can continue: follow-up questions build on what you already found.
+"""
+
 EDIT_FILE_TOOL = "edit_file"
 
 
@@ -201,15 +217,21 @@ def cowork_tools() -> tuple[BaseTool, ...]:
     )
 
 
+def question_tools() -> tuple[BaseTool, ...]:
+    """The cowork tools without ``edit_file``: answering a question never changes code."""
+
+    return tuple(tool for tool in cowork_tools() if tool.name != EDIT_FILE_TOOL)
+
+
 class CoworkAgent(BaseAgent):
     """Agent role used for every cowork task."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, question: bool = False) -> None:
         super().__init__(
             kind=AgentKind.SUB,
             name="Cowork",
-            system_prompt=COWORK_PROMPT,
-            tools=cowork_tools(),
+            system_prompt=QUESTION_PROMPT if question else COWORK_PROMPT,
+            tools=question_tools() if question else cowork_tools(),
             color="subagent",
             symbol="C",
             can_spawn_subagents=False,
@@ -231,10 +253,13 @@ class CoworkRuntime(AgentRuntime):
     ``after_turn`` hook is where results get committed in both cases.
     """
 
-    def __init__(self, home: Any, worktree: Path, **kwargs: Any) -> None:
+    def __init__(
+        self, home: Any, worktree: Path, *, question: bool = False, **kwargs: Any
+    ) -> None:
         kwargs.setdefault("agent_kind", AgentKind.SUB)
         super().__init__(home, worktree, workspace_root=worktree, **kwargs)
-        self.agent_spec = CoworkAgent()
+        self.question = question
+        self.agent_spec = CoworkAgent(question=question)
         self.agent_kind = self.agent_spec.kind
         self.after_turn: TurnHook | None = None
 
@@ -259,6 +284,11 @@ class CoworkRuntime(AgentRuntime):
             )
         return response
 
+    def turn_aborted(self) -> bool:
+        """Whether the latest turn was stopped by the user."""
+
+        return bool(self._turn_aborted())
+
     def set_agent(self, kind: AgentKind | str) -> None:
         """The cowork role is fixed; callers cannot swap it for a general agent."""
 
@@ -271,7 +301,9 @@ class CoworkRuntime(AgentRuntime):
         del session_path, include_previous_conversation
         tools = "\n".join(f"- {tool}" for tool in self._tool_descriptions())
         workspace = (
-            f"Your worktree (repository root for this task): {self.cwd}\n"
+            f"The repository root: {self.cwd}\nPaths may be relative to it. Only read."
+            if self.question
+            else f"Your worktree (repository root for this task): {self.cwd}\n"
             "Paths may be relative to it. Read and edit only files inside it."
         )
         return "\n\n".join(

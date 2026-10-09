@@ -1,4 +1,4 @@
-"""Cowork core: Margo vault reader, task state and git worktree handling."""
+"""Cowork core: notes reader, task state and git worktree handling."""
 
 from __future__ import annotations
 
@@ -14,13 +14,14 @@ from anomx.agent.cowork import (
     GitError,
     TaskStatus,
     TaskStore,
-    find_margo_workspace,
+    find_notes_workspace,
     find_repo_root,
     normalize_note_path,
     note_context,
-    read_margo_notes,
+    read_notes,
 )
 from anomx.agent.cowork.git import branch_for
+from cowork_notes import note_entry, write_notes
 
 AUTH = (
     "def get_token():\n    return {'user': 'a'}\n\n\n"
@@ -47,56 +48,67 @@ def repo(tmp_path: Path) -> Path:
     return root
 
 
-# -- Margo reader ---------------------------------------------------------------------
+# -- notes reader ---------------------------------------------------------------------
 
 
-def test_reads_both_vaults_and_hides_resolved_notes(tmp_path):
-    (tmp_path / ".margo").mkdir()
-    local = {
-        "src/auth.py": [
-            {"id": "1-a", "line": 0, "title": "Make dict a dataclass", "text": "also callers"},
-            {"id": "2-b", "line": 4, "title": "done", "text": "", "status": "resolved"},
-        ]
-    }
-    team = {"src/other.py": [{"id": "3-c", "line": 2, "title": "Shared", "vault": "team"}]}
-    (tmp_path / ".margo" / "local.notes.json").write_text(json.dumps(local), encoding="utf-8")
-    (tmp_path / ".notes.json").write_text(json.dumps(team), encoding="utf-8")
+def test_reads_notes_and_questions_and_hides_resolved_notes(tmp_path):
+    write_notes(
+        tmp_path,
+        note_entry("1-a", "src/auth.py", 1, "Make dict a dataclass\n\nalso callers"),
+        note_entry("2-b", "src/auth.py", 5, "done", status="resolved"),
+        note_entry("q-1", None, None, "where is the GUI built?", kind="question"),
+        note_entry("3-c", "./src/other.py", 3, "Shared", end_line=6),
+    )
 
-    notes = read_margo_notes(tmp_path)
+    notes = read_notes(tmp_path)
 
-    assert [(n.id, n.file, n.vault) for n in notes] == [
-        ("1-a", "src/auth.py", "local"),
-        ("3-c", "src/other.py", "team"),
+    assert [(n.id, n.file, n.line, n.end_line) for n in notes] == [
+        ("1-a", "src/auth.py", 1, 1),
+        ("3-c", "src/other.py", 3, 6),
+        ("q-1", "", 0, 0),  # questions come last
     ]
-    assert notes[0].line_number == 1  # Margo stores the first line as 0
     assert notes[0].request == "Make dict a dataclass\n\nalso callers"
-    assert len(read_margo_notes(tmp_path, include_resolved=True)) == 3
+    assert (notes[0].title, notes[0].text) == ("Make dict a dataclass", "also callers")
+    assert notes[2].is_question and notes[2].request == "where is the GUI built?"
+    assert len(read_notes(tmp_path, include_resolved=True)) == 4
+
+
+def test_a_note_keeps_follow_up_messages_in_order(tmp_path):
+    write_notes(
+        tmp_path, note_entry("n", "a.py", 2, "first", extra_messages=("second", "third"))
+    )
+
+    (note,) = read_notes(tmp_path)
+
+    assert [m.text for m in note.messages] == ["first", "second", "third"]
+    assert note.request == "first"
 
 
 def test_reader_skips_malformed_files_and_entries(tmp_path):
-    (tmp_path / ".notes.json").write_text("{not json", encoding="utf-8")
-    (tmp_path / ".margo").mkdir()
-    broken = {
-        "a.py": [
-            {"id": "ok", "line": 1, "title": "fine"},
-            {"id": "", "line": 1},
-            {"id": "neg", "line": -3},
-            {"id": "bool", "line": True},
-            "string",
-        ],
-        "b.py": "not a list",
-    }
-    (tmp_path / ".margo" / "local.notes.json").write_text(json.dumps(broken), encoding="utf-8")
+    path = write_notes(
+        tmp_path,
+        note_entry("ok", "a.py", 2, "fine"),
+        note_entry("", "a.py", 2, "no id"),
+        note_entry("zero", "a.py", 0, "line below 1"),
+        note_entry("nofile", None, 3, "note without file"),
+        note_entry("empty", "a.py", 2, "   "),
+        {"id": "bool", "kind": "note", "file": "a.py", "line": True, "messages": []},
+    )
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["notes"].append("string")
+    path.write_text(json.dumps(data), encoding="utf-8")
 
-    assert [n.id for n in read_margo_notes(tmp_path)] == ["ok"]
-    assert read_margo_notes(tmp_path / "missing") == []
+    assert [n.id for n in read_notes(tmp_path)] == ["ok"]
+    assert read_notes(tmp_path / "missing") == []
+    path.write_text("{not json", encoding="utf-8")
+    assert read_notes(tmp_path) == []
+    path.write_text(json.dumps({"schema": 2, "notes": []}), encoding="utf-8")
+    assert read_notes(tmp_path) == []
 
 
 def test_note_context_numbers_lines_and_records_anchor_text(repo):
-    (repo / ".margo").mkdir()
-    vault = {"src/auth.py": [{"id": "n1", "line": 1, "title": "x"}]}
-    (repo / ".margo" / "local.notes.json").write_text(json.dumps(vault), encoding="utf-8")
-    note = read_margo_notes(repo)[0]
+    write_notes(repo, note_entry("n1", "src/auth.py", 2, "x"))
+    note = read_notes(repo)[0]
 
     context = note_context(repo, note, radius=1)
 
@@ -107,10 +119,8 @@ def test_note_context_numbers_lines_and_records_anchor_text(repo):
 
 
 def test_note_context_for_missing_file(tmp_path):
-    (tmp_path / ".notes.json").write_text(
-        json.dumps({"gone.py": [{"id": "n", "line": 0, "title": "x"}]}), encoding="utf-8"
-    )
-    note = read_margo_notes(tmp_path)[0]
+    write_notes(tmp_path, note_entry("n", "gone.py", 1, "x"))
+    note = read_notes(tmp_path)[0]
 
     assert note_context(tmp_path, note).file_exists is False
 
@@ -297,25 +307,6 @@ def test_a_detached_head_cannot_host_tasks(repo, tmp_path):
 
 # -- real-world layout: workspace folder above one or more repositories ----------------
 
-# Verbatim shape of a vault written by Margo 0.1.0 (keys carry a leading "./").
-REAL_VAULT = {
-    "./anomx/examples/baseline_detection.py": [
-        {
-            "id": "1791449926580-x93ibwz6i",
-            "line": 2,
-            "title": "this is a comment",
-            "text": "",
-            "timestamp": 1791449926580,
-            "author": "ultrasat",
-            "priority": "medium",
-            "category": "note",
-            "status": "open",
-            "vault": "local",
-        }
-    ]
-}
-
-
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     """A VS Code workspace folder that contains a git repository (like app_project/anomx)."""
@@ -330,26 +321,25 @@ def workspace(tmp_path: Path) -> Path:
     (project / "examples" / "baseline_detection.py").write_text(source, encoding="utf-8")
     run(project, "add", "-A")
     run(project, "commit", "-m", "initial")
-    (root / ".margo").mkdir()
-    (root / ".margo" / "local.notes.json").write_text(json.dumps(REAL_VAULT), encoding="utf-8")
+    write_notes(root, note_entry("n-1", "anomx/examples/baseline_detection.py", 3, "a comment"))
     return root
 
 
-def test_vault_in_a_parent_folder_is_found_from_inside_the_repo(workspace):
-    assert find_margo_workspace(workspace / "anomx" / "examples") == workspace
-    assert find_margo_workspace(workspace.parent.parent / "nowhere") is None
+def test_notes_in_a_parent_folder_are_found_from_inside_the_repo(workspace):
+    assert find_notes_workspace(workspace / "anomx" / "examples") == workspace
+    assert find_notes_workspace(workspace.parent.parent / "nowhere") is None
 
 
-def test_real_vault_keys_lose_the_leading_dot_slash(workspace):
-    (note,) = read_margo_notes(workspace)
+def test_note_paths_lose_the_leading_dot_slash(workspace):
+    (note,) = read_notes(workspace)
 
     assert note.file == "anomx/examples/baseline_detection.py"
     assert normalize_note_path("././a\\b.py") == "a/b.py"
-    assert note.line_number == 3
+    assert note.line == 3
 
 
 def test_note_is_resolved_to_the_repository_of_its_own_file(workspace):
-    (note,) = read_margo_notes(workspace)
+    (note,) = read_notes(workspace)
     target = workspace / note.file
 
     repo_root = find_repo_root(target)

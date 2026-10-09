@@ -73,7 +73,7 @@ def find_repo_root(path: Path) -> Path | None:
 
 
 def branch_for(note_id: str) -> str:
-    """Branch name for a note; Margo ids are already close to valid ref names."""
+    """Branch name for a note; note ids are already close to valid ref names."""
 
     return BRANCH_PREFIX + re.sub(r"[^A-Za-z0-9._-]", "-", note_id).strip(".-")
 

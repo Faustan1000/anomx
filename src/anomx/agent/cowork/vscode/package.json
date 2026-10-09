@@ -1,14 +1,22 @@
 {
   "name": "anomx-editor-context",
   "displayName": "Anomx Editor Context",
-  "description": "Writes the active file, cursor, selection and visible lines to a local JSON file so the Anomx CLI agent knows what you are looking at.",
-  "version": "0.1.2",
+  "description": "Tells the Anomx CLI agent what you are looking at in VS Code and lets you leave comments and questions for it: it works on your notes and answers in the comment thread.",
+  "version": "0.2.3",
   "publisher": "anomx-local",
   "license": "Apache-2.0",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
-  "extensionKind": ["workspace"],
-  "activationEvents": ["onStartupFinished"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
   "main": "./extension.js",
   "capabilities": {
     "untrustedWorkspaces": {
@@ -19,7 +27,7 @@
   },
   "contributes": {
     "configuration": {
-      "title": "Anomx Editor Context",
+      "title": "Anomx",
       "properties": {
         "anomxEditorContext.enabled": {
           "type": "boolean",
@@ -30,8 +38,154 @@
           "type": "string",
           "default": "",
           "description": "Override the output path. Default: $ANOMX_HOME/editor-context.json or ~/.anomx/editor-context.json."
+        },
+        "anomxNotes.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show Anomx comments, questions and the sidebar."
         }
       }
-    }
+    },
+    "commands": [
+      {
+        "command": "anomx.ask",
+        "title": "Anomx: Ask a question"
+      },
+      {
+        "command": "anomx.replyToQuestion",
+        "title": "Anomx: Follow-up question"
+      },
+      {
+        "command": "anomx.importMargo",
+        "title": "Anomx: Import Margo notes"
+      },
+      {
+        "command": "anomx.submitComment",
+        "title": "Send to agent"
+      },
+      {
+        "command": "anomx.resolveNote",
+        "title": "Anomx: Resolve note"
+      },
+      {
+        "command": "anomx.deleteNote",
+        "title": "Anomx: Delete note"
+      },
+      {
+        "command": "anomx.openAnswer",
+        "title": "Anomx: Open answer"
+      },
+      {
+        "command": "anomx.revealNote",
+        "title": "Anomx: Show note in code"
+      },
+      {
+        "command": "anomx.openLocation",
+        "title": "Anomx: Open location"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "anomx",
+          "title": "Anomx",
+          "icon": "media/anomx.svg"
+        }
+      ]
+    },
+    "views": {
+      "anomx": [
+        {
+          "type": "webview",
+          "id": "anomx.ask",
+          "name": "Ask the agent",
+          "when": "workspaceFolderCount > 0"
+        },
+        {
+          "id": "anomx.notes",
+          "name": "Questions & notes"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "anomx.ask",
+        "key": "ctrl+alt+a",
+        "mac": "cmd+alt+a"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "anomx.submitComment",
+          "when": "false"
+        },
+        {
+          "command": "anomx.openAnswer",
+          "when": "false"
+        },
+        {
+          "command": "anomx.revealNote",
+          "when": "false"
+        },
+        {
+          "command": "anomx.openLocation",
+          "when": "false"
+        }
+      ],
+      "comments/commentThread/context": [
+        {
+          "command": "anomx.submitComment",
+          "group": "inline",
+          "when": "commentController == anomx"
+        }
+      ],
+      "comments/commentThread/title": [
+        {
+          "command": "anomx.resolveNote",
+          "group": "navigation",
+          "when": "commentController == anomx"
+        },
+        {
+          "command": "anomx.deleteNote",
+          "group": "navigation",
+          "when": "commentController == anomx"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "anomx.replyToQuestion",
+          "when": "view == anomx.notes && viewItem == anomx.question",
+          "group": "inline"
+        },
+        {
+          "command": "anomx.resolveNote",
+          "when": "view == anomx.notes && viewItem =~ /^anomx\\./"
+        },
+        {
+          "command": "anomx.deleteNote",
+          "when": "view == anomx.notes && viewItem =~ /^anomx\\./"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "anomx.replyToQuestion",
+          "when": "resourceScheme == anomx-answer",
+          "group": "navigation"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "anomx.notes",
+        "contents": "No questions or notes yet. Ask above, or select code and use the comment button in the editor margin.",
+        "when": "workspaceFolderCount > 0"
+      },
+      {
+        "view": "anomx.notes",
+        "contents": "Open a folder to use Anomx notes.\n[Open Folder](command:vscode.openFolder)",
+        "when": "workspaceFolderCount == 0"
+      }
+    ]
   }
 }

@@ -2,7 +2,7 @@
 
 The ``anomx-editor-context`` extension (``cowork/vscode``) writes the active file, cursor,
 selection and visible lines to ``<anomx home>/editor-context.json``. This module reads that
-file and relates it to Margo notes, so the agent can tell which note the user is working on.
+file and relates it to the notes, so the agent can tell which note the user is working on.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from anomx.agent.cowork.margo import MargoNote
+from anomx.agent.cowork.notes import Note
 
 CONTEXT_FILE_NAME = "editor-context.json"
 SUPPORTED_SCHEMA = 1
@@ -127,32 +127,34 @@ def _same_file(note_file: Path, context_file: Path | None) -> bool:
 
 def note_near_cursor(
     context: EditorContext,
-    notes: Iterable[MargoNote],
+    notes: Iterable[Note],
     workspace: Path,
     *,
     radius: int = 0,
-) -> MargoNote | None:
+) -> Note | None:
     """The note on (or within ``radius`` lines of) the cursor line, nearest first."""
 
-    best: tuple[int, MargoNote] | None = None
+    best: tuple[int, Note] | None = None
     for note in notes:
         if not _same_file(workspace / note.file, context.file):
             continue
-        distance = abs(note.line_number - context.line)
+        distance = 0 if note.line <= context.line <= note.end_line else min(
+            abs(note.line - context.line), abs(note.end_line - context.line)
+        )
         if distance <= radius and (best is None or distance < best[0]):
             best = (distance, note)
     return best[1] if best else None
 
 
 def notes_in_view(
-    context: EditorContext, notes: Iterable[MargoNote], workspace: Path
-) -> list[MargoNote]:
+    context: EditorContext, notes: Iterable[Note], workspace: Path
+) -> list[Note]:
     """Notes of the active file that lie inside the visible lines, top to bottom."""
 
     visible = [
         note
         for note in notes
         if _same_file(workspace / note.file, context.file)
-        and context.visible_start_line <= note.line_number <= context.visible_end_line
+        and context.visible_start_line <= note.line <= context.visible_end_line
     ]
-    return sorted(visible, key=lambda note: note.line_number)
+    return sorted(visible, key=lambda note: note.line)

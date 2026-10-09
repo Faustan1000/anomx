@@ -30,6 +30,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Print the resolved Anomx home directory and exit.",
     )
     parser.add_argument(
+        "--install-vscode",
+        action="store_true",
+        help="Install the Anomx VS Code extension (comments, questions, editor context).",
+    )
+    parser.add_argument(
         "--no-color",
         action="store_true",
         help="Disable ANSI colors in the interactive shell.",
@@ -61,6 +66,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.print_home:
         print(home_path)
         return 0
+    if args.install_vscode:
+        from anomx.agent.cowork.extension import install_extension
+
+        ok, message = install_extension(home_path)
+        print(message)
+        return 0 if ok else 1
     return _run_interface(args, home_path)
 
 

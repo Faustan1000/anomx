@@ -26,10 +26,12 @@ from anomx.agent.ui.models import CursesWindow, MenuChoice
 STAY_IN_NOTE_MENU = frozenset({"diff", "compare", "follow"})
 BACK_VALUE = "__back__"
 FOLLOW_VALUE = "__follow__"
+SERVE_VALUE = "__serve__"
 STATUS_TAGS = {
     "new": "[new]",
     "queued": "[queued]",
     "running": "[running]",
+    "answered": "[answered]",
     "ready": "[ready]",
     "failed": "[failed]",
     "merging": "[merging]",
@@ -38,13 +40,13 @@ STATUS_TAGS = {
     "no-repo": "[no repo]",
 }
 NO_EXTENSION_TEXT = (
-    "Following needs the Anomx Editor Context extension, which has not written "
-    "{path} yet. Install it with the command printed by anomx's cowork setup "
-    "(code --install-extension on the .vsix) and reload VS Code."
+    "Following needs the Anomx VS Code extension, which has not written {path} yet. "
+    "Install it with `anomx --install-vscode` in a terminal and reload the VS Code window."
 )
-NO_MARGO_TEXT = (
-    "No Margo notes found. Add a note in VS Code (Margo extension); anomx looks for "
-    ".margo/local.notes.json or .notes.json in this folder and above it."
+NO_NOTES_TEXT = (
+    "No notes found. Add a comment in VS Code with the Anomx Editor Context extension "
+    "(or ask a question with Ctrl+Alt+A); anomx looks for .anomx/notes.json in this folder, "
+    "above it and in the folders of your open VS Code window."
 )
 
 
@@ -65,14 +67,14 @@ class CoworkViewMixin:
             return None
         known = self._cowork_panels
         # Reuse the object of an earlier visit so background runs keep their progress.
-        return known.setdefault(found.margo_workspace, found)
+        return known.setdefault(found.notes_workspace, found)
 
     def _run_cowork_panel(self, stdscr: CursesWindow) -> SessionRecord | None:
         """Show the panel; returns the chat session to switch to when one was opened."""
 
         panel = self._cowork_workspace()
         if panel is None:
-            self._message(stdscr, "Cowork", NO_MARGO_TEXT)
+            self._message(stdscr, "Cowork", NO_NOTES_TEXT)
             return None
 
         def refresh() -> tuple[str, tuple[MenuChoice, ...]]:
@@ -93,7 +95,14 @@ class CoworkViewMixin:
                 MenuChoice(
                     f"Follow my notes in the editor: {'on' if self._cowork_follower else 'off'}",
                     FOLLOW_VALUE,
-                    "Click a note in Margo's sidebar: this chat and your working tree switch to it",
+                    "Put the cursor in a note: this chat and your working tree switch to it",
+                )
+            )
+            choices.append(
+                MenuChoice(
+                    f"Work on notes from VS Code: {'on' if self._cowork_serving else 'off'}",
+                    SERVE_VALUE,
+                    "Agents start when you comment or ask in the editor; answers appear there",
                 )
             )
             running = sum(1 for row in rows if row.running)
@@ -117,6 +126,9 @@ class CoworkViewMixin:
                 return None
             if selected == BACK_VALUE:
                 self._cowork_back(stdscr, panel)
+                continue
+            if selected == SERVE_VALUE:
+                self._cowork_serving = not self._cowork_serving
                 continue
             if selected == FOLLOW_VALUE:
                 self._cowork_toggle_follow(stdscr, panel)
@@ -176,7 +188,7 @@ class CoworkViewMixin:
                 # Opening the chat from the panel is an explicit request: answer the note now.
                 self._cowork_send_pending(record)
             return record
-        if action.value == "start":
+        if action.value in {"start", "answer"}:
             problem = panel.start(row)
             if problem:
                 message(stdscr, "Cannot start", problem)

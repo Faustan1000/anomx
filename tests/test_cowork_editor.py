@@ -13,7 +13,8 @@ from pathlib import Path
 import pytest
 
 from anomx.agent.cowork import (
-    MargoNote,
+    Note,
+    NoteMessage,
     build_vsix,
     context_path,
     install_command,
@@ -52,8 +53,17 @@ def _write(path: Path, **overrides) -> Path:
     return path
 
 
-def _note(note_id: str, line: int, file: str = "anomx/examples/baseline_detection.py") -> MargoNote:
-    return MargoNote(id=note_id, file=file, line=line, title=note_id, text="")
+def _note(
+    note_id: str, line: int, file: str = "anomx/examples/baseline_detection.py", end_line: int = 0
+) -> Note:
+    return Note(
+        id=note_id,
+        kind="note",
+        file=file,
+        line=line,
+        end_line=end_line or line,
+        messages=(NoteMessage(f"m-{note_id}", note_id),),
+    )
 
 
 # -- Python reader --------------------------------------------------------------------
@@ -106,20 +116,32 @@ def test_note_near_cursor_picks_the_closest_note_in_the_active_file(tmp_path):
     assert context is not None
     workspace = Path("/ws")
     notes = [
-        _note("far", 30),  # line_number 31
-        _note("exact", 2),  # line_number 3 == cursor line
-        _note("elsewhere", 2, file="anomx/other.py"),
+        _note("far", 31),
+        _note("exact", 3),  # on the cursor line
+        _note("elsewhere", 3, file="anomx/other.py"),
     ]
 
     assert note_near_cursor(context, notes, workspace).id == "exact"
-    assert note_near_cursor(context, [_note("a", 4)], workspace) is None  # radius 0
-    assert note_near_cursor(context, [_note("a", 4)], workspace, radius=2).id == "a"
+    assert note_near_cursor(context, [_note("a", 5)], workspace) is None  # radius 0
+    assert note_near_cursor(context, [_note("a", 5)], workspace, radius=2).id == "a"
+
+
+def test_a_cursor_anywhere_inside_a_range_note_counts_as_on_the_note(tmp_path):
+    workspace = Path("/ws")
+    ranged = _note("block", 2, end_line=5)
+
+    inside = read_editor_context(_write(tmp_path / "a.json"))  # cursor on line 3
+    outside = read_editor_context(_write(tmp_path / "b.json", cursor={"line": 9, "character": 1}))
+
+    assert inside is not None and outside is not None
+    assert note_near_cursor(inside, [ranged], workspace).id == "block"
+    assert note_near_cursor(outside, [ranged], workspace) is None
 
 
 def test_notes_in_view_uses_the_visible_lines_of_the_active_file(tmp_path):
     context = read_editor_context(_write(tmp_path / "ctx.json"))
     assert context is not None
-    notes = [_note("b", 20), _note("a", 4), _note("below", 80), _note("x", 5, file="anomx/x.py")]
+    notes = [_note("b", 21), _note("a", 5), _note("below", 81), _note("x", 6, file="anomx/x.py")]
 
     assert [note.id for note in notes_in_view(context, notes, Path("/ws"))] == ["a", "b"]
 
@@ -130,17 +152,20 @@ def test_notes_in_view_uses_the_visible_lines_of_the_active_file(tmp_path):
 def test_vsix_contains_manifest_and_only_the_audited_files(tmp_path):
     vsix = build_vsix(tmp_path)
 
-    assert vsix.name == vsix_name() == "anomx-local.anomx-editor-context-0.1.2.vsix"
+    assert vsix.name == vsix_name() == "anomx-local.anomx-editor-context-0.2.3.vsix"
     with zipfile.ZipFile(vsix) as archive:
         assert sorted(archive.namelist()) == [
             "[Content_Types].xml",
             "extension.vsixmanifest",
             "extension/README.md",
+            "extension/comments.js",
             "extension/extension.js",
+            "extension/media/anomx.svg",
+            "extension/notes.js",
             "extension/package.json",
         ]
         manifest = archive.read("extension.vsixmanifest").decode("utf-8")
-    assert 'Publisher="anomx-local"' in manifest and 'Version="0.1.2"' in manifest
+    assert 'Publisher="anomx-local"' in manifest and 'Version="0.2.3"' in manifest
     assert install_command(vsix) == f"code --install-extension {vsix}"
     assert extension_manifest()["main"] == "./extension.js"
 
@@ -153,10 +178,17 @@ def test_extension_declares_no_dependencies_or_scripts():
 
 
 def test_extension_source_has_no_network_or_process_access():
-    source = (EXTENSION_DIR / "extension.js").read_text(encoding="utf-8")
-
-    for forbidden in ("require('http", 'require("http', "child_process", "net'", "fetch(", "https"):
-        assert forbidden not in source
+    for name in ("extension.js", "notes.js", "comments.js"):
+        source = (EXTENSION_DIR / name).read_text(encoding="utf-8")
+        for forbidden in (
+            "require('http",
+            'require("http',
+            "child_process",
+            "net'",
+            "fetch(",
+            "https",
+        ):
+            assert forbidden not in source, (name, forbidden)
 
 
 # -- the JavaScript itself (needs Node) -----------------------------------------------
@@ -308,3 +340,131 @@ def test_extension_writes_the_expected_context_with_a_simulated_vscode(tmp_path)
     assert results["cleared"]["activeFile"] is None  # disposing clears stale state
     assert results["leftover"] == []
     assert stat.S_IMODE(out.parent.stat().st_mode) == 0o700
+
+
+# -- installing the extension -----------------------------------------------------------
+
+
+def test_the_hint_shows_only_inside_vscode_without_a_current_extension(tmp_path):
+    from anomx.agent.cowork.extension import extension_manifest, extension_needs_install
+
+    vscode = {"TERM_PROGRAM": "vscode"}
+    context = tmp_path / "editor-context.json"
+    assert extension_needs_install(tmp_path, vscode) == "missing"
+    assert extension_needs_install(tmp_path, {"VSCODE_IPC_HOOK_CLI": "/tmp/x.sock"}) == "missing"
+    assert extension_needs_install(tmp_path, {}) == ""  # a plain terminal does not need it
+    context.write_text('{"schema": 1}', encoding="utf-8")  # 0.1.x wrote no version
+    assert extension_needs_install(tmp_path, vscode) == "outdated"
+    context.write_text('{"extensionVersion": "0.1.9"}', encoding="utf-8")
+    assert extension_needs_install(tmp_path, vscode) == "outdated"
+    version = extension_manifest()["version"]
+    context.write_text(json.dumps({"extensionVersion": version}), encoding="utf-8")
+    assert extension_needs_install(tmp_path, vscode) == ""
+
+
+def test_install_builds_the_vsix_and_runs_code(tmp_path, monkeypatch):
+    from anomx.agent.cowork import extension
+
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(extension.shutil, "which", lambda _name: "/usr/bin/code")
+    monkeypatch.setattr(extension.subprocess, "run", fake_run)
+
+    ok, message = extension.install_extension(tmp_path)
+
+    assert ok and "Reload Window" in message
+    assert calls[0][:2] == ["/usr/bin/code", "--install-extension"]
+    assert Path(calls[0][2]).name == extension.vsix_name() and Path(calls[0][2]).exists()
+
+
+def test_install_explains_what_to_do_without_the_code_command(tmp_path, monkeypatch):
+    from anomx.agent.cowork import extension
+
+    monkeypatch.setattr(extension.shutil, "which", lambda _name: None)
+
+    ok, message = extension.install_extension(tmp_path)
+
+    assert not ok and "Install from VSIX" in message and ".vsix" in message
+
+
+def test_cli_flag_installs_the_extension(tmp_path, monkeypatch, capsys):
+    from anomx import cli
+    from anomx.agent.cowork import extension
+
+    monkeypatch.setattr(extension, "install_extension", lambda home: (True, "done"))
+
+    assert cli.main(["--home", str(tmp_path), "--install-vscode"]) == 0
+    assert "done" in capsys.readouterr().out
+
+
+def test_copy_falls_back_to_the_terminal_clipboard_without_tools(monkeypatch):
+    import base64
+    import io
+
+    from anomx.agent.ui.components import messages
+
+    written = io.StringIO()
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setattr(messages.shutil, "which", lambda _name: None)
+    monkeypatch.setattr("builtins.open", lambda *_a, **_k: _Keep(written))
+
+    class _Keep(io.StringIO):
+        def __init__(self, target):
+            super().__init__()
+            self._target = target
+
+        def write(self, text):
+            return self._target.write(text)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    assert messages.MessagesComponentMixin()._copy_to_clipboard("anomx --install-vscode")  # noqa: SLF001
+    sequence = written.getvalue()
+    assert sequence.startswith("\x1b]52;c;") and sequence.endswith("\x07")
+    payload = sequence.removeprefix("\x1b]52;c;").removesuffix("\x07")
+    assert base64.b64decode(payload).decode() == "anomx --install-vscode"
+
+
+def test_install_retries_with_a_live_socket_when_the_terminals_is_stale(tmp_path, monkeypatch):
+    from anomx.agent.cowork import extension
+
+    envs = []
+
+    def fake_run(command, **kwargs):
+        envs.append(kwargs["env"].get("VSCODE_IPC_HOOK_CLI"))
+        if kwargs["env"].get("VSCODE_IPC_HOOK_CLI") == "/live.sock":
+            return subprocess.CompletedProcess(command, 0, "", "")
+        return subprocess.CompletedProcess(command, 1, "", "Error: connect ENOENT /old.sock")
+
+    monkeypatch.setenv("VSCODE_IPC_HOOK_CLI", "/old.sock")
+    monkeypatch.setattr(extension.shutil, "which", lambda _name: "/usr/bin/code")
+    monkeypatch.setattr(extension.subprocess, "run", fake_run)
+    monkeypatch.setattr(extension, "_live_vscode_sockets", lambda _env: ["/live.sock"])
+
+    ok, _message = extension.install_extension(tmp_path)
+
+    assert ok and envs == ["/old.sock", "/live.sock"]
+
+
+def test_install_failure_tells_to_open_a_new_terminal(tmp_path, monkeypatch):
+    from anomx.agent.cowork import extension
+
+    monkeypatch.setattr(extension.shutil, "which", lambda _name: "/usr/bin/code")
+    monkeypatch.setattr(
+        extension.subprocess,
+        "run",
+        lambda command, **_k: subprocess.CompletedProcess(command, 1, "", "Error: ENOENT"),
+    )
+    monkeypatch.setattr(extension, "_live_vscode_sockets", lambda _env: [])
+
+    ok, message = extension.install_extension(tmp_path)
+
+    assert not ok and "NEW terminal" in message

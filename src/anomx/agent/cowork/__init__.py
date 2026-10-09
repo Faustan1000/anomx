@@ -1,7 +1,8 @@
 """Cowork mode: turn editor notes into small, isolated agent tasks.
 
-A note written in VS Code (via the Margo extension) becomes one task. Each task gets its
-own git worktree and branch, so several agents can work next to the user without
+A note written in VS Code (a comment made with the bundled extension) becomes one task.
+Each task gets its own git
+worktree and branch, so several agents can work next to the user without
 touching each other's files; the user merges a branch back only after approving it.
 """
 
@@ -24,15 +25,17 @@ from anomx.agent.cowork.git import (
     TaskWorkspace,
     find_repo_root,
 )
-from anomx.agent.cowork.margo import (
-    MARGO_LINE_BASE,
-    MargoNote,
+from anomx.agent.cowork.notes import (
+    Note,
     NoteContext,
-    find_margo_workspace,
+    NoteMessage,
+    find_notes_workspace,
     normalize_note_path,
     note_context,
-    read_margo_notes,
+    read_notes,
 )
+from anomx.agent.cowork.questions import QuestionService
+from anomx.agent.cowork.replies import AgentReplies, Location, find_locations
 from anomx.agent.cowork.runner import (
     ComparisonFile,
     CoworkService,
@@ -43,7 +46,6 @@ from anomx.agent.cowork.tasks import CoworkTask, TaskStatus, TaskStore
 from anomx.agent.cowork.workspace import CoworkAction, CoworkRow, CoworkWorkspace
 
 __all__ = [
-    "MARGO_LINE_BASE",
     "CoworkGit",
     "Activation",
     "ComparisonFile",
@@ -56,7 +58,12 @@ __all__ = [
     "EditorContext",
     "FollowResult",
     "GitError",
-    "MargoNote",
+    "Note",
+    "NoteMessage",
+    "AgentReplies",
+    "Location",
+    "QuestionService",
+    "find_locations",
     "MergeResult",
     "NoteContext",
     "RunResult",
@@ -66,7 +73,7 @@ __all__ = [
     "build_task_prompt",
     "build_vsix",
     "context_path",
-    "find_margo_workspace",
+    "find_notes_workspace",
     "find_repo_root",
     "note_context",
     "install_command",
@@ -74,5 +81,5 @@ __all__ = [
     "note_near_cursor",
     "notes_in_view",
     "read_editor_context",
-    "read_margo_notes",
+    "read_notes",
 ]

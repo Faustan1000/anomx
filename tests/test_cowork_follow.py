@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from cowork_notes import note_entry, write_notes
 
 from anomx.agent.cowork import CoworkFollower, CoworkWorkspace
 from anomx.agent.runtime import AgentRuntime
@@ -41,14 +42,11 @@ def workspace(tmp_path: Path) -> Path:
     (repo / "src" / "other.py").write_text("x = 1\n", encoding="utf-8")
     git(repo, "add", "-A")
     git(repo, "commit", "-m", "initial")
-    (root / ".margo").mkdir()
-    vault = {
-        "./proj/src/data.py": [
-            {"id": "a", "line": 0, "title": "note a"},
-            {"id": "b", "line": 4, "title": "note b"},
-        ]
-    }
-    (root / ".margo" / "local.notes.json").write_text(json.dumps(vault), encoding="utf-8")
+    write_notes(
+        root,
+        note_entry("a", "proj/src/data.py", 1, "note a"),
+        note_entry("b", "proj/src/data.py", 5, "note b"),
+    )
     return root
 
 

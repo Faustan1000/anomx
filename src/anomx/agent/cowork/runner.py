@@ -1,6 +1,6 @@
 """Run one cowork task: prepare a worktree for a note, let the agent work, commit, merge.
 
-The service owns everything about tasks of one repository. It never touches Margo's files
+The service owns everything about tasks of one repository. It never touches the editor's note files
 and never changes the user's working tree except through ``follow`` and ``merge``, which
 refuse to run over uncommitted work (see ``git.py``).
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,11 +17,14 @@ from typing import Any
 from anomx.agent.base.agents import AgentKind
 from anomx.agent.cowork.agent import CoworkRuntime
 from anomx.agent.cowork.git import CoworkGit, FollowResult, GitError, MergeResult, branch_for
-from anomx.agent.cowork.margo import MARGO_LINE_BASE, MargoNote, NoteContext, note_context
+from anomx.agent.cowork.notes import Note, NoteContext, NoteMessage, note_context
 from anomx.agent.cowork.tasks import CoworkTask, TaskStatus, TaskStore
 from anomx.agent.helpers.mode import AgentMode
 from anomx.agent.runtime import RuntimeCallbacks
 from anomx.agent.store import AnomxHome, SessionRecord
+
+TurnObserver = Callable[[str, str, bool, str], None]
+"""Called after every finished model turn as ``observer(note_id, response, failed, error)``."""
 
 MAX_SUMMARY_CHARS = 2_000
 RUNNABLE = {TaskStatus.QUEUED, TaskStatus.FAILED}
@@ -101,7 +104,9 @@ def build_task_prompt(task: CoworkTask, context: NoteContext, *, discuss: bool =
         "The user left this note in their editor:",
         "",
         f"File: {task.file}",
-        f"Line: {task.line}",
+        f"Lines: {task.line}-{task.end_line}"
+        if task.end_line > task.line
+        else f"Line: {task.line}",
         "Note:",
         task.request,
         "",
@@ -134,13 +139,14 @@ class CoworkService:
         self.state_dir = home.root / "cowork" / f"{self.repo_root.name}-{key}"
         self.tasks = TaskStore(self.state_dir / "tasks.json")
         self.worktrees = self.state_dir / "worktrees"
+        self.on_turn: TurnObserver | None = None
         self._running: dict[str, CoworkRuntime] = {}
         self._outcomes: dict[str, tuple[str | None, str]] = {}
         self._lock = threading.Lock()
 
     # -- preparing --------------------------------------------------------------------
 
-    def prepare(self, note: MargoNote, workspace: Path) -> CoworkTask:
+    def prepare(self, note: Note, workspace: Path) -> CoworkTask:
         """Create the branch and worktree for a note (no agent runs yet)."""
 
         existing = self.tasks.get(note.id)
@@ -165,7 +171,8 @@ class CoworkService:
         task = CoworkTask(
             note_id=note.id,
             file=relative,
-            line=note.line_number,
+            line=note.line,
+            end_line=note.end_line,
             title=note.title,
             request=note.request,
             branch=workspace_info.branch,
@@ -198,11 +205,32 @@ class CoworkService:
             self.home.append_session_event(
                 session_path, "user_message", {"message": "Please make the change now."}
             )
+        return self._run_turn(note_id, session_path, callbacks)
+
+    def reply(
+        self, note_id: str, text: str, callbacks: RuntimeCallbacks | None = None
+    ) -> RunResult:
+        """Continue the task's conversation with a follow-up the user wrote. Blocks until done.
+
+        Unlike ``run`` this works on a finished task too: the agent keeps its worktree and
+        its earlier edits, answers the follow-up and commits what it changed.
+        """
+
+        task = self._require(note_id)
+        session_path = self._existing_session(task)
+        if session_path is None:
+            raise GitError("The task has no conversation to continue.")
+        self.tasks.update(note_id, status=TaskStatus.RUNNING)
+        self.home.append_session_event(session_path, "user_message", {"message": text})
+        return self._run_turn(note_id, session_path, callbacks)
+
+    def _run_turn(
+        self, note_id: str, session_path: Path, callbacks: RuntimeCallbacks | None
+    ) -> RunResult:
         runtime = self.runtime_for(note_id)
         with self._lock:
             self._running[note_id] = runtime
         self._outcomes.pop(note_id, None)
-
         try:
             runtime.backend_response(session_path, callbacks or RuntimeCallbacks())
         except Exception as exc:  # noqa: BLE001 - the task must end in a recorded state
@@ -218,7 +246,7 @@ class CoworkService:
     # -- chat -------------------------------------------------------------------------
 
     def open_chat(
-        self, note: MargoNote, workspace: Path, *, discuss: bool = False
+        self, note: Note, workspace: Path, *, discuss: bool = False
     ) -> tuple[CoworkTask, SessionRecord]:
         """Task and chat session of a note, created on first use.
 
@@ -310,6 +338,8 @@ class CoworkService:
         self._outcomes[note_id] = (commit, error if failed else "")
         status = TaskStatus.FAILED if failed else TaskStatus.READY
         self.tasks.update(note_id, status=status, summary=error if failed else summary)
+        if self.on_turn is not None:
+            self.on_turn(note_id, response.strip(), failed, error)
 
     def abort(self, note_id: str) -> bool:
         """Ask a running agent to stop; ``run`` then records the task as failed."""
@@ -441,15 +471,16 @@ def _slug(note_id: str) -> str:
     return branch_for(note_id).removeprefix("anomx/cowork/")
 
 
-def _note_view(task: CoworkTask) -> MargoNote:
+def _note_view(task: CoworkTask) -> Note:
     """The task's note as seen from inside its worktree (file path relative to it)."""
 
-    return MargoNote(
+    return Note(
         id=task.note_id,
+        kind="note",
         file=task.file,
-        line=task.line - 1 + MARGO_LINE_BASE,
-        title=task.title,
-        text="",
+        line=task.line,
+        end_line=max(task.end_line, task.line),
+        messages=(NoteMessage("", task.request),),
     )
 
 
